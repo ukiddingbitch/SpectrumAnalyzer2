@@ -13,8 +13,6 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 
 ## Screenshots
 
-![Spectrum Analyzer 2 - Screenshot 1](Screenshots/Spectrum%20Analyzer2_1.png)
-
 
 
 ## Source Code
