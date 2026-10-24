@@ -1,1 +1,15 @@
+SpectrumAnalyzer2 is an Android application for visualizing and analyzing audio frequencies.
 
+Features:
+
+* Real-time audio spectrum visualization.
+* Waterfall spectrogram for viewing frequency changes over time.
+* Interactive cursor selection in the spectrum graph.
+* Frequency and decibel (dB) information at the selected position.
+* Adjustable spectrum display and frequency range.
+* Landscape-oriented interface for convenient analysis.
+
+SpectrumAnalyzer2 is open source and released under the MIT license.
+
+Source code:
+https://github.com/ukiddingbitch/SpectrumAnalyzer2
