@@ -25,6 +25,8 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 
 ![Spectrum Analyzer 2 - Screenshot 6](Screenshots/SpectrumAnalyzer2_6.png)
 
+![Spectrum Analyzer 2 - Screenshot 7](Screenshots/SpectrumAnalyzer2_7.png)
+
 ## Source Code
 
 The complete source code is available in this repository.
