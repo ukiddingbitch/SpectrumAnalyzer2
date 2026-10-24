@@ -1,1 +1,7 @@
+SpectrumAnalyzer2 1.3.0
 
+* Added a complete waterfall spectrogram visualization.
+* Added interactive cursor selection in the spectrogram.
+* Added frequency and dB information for the selected position.
+* Improved spectrum analysis visualization and user interaction.
+* Extended the graph display range to 40 kHz while maintaining a 48 kHz sampling rate. Actual spectrum analysis remains limited to 20 kHz.
