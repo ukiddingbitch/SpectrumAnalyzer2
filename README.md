@@ -10,22 +10,22 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Pinch-to-zoom gesture support.
 - Resettable display range.
 - Native Android application built with Kotlin.
-
+- 
 ## Screenshots
 
-![Spectrum Analyzer 2 - Screenshot 1](Screenshots/SpectrumAnalyzer2_1.png)
+![Spectrum Analyzer 2 - Linear Spectrum](Screenshots/SpectrumAnalyzer2_lin_spectrum.png)
 
-![Spectrum Analyzer 2 - Screenshot 2](Screenshots/SpectrumAnalyzer2_2.png)
+![Spectrum Analyzer 2 - Logarithmic Spectrum](Screenshots/SpectrumAnalyzer2_log_spectrum.png)
 
-![Spectrum Analyzer 2 - Screenshot 3](Screenshots/SpectrumAnalyzer2_3.png)
+![Spectrum Analyzer 2 - Spectrogram](Screenshots/SpectrumAnalyzer2_spectogram.png)
 
-![Spectrum Analyzer 2 - Screenshot 4](Screenshots/SpectrumAnalyzer2_4.png)
+![Spectrum Analyzer 2 - Frequency Range Selection](Screenshots/SpectrumAnalyzer2_range_select.png)
 
-![Spectrum Analyzer 2 - Screenshot 5](Screenshots/SpectrumAnalyzer2_5.png)
+![Spectrum Analyzer 2 - Frequency Range Information](Screenshots/SpectrumAnalyzer2_range_info.png)
 
-![Spectrum Analyzer 2 - Screenshot 6](Screenshots/SpectrumAnalyzer2_6.png)
+![Spectrum Analyzer 2 - Musical Keys](Screenshots/SpectrumAnalyzer2_keys.png)
 
-![Spectrum Analyzer 2 - Screenshot 7](Screenshots/SpectrumAnalyzer2_7.png)
+![Spectrum Analyzer 2 - Tone Generator](Screenshots/SpectrumAnalyzer2_tone_generator.png)
 
 ## Source Code
 
