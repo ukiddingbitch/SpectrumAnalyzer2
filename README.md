@@ -16,43 +16,43 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 
 ## Screenshots
 
-Linear frequency scale.
+Linear frequency scale
 
 ![Spectrum Analyzer 2 - Linear Spectrum](Screenshots/SpectrumAnalyzer2_lin_spectrum.png)
 
 ---
 
-Logarithmic frequency scale for detailed low-frequency analysis.
+Logarithmic frequency scale for detailed low-frequency analysis
 
 ![Spectrum Analyzer 2 - Logarithmic Spectrum](Screenshots/SpectrumAnalyzer2_log_spectrum.png)
 
 ---
 
-Real-time spectrogram showing frequency changes over time.
+Real-time spectrogram showing frequency changes over time
 
 ![Spectrum Analyzer 2 - Spectrogram](Screenshots/SpectrumAnalyzer2_spectogram.png)
 
 ---
 
-Frequency range selection.
+Frequency range selection
 
 ![Spectrum Analyzer 2 - Frequency Range Selection](Screenshots/SpectrumAnalyzer2_range_select.png)
 
 ---
 
-Frequency range information.
+Frequency range information
 
 ![Spectrum Analyzer 2 - FreqFrequency nge Information](Screenshots/SpectrumAnalyzer2_range_info.png)
 
 ---
 
-Keys.
+Keys
 
 ![Spectrum Analyzer 2 - Musical Keys](Screenshots/SpectrumAnalyzer2_keys.png)
 
 ---
 
-Tone generator.
+Tone generator
 
 ![Spectrum Analyzer 2 - Tone Generator](Screenshots/SpectrumAnalyzer2_tone_generator.png)
 
