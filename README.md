@@ -3,13 +3,16 @@
 An Android application developed in Kotlin that visualizes audio frequencies in a spectrum analyzer interface.
 
 ## Features
-
-- Audio spectrum visualization.
-- Decibel (dB) scale.
-- Adjustable display range.
-- Pinch-to-zoom gesture support.
-- Resettable display range.
-- Native Android application built with Kotlin.
+- Real-time audio spectrum visualization.
+- Linear and logarithmic frequency scales.
+- Real-time spectrogram visualization.
+- Decibel (dB) scale with adjustable display range.
+- Adjustable frequency range selection (20 Hz–20 kHz).
+- Pinch-to-zoom and pan gesture support.
+- Peak hold functionality.
+- Frequency cursor with detailed information.
+- Musical note and frequency identification.
+- Built-in tone generator.
 
 ## Screenshots
 
