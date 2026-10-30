@@ -39,6 +39,10 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Full-screen keyboard mode.
 - Piano samples load in the background, prioritizing the middle octave.
 
+![Spectrum Analyzer 2 - Keys Full](Screenshots/Spectrum%20Analyzer2_keysfull.png)
+
+![Spectrum Analyzer 2 - Keys Spectrum](Screenshots/Spectrum%20Analyzer2_keysspectrum.png)
+
 ### App Experience
 - Audio analysis starts automatically after microphone permission is granted.
 - Immersive full-screen interface with icon-based controls.
