@@ -25,7 +25,7 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Play or pause, delete, and scroll through saved recordings.
 - Import and export ZIP archives containing recordings, names, and sound profiles.
 
-![Spectrum Analyzer 2](Screenshots/SpectrumAnalyzer2_mysoundid.png)
+![Spectrum Analyzer 2 - My Sound ID](Screenshots/Spectrum%20Analyzer2_mysoundid.png)
 
 ### Tone Generator
 - Built-in tone generator with adjustable frequency and volume.
