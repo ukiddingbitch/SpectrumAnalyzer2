@@ -3,16 +3,41 @@
 An Android application developed in Kotlin that visualizes audio frequencies in a spectrum analyzer interface.
 
 ## Features
-- Real-time audio spectrum visualization.
+
+### Audio Analysis
+- Real-time spectrum and spectrogram visualization.
 - Linear and logarithmic frequency scales.
-- Real-time spectrogram visualization.
-- Decibel (dB) scale with adjustable display range.
-- Adjustable frequency range selection (20 Hz–20 kHz).
-- Pinch-to-zoom and pan gesture support.
-- Peak hold functionality.
-- Frequency cursor with detailed information.
-- Musical note and frequency identification.
-- Built-in tone generator.
+- Adjustable frequency range from 20 Hz to 20 kHz.
+- Pinch-to-zoom graph controls.
+- Pan the spectrum horizontally across frequencies and vertically through the dB range.
+- Adjustable dB display range and peak hold.
+- Frequency cursor with frequency and level information.
+- Peak detection with frequency and dB labels.
+
+### Sound ID
+- Offline sound identification powered by the bundled YAMNet model, with 521 sound classes.
+- Shows a leading sound match and alternative predictions.
+- Session summary chart showing the most detected sounds and their share of analyzed time.
+- Export session summaries as PDF.
+
+### My Sound ID
+- Record a 10-second sound sample after a countdown, name it, and save it for future matching.
+- Play or pause, delete, and scroll through saved recordings.
+- Import and export ZIP archives containing recordings, names, and sound profiles.
+
+### Tone Generator
+- Built-in tone generator with adjustable frequency and volume.
+- Sine, square, triangle, and sawtooth waveforms.
+- Frequency presets and frequency sweep.
+
+### Piano Keyboard
+- Multi-touch piano keyboard with volume, octave, and reverb controls.
+- Full-screen keyboard mode.
+- Piano samples load in the background, prioritizing the middle octave.
+
+### App Experience
+- Audio analysis starts automatically after microphone permission is granted.
+- Immersive full-screen interface with icon-based controls.
 
 ## Screenshots
 
