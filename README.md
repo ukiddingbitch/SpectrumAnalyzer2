@@ -34,6 +34,8 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Sine, square, triangle, and sawtooth waveforms.
 - Frequency presets and frequency sweep.
 
+![Spectrum Analyzer 2 - Spectrum Tone Generator](Screenshots/Spectrum%20Analyzer2_spectrumtonegene.png)
+
 ### Piano Keyboard
 - Multi-touch piano keyboard with volume, octave, and reverb controls.
 - Full-screen keyboard mode.
