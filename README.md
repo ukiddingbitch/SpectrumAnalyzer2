@@ -20,6 +20,8 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Session summary chart showing the most detected sounds and their share of analyzed time.
 - Export session summaries as PDF.
 
+![Spectrum Analyzer 2 - Sound ID](Screenshots/Spectrum%20Analyzer2_soundid.png)
+
 ### My Sound ID
 - Record a 10-second sound sample after a countdown, name it, and save it for future matching.
 - Play or pause, delete, and scroll through saved recordings.
