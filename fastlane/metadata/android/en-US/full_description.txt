@@ -1,13 +1,34 @@
-SpectrumAnalyzer2 is an Android application for visualizing and analyzing audio frequencies.
+SpectrumAnalyzer2 is an Android app for real-time audio analysis, sound identification, and tone generation.
 
-Features:
+AUDIO ANALYSIS
+* View live audio as a spectrum or waterfall spectrogram.
+* Switch between linear and logarithmic frequency scales.
+* Zoom and pan the graph horizontally across frequencies and vertically through the dB range.
+* Select a point on the graph to view its frequency and level.
+* Adjust the frequency range from 20 Hz to 20 kHz and use peak hold.
+* View an estimated SPL level with reference calibration.
 
-* Real-time audio spectrum visualization.
-* Waterfall spectrogram for viewing frequency changes over time.
-* Interactive cursor selection in the spectrum graph.
-* Frequency and decibel (dB) information at the selected position.
-* Adjustable spectrum display and frequency range.
-* Landscape-oriented interface for convenient analysis.
+SOUND ID
+* Identify sounds offline with the bundled YAMNet model and its 521 sound classes.
+* View the leading match and alternative predictions.
+* Review a session summary showing which sounds were detected over time.
+* Export session summaries as PDF.
+
+MY SOUND ID
+* Record 5- or 10-second samples, name them, and save them for future matching.
+* Play, pause, rename, or delete your recordings.
+* Import WAV samples and import or export ZIP archives containing your samples and profiles.
+
+TONE GENERATOR
+* Generate sine, square, triangle, and sawtooth tones.
+* Create white noise, pink noise, and DTMF tones.
+* Use frequency presets, follow the detected peak, or add your own presets.
+* Run frequency sweeps in either direction for 4, 8, 16, or 32 seconds.
+* Choose LEFT, RIGHT, or STEREO audio output.
+
+PIANO KEYBOARD
+* Play a multi-touch piano keyboard with volume, octave, and reverb controls.
+* Expand the keyboard to full-screen mode.
 
 SpectrumAnalyzer2 is open source and released under the MIT license.
 
