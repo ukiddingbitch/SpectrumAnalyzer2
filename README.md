@@ -15,9 +15,13 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Displays detected peak frequencies in Hz.
 - Estimated SPL readout with reference calibration and a live level scale.
 
-![Spectrum Analyzer 2 - Default Launch Screen](Screenshots/Spectrum%20Analyzer2_launchappdefault.png)
+![Spectrum Analyzer 2 - Linear Spectrum](Screenshots/linear.png)
 
-![Spectrum Analyzer 2 - Spectrogram Analysis](Screenshots/Spectrum%20Analyzer2_spectogramanalysis.png)
+![Spectrum Analyzer 2 - Logarithmic Spectrum](Screenshots/log.png)
+
+![Spectrum Analyzer 2 - Spectrogram](Screenshots/spectogram.png)
+
+![Spectrum Analyzer 2 - SPL](Screenshots/SPL.png)
 
 ### Sound ID
 - Offline sound identification powered by the bundled YAMNet model, with 521 sound classes.
@@ -25,7 +29,9 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Session summary chart showing the most detected sounds and their share of analyzed time.
 - Export session summaries as PDF.
 
-![Spectrum Analyzer 2 - Sound ID](Screenshots/Spectrum%20Analyzer2_soundid.png)
+![Spectrum Analyzer 2 - Sound ID](Screenshots/soundid.png)
+
+![Spectrum Analyzer 2 - Sound ID 2](Screenshots/soundid2.png)
 
 ### My Sound ID
 - Record a 5- or 10-second sound sample after a countdown, name it, and save it for future matching.
@@ -33,7 +39,7 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Import WAV recordings.
 - Import and export ZIP archives containing recordings, names, and sound profiles.
 
-![Spectrum Analyzer 2 - My Sound ID](Screenshots/Spectrum%20Analyzer2_mysoundid.png)
+![Spectrum Analyzer 2 - My Sound ID](Screenshots/mysoundid.png)
 
 ### Tone Generator
 - Built-in tone generator with adjustable frequency and volume.
@@ -45,16 +51,16 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Choose sweep direction and durations of 4, 8, 16, or 32 seconds.
 - Select LEFT, RIGHT, or STEREO audio output.
 
-![Spectrum Analyzer 2 - Spectrum Tone Generator](Screenshots/Spectrum%20Analyzer2_spectrumtonegene.png)
+![Spectrum Analyzer 2 - Tone Generator](Screenshots/tonegen.png)
 
 ### Piano Keyboard
 - Multi-touch piano keyboard with volume, octave, and reverb controls.
 - Full-screen keyboard mode.
 - Piano samples load in the background, prioritizing the middle octave.
 
-![Spectrum Analyzer 2 - Keys Full](Screenshots/Spectrum%20Analyzer2_keysfull.png)
+![Spectrum Analyzer 2 - Full-Scale Keys](Screenshots/fullscalekeys.png)
 
-![Spectrum Analyzer 2 - Keys Spectrum](Screenshots/Spectrum%20Analyzer2_keysspectrum.png)
+![Spectrum Analyzer 2 - Keys](Screenshots/keys.png)
 
 ### App Experience
 - Audio analysis starts automatically after microphone permission is granted.
