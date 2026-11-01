@@ -12,7 +12,8 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Pan the spectrum horizontally across frequencies and vertically through the dB range.
 - Adjustable dB display range and peak hold.
 - Frequency cursor with frequency and level information.
-- Peak detection with frequency and dB labels.
+- Displays detected peak frequencies in Hz.
+- Estimated SPL readout with reference calibration and a live level scale.
 
 ![Spectrum Analyzer 2 - Default Launch Screen](Screenshots/Spectrum%20Analyzer2_launchappdefault.png)
 
@@ -27,8 +28,9 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 ![Spectrum Analyzer 2 - Sound ID](Screenshots/Spectrum%20Analyzer2_soundid.png)
 
 ### My Sound ID
-- Record a 10-second sound sample after a countdown, name it, and save it for future matching.
-- Play or pause, delete, and scroll through saved recordings.
+- Record a 5- or 10-second sound sample after a countdown, name it, and save it for future matching.
+- Play or pause, rename, delete, and scroll through saved recordings.
+- Import WAV recordings.
 - Import and export ZIP archives containing recordings, names, and sound profiles.
 
 ![Spectrum Analyzer 2 - My Sound ID](Screenshots/Spectrum%20Analyzer2_mysoundid.png)
@@ -37,6 +39,11 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Built-in tone generator with adjustable frequency and volume.
 - Sine, square, triangle, and sawtooth waveforms.
 - Frequency presets and frequency sweep.
+- White noise, pink noise, and DTMF tones.
+- Peak-follow mode.
+- Add custom frequency presets and delete them with a long press; built-in presets and PEAK are protected.
+- Choose sweep direction and durations of 4, 8, 16, or 32 seconds.
+- Select LEFT, RIGHT, or STEREO audio output.
 
 ![Spectrum Analyzer 2 - Spectrum Tone Generator](Screenshots/Spectrum%20Analyzer2_spectrumtonegene.png)
 
