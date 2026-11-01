@@ -1,1 +1,1 @@
-Audio spectrum analyzer with a real-time spectrum and waterfall spectrogram.
+Audio spectrum analyzer with spectrogram, sound ID and tone generator.
