@@ -1,0 +1,6 @@
+* Offline YAMNet Sound ID with 521 classes, alternative matches, and PDF session summaries.
+* Added estimated SPL with reference calibration and a live scale.
+* Improved graph controls, peak readouts, and the portrait Sound ID layout.
+* My Sound ID adds 5- and 10-second recordings, WAV import, renaming, and improved sample management.
+* Tone Generator adds DTMF, white and pink noise, PEAK follow, custom presets, LEFT/RIGHT/STEREO output, and reversible sweeps up to 32 seconds.
+* Improved piano volume controls and background sample loading.
