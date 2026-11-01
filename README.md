@@ -16,19 +16,13 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Estimated SPL readout with reference calibration and a live level scale.
 
 <p align="center">
-  <img src="Screenshots/linear.png" width="420" alt="Spectrum Analyzer 2 - Linear Spectrum">
+  <img src="Screenshots/linear.png" width="360" alt="Spectrum Analyzer 2 - Linear Spectrum">
+  <img src="Screenshots/log.png" width="360" alt="Spectrum Analyzer 2 - Logarithmic Spectrum">
 </p>
 
 <p align="center">
-  <img src="Screenshots/log.png" width="420" alt="Spectrum Analyzer 2 - Logarithmic Spectrum">
-</p>
-
-<p align="center">
-  <img src="Screenshots/spectogram.png" width="420" alt="Spectrum Analyzer 2 - Spectrogram">
-</p>
-
-<p align="center">
-  <img src="Screenshots/SPL.png" width="420" alt="Spectrum Analyzer 2 - SPL">
+  <img src="Screenshots/spectogram.png" width="360" alt="Spectrum Analyzer 2 - Spectrogram">
+  <img src="Screenshots/SPL.png" width="360" alt="Spectrum Analyzer 2 - SPL">
 </p>
 
 ### Sound ID
@@ -39,9 +33,6 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 
 <p align="center">
   <img src="Screenshots/soundid.png" width="220" alt="Spectrum Analyzer 2 - Sound ID">
-</p>
-
-<p align="center">
   <img src="Screenshots/soundid2.png" width="220" alt="Spectrum Analyzer 2 - Sound ID 2">
 </p>
 
@@ -66,7 +57,7 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Select LEFT, RIGHT, or STEREO audio output.
 
 <p align="center">
-  <img src="Screenshots/tonegen.png" width="420" alt="Spectrum Analyzer 2 - Tone Generator">
+  <img src="Screenshots/tonegen.png" width="360" alt="Spectrum Analyzer 2 - Tone Generator">
 </p>
 
 ### Piano Keyboard
@@ -75,11 +66,8 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 - Piano samples load in the background, prioritizing the middle octave.
 
 <p align="center">
-  <img src="Screenshots/fullscalekeys.png" width="420" alt="Spectrum Analyzer 2 - Full-Scale Keys">
-</p>
-
-<p align="center">
-  <img src="Screenshots/keys.png" width="420" alt="Spectrum Analyzer 2 - Keys">
+  <img src="Screenshots/fullscalekeys.png" width="360" alt="Spectrum Analyzer 2 - Full-Scale Keys">
+  <img src="Screenshots/keys.png" width="360" alt="Spectrum Analyzer 2 - Keys">
 </p>
 
 ### App Experience
