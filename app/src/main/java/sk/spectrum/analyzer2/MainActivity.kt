@@ -25,6 +25,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.abs
 import android.media.MediaRecorder
+import android.net.Uri
 import android.os.Bundle
 import android.os.Process
 import android.os.Handler
@@ -54,12 +55,12 @@ import android.app.Dialog
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.SeekBar
-import android.widget.Spinner
-import android.widget.ArrayAdapter
 import android.widget.Toast
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.ceil
 import kotlin.math.exp
+import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.ln
 import kotlin.math.log10
@@ -75,7 +76,7 @@ private class AnalyzerIconButton(
     context: Context,
     icon: Icon
 ) : AppCompatButton(context) {
-    enum class Icon { PLAY, STOP, RESET, TONE, PRESETS, SWEEP, KEYS, SOUND, AXIS, LIN, LOG, IMPORT, EXPORT, FULL_SCALE_OPEN, FULL_SCALE_CLOSE, SPECTRUM, SPECTROGRAM }
+    enum class Icon { PLAY, STOP, MIC, RESET, TONE, PRESETS, SWEEP, KEYS, SOUND, AXIS, LIN, LOG, IMPORT, EXPORT, FULL_SCALE_OPEN, FULL_SCALE_CLOSE, SPECTRUM, SPECTROGRAM }
 
     var icon: Icon = icon
         set(value) {
@@ -84,6 +85,7 @@ private class AnalyzerIconButton(
             contentDescription = when (value) {
                 Icon.PLAY -> "Start analysis"
                 Icon.STOP -> "Stop analysis"
+                Icon.MIC -> "Start listening"
                 Icon.RESET -> "Reset display"
                 Icon.TONE -> "Tone generator"
                 Icon.PRESETS -> "Frequency presets"
@@ -102,9 +104,22 @@ private class AnalyzerIconButton(
             }
         }
 
+    var playStopIconScale = 0.30f
+        set(value) {
+            field = value.coerceIn(0.30f, 0.80f)
+            invalidate()
+        }
+
+    var roundedPlayStopGlyphs = false
+
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.BLACK
         style = Paint.Style.FILL
+    }
+    private val playStopRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(150, 255, 255, 255)
+        style = Paint.Style.STROKE
+        strokeWidth = resources.displayMetrics.density * 1.5f
     }
     private val resetPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
@@ -129,6 +144,7 @@ private class AnalyzerIconButton(
         contentDescription = when (icon) {
             Icon.PLAY -> "Start analysis"
             Icon.STOP -> "Stop analysis"
+            Icon.MIC -> "Start listening"
             Icon.RESET -> "Reset display"
             Icon.TONE -> "Tone generator"
             Icon.PRESETS -> "Frequency presets"
@@ -152,21 +168,39 @@ private class AnalyzerIconButton(
         val cx = width / 2f
         val cy = height / 2f
         // Play and stop use the same compact visual bounds and have no outline.
-        val iconSize = minOf(width, height) * 0.30f
+        val iconSize = minOf(width, height) * playStopIconScale
         val path = Path()
         fillPaint.color = Color.WHITE
         when (icon) {
             Icon.PLAY -> {
-                path.moveTo(cx - iconSize * 0.5f, cy - iconSize * 0.5f)
-                path.lineTo(cx + iconSize * 0.5f, cy)
-                path.lineTo(cx - iconSize * 0.5f, cy + iconSize * 0.5f)
-                path.close()
+                if (roundedPlayStopGlyphs) {
+                    canvas.drawCircle(cx, cy, iconSize * 0.57f, playStopRingPaint)
+                    val glyphSize = iconSize * 0.72f
+                    path.moveTo(cx - glyphSize * 0.28f, cy - glyphSize * 0.46f)
+                    path.cubicTo(cx - glyphSize * 0.28f, cy - glyphSize * 0.56f, cx - glyphSize * 0.20f, cy - glyphSize * 0.57f, cx - glyphSize * 0.10f, cy - glyphSize * 0.50f)
+                    path.lineTo(cx + glyphSize * 0.38f, cy - glyphSize * 0.05f)
+                    path.cubicTo(cx + glyphSize * 0.49f, cy, cx + glyphSize * 0.49f, cy, cx + glyphSize * 0.38f, cy + glyphSize * 0.05f)
+                    path.lineTo(cx - glyphSize * 0.10f, cy + glyphSize * 0.50f)
+                    path.cubicTo(cx - glyphSize * 0.20f, cy + glyphSize * 0.57f, cx - glyphSize * 0.28f, cy + glyphSize * 0.56f, cx - glyphSize * 0.28f, cy + glyphSize * 0.46f)
+                    path.close()
+                } else {
+                    path.moveTo(cx - iconSize * 0.5f, cy - iconSize * 0.5f)
+                    path.lineTo(cx + iconSize * 0.5f, cy)
+                    path.lineTo(cx - iconSize * 0.5f, cy + iconSize * 0.5f)
+                    path.close()
+                }
                 canvas.drawPath(path, fillPaint)
             }
             Icon.STOP -> {
-                val half = iconSize * 0.5f
-                path.addRect(cx - half, cy - half, cx + half, cy + half, Path.Direction.CW)
-                canvas.drawPath(path, fillPaint)
+                if (roundedPlayStopGlyphs) {
+                    canvas.drawCircle(cx, cy, iconSize * 0.57f, playStopRingPaint)
+                    val half = iconSize * 0.31f
+                    canvas.drawRoundRect(cx - half, cy - half, cx + half, cy + half, half * 0.24f, half * 0.24f, fillPaint)
+                } else {
+                    val half = iconSize * 0.5f
+                    path.addRect(cx - half, cy - half, cx + half, cy + half, Path.Direction.CW)
+                    canvas.drawPath(path, fillPaint)
+                }
             }
             Icon.RESET -> {
                 // Material-style refresh symbol: a clean circular arrow, drawn as one filled shape.
@@ -196,11 +230,12 @@ private class AnalyzerIconButton(
                 fillPaint.color = Color.BLACK
                 canvas.restore()
             }
-            Icon.TONE, Icon.PRESETS, Icon.SWEEP, Icon.SOUND, Icon.SPECTRUM, Icon.SPECTROGRAM, Icon.AXIS, Icon.KEYS, Icon.LIN, Icon.LOG, Icon.IMPORT, Icon.EXPORT, Icon.FULL_SCALE_OPEN, Icon.FULL_SCALE_CLOSE -> {
+            Icon.TONE, Icon.PRESETS, Icon.SWEEP, Icon.MIC, Icon.SOUND, Icon.SPECTRUM, Icon.SPECTROGRAM, Icon.AXIS, Icon.KEYS, Icon.LIN, Icon.LOG, Icon.IMPORT, Icon.EXPORT, Icon.FULL_SCALE_OPEN, Icon.FULL_SCALE_CLOSE -> {
                 val s = minOf(width, height) * when (icon) {
                     Icon.KEYS -> 0.48f
+                    Icon.MIC -> 0.62f
                     Icon.TONE, Icon.SOUND, Icon.SPECTRUM, Icon.SPECTROGRAM -> 0.40f
-                    Icon.IMPORT, Icon.EXPORT -> 0.48f
+                    Icon.PRESETS, Icon.IMPORT, Icon.EXPORT -> 0.48f
                     else -> 0.34f
                 }
                 val l = cx - s / 2f
@@ -208,6 +243,21 @@ private class AnalyzerIconButton(
                 val r = cx + s / 2f
                 val b = cy + s / 2f
                 when (icon) {
+                    Icon.MIC -> {
+                        canvas.drawRoundRect(
+                            cx - s * 0.15f, cy - s * 0.38f,
+                            cx + s * 0.15f, cy + s * 0.12f,
+                            s * 0.15f, s * 0.15f, symbolPaint
+                        )
+                        val cradle = Path().apply {
+                            moveTo(cx - s * 0.30f, cy - s * 0.03f)
+                            cubicTo(cx - s * 0.30f, cy + s * 0.24f, cx - s * 0.15f, cy + s * 0.38f, cx, cy + s * 0.38f)
+                            cubicTo(cx + s * 0.15f, cy + s * 0.38f, cx + s * 0.30f, cy + s * 0.24f, cx + s * 0.30f, cy - s * 0.03f)
+                        }
+                        canvas.drawPath(cradle, symbolPaint)
+                        canvas.drawLine(cx, cy + s * 0.38f, cx, cy + s * 0.49f, symbolPaint)
+                        canvas.drawLine(cx - s * 0.17f, cy + s * 0.49f, cx + s * 0.17f, cy + s * 0.49f, symbolPaint)
+                    }
                     Icon.TONE -> {
                         val p = Path().apply {
                             moveTo(l, cy)
@@ -346,6 +396,82 @@ private class AnalyzerIconButton(
     }
 }
 
+private class ToneWaveformIconView(
+    context: Context,
+    waveform: String,
+    color: Int = Color.WHITE
+) : View(context) {
+    var waveform: String = waveform
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    private val wavePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        this.color = color
+        style = Paint.Style.STROKE
+        strokeWidth = resources.displayMetrics.density * 2.2f
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val left = width * 0.12f
+        val right = width * 0.88f
+        val centerY = height * 0.5f
+        val amplitude = height * 0.30f
+        val plotWidth = right - left
+        val path = Path()
+
+        when (waveform.lowercase()) {
+            "sine" -> {
+                for (step in 0..40) {
+                    val x = left + plotWidth * step / 40f
+                    val y = centerY - amplitude * sin(2.0 * PI * step / 40.0).toFloat()
+                    if (step == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+            }
+            "square" -> {
+                path.moveTo(left, centerY + amplitude)
+                path.lineTo(left + plotWidth * 0.25f, centerY + amplitude)
+                path.lineTo(left + plotWidth * 0.25f, centerY - amplitude)
+                path.lineTo(left + plotWidth * 0.75f, centerY - amplitude)
+                path.lineTo(left + plotWidth * 0.75f, centerY + amplitude)
+                path.lineTo(right, centerY + amplitude)
+            }
+            "triangle" -> {
+                path.moveTo(left, centerY + amplitude)
+                path.lineTo(left + plotWidth * 0.25f, centerY - amplitude)
+                path.lineTo(left + plotWidth * 0.5f, centerY + amplitude)
+                path.lineTo(left + plotWidth * 0.75f, centerY - amplitude)
+                path.lineTo(right, centerY + amplitude)
+            }
+            "white noise" -> {
+                val levels = floatArrayOf(0.15f, 0.82f, 0.28f, 0.68f, 0.12f, 0.91f, 0.35f, 0.76f, 0.20f, 0.62f, 0.10f, 0.85f, 0.40f)
+                levels.forEachIndexed { index, level ->
+                    val x = left + plotWidth * index / (levels.lastIndex).toFloat()
+                    val y = centerY + (level - 0.5f) * amplitude * 2f
+                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+            }
+            "pink noise" -> {
+                path.moveTo(left, centerY + amplitude * 0.55f)
+                path.cubicTo(left + plotWidth * 0.18f, centerY + amplitude * 0.35f, left + plotWidth * 0.18f, centerY - amplitude * 0.85f, left + plotWidth * 0.40f, centerY - amplitude * 0.45f)
+                path.cubicTo(left + plotWidth * 0.62f, centerY - amplitude * 0.05f, left + plotWidth * 0.61f, centerY + amplitude * 0.92f, left + plotWidth * 0.80f, centerY + amplitude * 0.42f)
+                path.cubicTo(left + plotWidth * 0.91f, centerY + amplitude * 0.15f, left + plotWidth * 0.90f, centerY - amplitude * 0.15f, right, centerY - amplitude * 0.34f)
+            }
+            else -> { // Sawtooth
+                path.moveTo(left, centerY + amplitude)
+                path.lineTo(left + plotWidth * 0.42f, centerY - amplitude)
+                path.lineTo(left + plotWidth * 0.42f, centerY + amplitude)
+                path.lineTo(left + plotWidth * 0.92f, centerY - amplitude)
+            }
+        }
+        canvas.drawPath(path, wavePaint)
+    }
+}
+
 @android.annotation.TargetApi(26)
 class MainActivity : Activity() {
 
@@ -355,7 +481,19 @@ class MainActivity : Activity() {
     private lateinit var startButton: Button
     private var headerPeakFrequencyText: TextView? = null
     private var headerPeakDbText: TextView? = null
+    private var headerSplText: TextView? = null
+    private var splCalibrationOffsetDb: Double? = null
+    private var splManualCalibrationOffsetDb: Double? = null
+    private var splSystemCalibrationOffsetDb: Double? = null
+    private var splDetailDialog: Dialog? = null
+    private var splDetailValueView: TextView? = null
+    private var splDetailInfoView: TextView? = null
+    private var splDetailDeltaView: TextView? = null
+    private var splScaleMeterView: SplScaleMeterView? = null
+    private var splHasCurrentSample = false
+    private val splRecentReadings = java.util.ArrayDeque<Pair<Long, Double>>()
     private var spectrumHeader: android.widget.FrameLayout? = null
+    private var spectrumHeaderCompactHeightPx = 0
     private var rangePickerButton: Button? = null
     private var keyboardControlsRow: LinearLayout? = null
     private var headerTitleText: TextView? = null
@@ -367,6 +505,9 @@ class MainActivity : Activity() {
     private var fullScaleKeysDialog: Dialog? = null
     private var keyboardSectionView: View? = null
     private var fullScaleKeyboardOpen = false
+    private var portraitGraphControlsRow: LinearLayout? = null
+    private var resetDisplayButton: AnalyzerIconButton? = null
+    private var spectrogramModeButton: AnalyzerIconButton? = null
     private var soundIdPanel: View? = null
     private var soundModeOpen = false
     private var switchAnalyzerMode: ((String) -> Unit)? = null
@@ -374,6 +515,7 @@ class MainActivity : Activity() {
     private var keyboardModeOpen = false
     private var toneToggleButton: Button? = null
     private var axisToggleButton: Button? = null
+    private var mainActionRow: LinearLayout? = null
     @Volatile private var soundIdActive = false
     private var soundIdBestSoundView: TextView? = null
     private var soundIdScoreView: TextView? = null
@@ -386,11 +528,13 @@ class MainActivity : Activity() {
     private var soundIdLivePanel: LinearLayout? = null
     private var soundIdSummaryPanel: LinearLayout? = null
     private var soundIdSummaryChart: SoundSessionChartView? = null
+    private var soundIdSummaryTimeline: SoundSessionTimelineView? = null
     private var soundIdPdfButton: Button? = null
     private var soundIdLastSummary: SoundSessionSummary? = null
     private var personalSoundListRefresh: (() -> Unit)? = null
     private var pendingSoundIdPdf: ByteArray? = null
-    private var pendingPersonalSoundExport: ByteArray? = null
+    private val personalSoundExportInProgress = AtomicBoolean(false)
+    private val personalSoundImportInProgress = AtomicBoolean(false)
     @Volatile private var personalPreviewTrack: AudioTrack? = null
     private var personalPreviewKey: String? = null
     private var personalPreviewButton: Button? = null
@@ -411,7 +555,7 @@ class MainActivity : Activity() {
             runOnUiThread {
                 soundIdBestSoundView?.text = result.bestSound
                 soundIdScoreView?.text = if (result.modelScorePercent > 0) {
-                    "${if (result.isPersonalMatch) "SAVED SOUND SIMILARITY" else "MODEL SCORE"} · ${result.modelScorePercent}%"
+                    "${if (result.isPersonalMatch) "Saved sample similarity" else "Match strength"} · ${result.modelScorePercent}%"
                 } else ""
                 soundIdAlternativesView?.text = result.alternatives
                 result.sessionSummary?.let(::showSoundIdSummary)
@@ -419,10 +563,18 @@ class MainActivity : Activity() {
         }
     }
     private val soundIdExportRequestCode = 72
-    private val personalSoundExportRequestCode = 73
+    private val personalSoundExportFolderRequestCode = 73
     private val personalSoundImportRequestCode = 74
     @Volatile private var tonePlaying = false
     @Volatile private var toneFrequency = 440
+    private var tonePeakFollowEnabled = false
+    private var tonePeakFollowWindowStartedAt = 0L
+    private var tonePeakBestFrequency = 0.0
+    private var tonePeakBestDb = -120.0
+    private var latestAnalyzedPeakFrequency = 0.0
+    private var latestAnalyzedPeakDb = -120.0
+    private var latestAnalyzedRmsDb = -120.0
+    private var tonePeakPresetButton: AnalyzerIconButton? = null
     private data class PianoSample(
         val samples: ShortArray,
         val sampleRate: Int,
@@ -434,12 +586,59 @@ class MainActivity : Activity() {
         val sample: PianoSample,
         var position: Double = 0.0,
         var volume: Float,
+        val pitchRatio: Double = 1.0,
         var releaseRemainingFrames: Int = 0,
         var releaseTotalFrames: Int = 0
     )
 
+    private class PianoReverbProcessor(private val sampleRate: Int, private val stereoOffset: Int = 0) {
+        private class CombFilter(size: Int) {
+            private val buffer = FloatArray(size.coerceAtLeast(1))
+            private var index = 0
+            private var filtered = 0f
+
+            fun process(input: Float): Float {
+                val output = buffer[index]
+                filtered = output * 0.78f + filtered * 0.22f
+                buffer[index] = input + filtered * 0.72f
+                index = (index + 1) % buffer.size
+                return output
+            }
+        }
+
+        private class AllPassFilter(size: Int) {
+            private val buffer = FloatArray(size.coerceAtLeast(1))
+            private var index = 0
+
+            fun process(input: Float): Float {
+                val delayed = buffer[index]
+                val output = delayed - input
+                buffer[index] = input + delayed * 0.5f
+                index = (index + 1) % buffer.size
+                return output
+            }
+        }
+
+        private fun scaledSize(baseSize: Int): Int =
+            (baseSize * sampleRate / 44100f).roundToInt() + stereoOffset
+
+        private val combFilters = intArrayOf(1116, 1188, 1277, 1356)
+            .map { CombFilter(scaledSize(it)) }
+        private val allPassFilters = intArrayOf(556, 441)
+            .map { AllPassFilter(scaledSize(it)) }
+
+        fun process(input: Float): Float {
+            var output = 0f
+            for (filter in combFilters) output += filter.process(input)
+            output *= 0.25f
+            for (filter in allPassFilters) output = filter.process(output)
+            return output
+        }
+    }
+
     private val pianoSamples = ConcurrentHashMap<Int, PianoSample>()
     private val pianoHeldNotes = mutableSetOf<Int>()
+    private val pianoPressedTargets = mutableMapOf<Int, Int>()
     private val pianoAudioLock = Any()
     private val pianoVoices = mutableListOf<PianoVoice>()
     private var pianoAudioTrack: AudioTrack? = null
@@ -450,21 +649,26 @@ class MainActivity : Activity() {
     private val pianoLoadedCount = AtomicInteger(0)
     private val pianoLoadFailedCount = AtomicInteger(0)
     private var pianoVolume = 0.8f
-    private var pianoReverbEnabled = true
+    @Volatile private var pianoReverbEnabled = true
     private var pianoReverbButton: Button? = null
     private var pianoTranspose = 0
-    private var pianoVolumeButton: Button? = null
+    private var pianoVolumeSlider: SeekBar? = null
+    private var pianoVolumeLabel: TextView? = null
     private var pianoOctaveButton: Button? = null
+    private var pianoNoteReadout: TextView? = null
+    private val pianoAudioShutdownHandler = Handler(Looper.getMainLooper())
+    private val pianoAudioShutdownRunnable = Runnable { stopPianoAudioEngine() }
 
     private val pianoOutputRate = 44100
     private val pianoBlockFrames = 256
+    private val pianoReverbLeft = PianoReverbProcessor(pianoOutputRate)
+    private val pianoReverbRight = PianoReverbProcessor(pianoOutputRate, stereoOffset = 23)
 
-    /** Starts a single streaming audio engine and decodes the original OGG samples off the UI thread. */
+    /** Decode the middle octave first, then the remaining OGG samples off the UI thread. */
     private fun initializePianoSamples() {
         if (pianoSamplesLoading || pianoSamplesInitialized) return
         pianoSamplesInitialized = true
         pianoSamplesLoading = true
-        startPianoAudioEngine()
         val names = arrayOf("c", "cs", "d", "ds", "e", "f", "fs", "g", "gs", "a", "as", "b")
         // Decode the middle octave first, where most users begin playing, then fill
         // outward. A few independent decoders make common keys available sooner.
@@ -472,8 +676,8 @@ class MainActivity : Activity() {
         val noteOrder = firstNotes + (36..96).filterNot { it in firstNotes }.sortedBy { abs(it - 65) }
         val nextNote = AtomicInteger(0)
         val missing = AtomicInteger(0)
-        val workersRemaining = AtomicInteger(4)
-        repeat(4) { workerIndex ->
+        val workersRemaining = AtomicInteger(2)
+        repeat(2) { workerIndex ->
             Thread({
                 while (true) {
                     val index = nextNote.getAndIncrement()
@@ -491,7 +695,8 @@ class MainActivity : Activity() {
                         pianoSamples[note] = decoded
                         pianoLoadedCount.incrementAndGet()
                         runOnUiThread {
-                            if (pianoHeldNotes.contains(note)) startPianoSample(note)
+                            pianoHeldNotes.filter { it.coerceIn(36, 96) == note }
+                                .forEach(::startPianoSample)
                         }
                     } catch (e: Exception) {
                         pianoLoadFailedCount.incrementAndGet()
@@ -507,6 +712,7 @@ class MainActivity : Activity() {
     }
 
     private fun startPianoAudioEngine() {
+        if (pianoEngineRunning || pianoAudioTrack?.state == AudioTrack.STATE_INITIALIZED) return
         val minBuffer = AudioTrack.getMinBufferSize(
             pianoOutputRate,
             AudioFormat.CHANNEL_OUT_STEREO,
@@ -568,15 +774,110 @@ class MainActivity : Activity() {
                             val outIndex = frame * 2
                             output[outIndex] = (output[outIndex].toInt() + (left * gain).toInt()).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
                             output[outIndex + 1] = (output[outIndex + 1].toInt() + (right * gain).toInt()).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-                            voice.position += sample.sampleRate.toDouble() / pianoOutputRate
+                            voice.position += sample.sampleRate.toDouble() / pianoOutputRate * voice.pitchRatio
                         }
                         if (voice.releaseTotalFrames > 0 && voice.releaseRemainingFrames <= 0) iterator.remove()
                     }
                 }
+                val reverbEnabled = pianoReverbEnabled
+                for (frame in 0 until pianoBlockFrames) {
+                    val outIndex = frame * 2
+                    val dryLeft = output[outIndex].toFloat() / 32768f
+                    val dryRight = output[outIndex + 1].toFloat() / 32768f
+                    val wetLeft = pianoReverbLeft.process(if (reverbEnabled) dryLeft else 0f)
+                    val wetRight = pianoReverbRight.process(if (reverbEnabled) dryRight else 0f)
+                    if (reverbEnabled) {
+                        output[outIndex] = ((dryLeft + wetLeft * 0.22f) * 32767f)
+                            .roundToInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                        output[outIndex + 1] = ((dryRight + wetRight * 0.22f) * 32767f)
+                            .roundToInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                    }
+                }
                 val written = track.write(output, 0, output.size, AudioTrack.WRITE_BLOCKING)
-                if (written < 0) Log.e(PIANO_LOAD_TAG, "AudioTrack write failed: $written")
+                if (written < 0 && pianoEngineRunning) Log.e(PIANO_LOAD_TAG, "AudioTrack write failed: $written")
             }
         }, "PianoAudioEngine").apply { start() }
+    }
+
+    private fun schedulePianoAudioShutdown() {
+        pianoAudioShutdownHandler.removeCallbacks(pianoAudioShutdownRunnable)
+        pianoAudioShutdownHandler.postDelayed(pianoAudioShutdownRunnable, 12_000L)
+    }
+
+    private fun stopPianoAudioEngine() {
+        pianoAudioShutdownHandler.removeCallbacks(pianoAudioShutdownRunnable)
+        pianoEngineRunning = false
+        val track = pianoAudioTrack
+        try { track?.pause() } catch (_: Exception) {}
+        try { track?.stop() } catch (_: Exception) {}
+        try { pianoAudioThread?.join(350) } catch (_: InterruptedException) {}
+        pianoAudioThread = null
+        try { track?.flush() } catch (_: Exception) {}
+        try { track?.release() } catch (_: Exception) {}
+        pianoAudioTrack = null
+        synchronized(pianoAudioLock) { pianoVoices.clear() }
+        pianoHeldNotes.clear()
+        pianoPressedTargets.clear()
+    }
+
+    private fun updatePianoVolumeControls() {
+        val percent = (pianoVolume * 100).roundToInt().coerceIn(0, 100)
+        pianoVolumeLabel?.text = "VOL $percent%"
+        pianoVolumeSlider?.let { if (it.progress != percent) it.progress = percent }
+        synchronized(pianoAudioLock) { pianoVoices.forEach { it.volume = pianoVolume } }
+    }
+
+    private fun applyKeyboardVolumeSafeInset() {
+        if (android.os.Build.VERSION.SDK_INT < 28) return
+        val row = keyboardControlsRow ?: return
+        val volumeCell = row.getChildAt(0) ?: return
+        val insets = window.decorView.rootWindowInsets ?: return
+        val cameraInset = insets.displayCutout?.safeInsetLeft ?: 0
+        val rowLocation = IntArray(2)
+        row.getLocationOnScreen(rowLocation)
+        val localInset = (cameraInset - rowLocation[0]).coerceAtLeast(0)
+        val gap = (6f * resources.displayMetrics.density).roundToInt()
+        val targetMargin = if (localInset > 0) localInset + gap else 0
+        val params = volumeCell.layoutParams as? LinearLayout.LayoutParams ?: return
+        if (params.marginStart != targetMargin) {
+            params.marginStart = targetMargin
+            volumeCell.layoutParams = params
+        }
+    }
+
+    private fun showPianoVolumeDialog() {
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).roundToInt()
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(16), dp(20), dp(8))
+        }
+        val value = TextView(this).apply {
+            text = "${(pianoVolume * 100).roundToInt()}%"
+            textSize = 18f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+        }
+        val slider = SeekBar(this).apply {
+            max = 100
+            progress = (pianoVolume * 100).roundToInt()
+        }
+        slider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                pianoVolume = progress.coerceIn(0, 100).toFloat() / 100f
+                value.text = "$progress%"
+                updatePianoVolumeControls()
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+            override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+        })
+        content.addView(value, LinearLayout.LayoutParams(-1, dp(30)))
+        content.addView(slider, LinearLayout.LayoutParams(-1, dp(48)))
+        AlertDialog.Builder(this)
+            .setTitle("Piano volume")
+            .setView(content)
+            .setPositiveButton("Done", null)
+            .show()
     }
 
     /** Decode an OGG resource into interleaved PCM16 without blocking the UI thread. */
@@ -665,25 +966,34 @@ class MainActivity : Activity() {
     }
 
     private fun playPianoSample(midiNote: Int) {
+        pianoAudioShutdownHandler.removeCallbacks(pianoAudioShutdownRunnable)
         initializePianoSamples()
-        val playedNote = (midiNote + pianoTranspose).coerceIn(36, 96)
+        startPianoAudioEngine()
+        val playedNote = midiNote + pianoTranspose
+        pianoPressedTargets[midiNote] = playedNote
         pianoHeldNotes.add(playedNote)
+        updatePianoNoteReadout(playedNote)
         startPianoSample(playedNote)
     }
 
     private fun startPianoSample(playedNote: Int) {
-        val sample = pianoSamples[playedNote] ?: return
+        val sourceNote = playedNote.coerceIn(36, 96)
+        val sample = pianoSamples[sourceNote] ?: return
+        val pitchRatio = 2.0.pow((playedNote - sourceNote) / 12.0)
         synchronized(pianoAudioLock) {
             // Retrigger this note without creating an unbounded number of voices.
             pianoVoices.removeAll { it.note == playedNote }
-            pianoVoices.add(PianoVoice(playedNote, sample, volume = pianoVolume))
+            pianoVoices.add(PianoVoice(playedNote, sample, volume = pianoVolume, pitchRatio = pitchRatio))
         }
     }
 
     private fun releasePianoSample(midiNote: Int) {
-        val playedNote = (midiNote + pianoTranspose).coerceIn(36, 96)
+        val playedNote = pianoPressedTargets.remove(midiNote) ?: (midiNote + pianoTranspose)
         pianoHeldNotes.remove(playedNote)
-        if (pianoReverbEnabled) return
+        if (pianoReverbEnabled) {
+            schedulePianoAudioShutdown()
+            return
+        }
         synchronized(pianoAudioLock) {
             for (voice in pianoVoices) {
                 if (voice.note == playedNote && voice.releaseTotalFrames == 0) {
@@ -692,33 +1002,356 @@ class MainActivity : Activity() {
                 }
             }
         }
+        schedulePianoAudioShutdown()
+    }
+
+    private fun updatePianoNoteReadout(midiNote: Int) {
+        val noteName = listOf("C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B")
+            .let { it[Math.floorMod(midiNote, 12)] + (Math.floorDiv(midiNote, 12) - 1) }
+        val frequency = 440.0 * 2.0.pow((midiNote - 69) / 12.0)
+        pianoNoteReadout?.text = String.format(java.util.Locale.US, "%s\n%.1f Hz", noteName, frequency)
     }
 
     private var toneMinFrequency = 20
     private var toneMaxFrequency = 20000
     @Volatile private var toneVolume = 0.5
     @Volatile private var toneWaveform = "Sine"
+    @Volatile private var toneOutputChannel = "Stereo"
+    @Volatile private var toneDtmfActive = false
+    @Volatile private var toneDtmfLowFrequency = 697
+    @Volatile private var toneDtmfHighFrequency = 1209
+    private var toneDtmfSelectedKey = "1"
+    private var toneDtmfModeButton: Button? = null
+    private var toneWaveformButton: View? = null
     @Volatile private var toneStopRequested = false
     private var toneTrack: AudioTrack? = null
     private var toneThread: Thread? = null
     private var tonePlayButton: Button? = null
     @Volatile private var toneSweepActive = false
     private var toneSweepStartedAt = 0L
-    private val toneSweepDurationMs = 8000L
+    private var toneSweepDurationMs = 8000L
+    private var toneSweepStartFrequency = 20
+    private var toneSweepEndFrequency = 20000
+    @Volatile private var toneSweepAscending = true
     private val toneSweepHandler = Handler(Looper.getMainLooper())
     private var toneSweepUiUpdate: (() -> Unit)? = null
     private var toneSweepButton: AnalyzerIconButton? = null
+    private var toneSweepRangeButton: Button? = null
+    private var toneSweepDurationButton: Button? = null
+    private var toneSweepDirectionButton: Button? = null
+
+    private fun loadCustomToneFrequencies(): List<Int> = getSharedPreferences(
+        "tone_generator", Context.MODE_PRIVATE
+    ).getStringSet("custom_frequency_presets", emptySet()).orEmpty()
+        .mapNotNull { it.toIntOrNull() }
+        .filter { it in 20..20000 }
+        .distinct()
+        .sorted()
+
+    private fun saveCustomToneFrequencies(frequencies: Collection<Int>) {
+        getSharedPreferences("tone_generator", Context.MODE_PRIVATE)
+            .edit()
+            .putStringSet("custom_frequency_presets", frequencies.map { it.toString() }.toSet())
+            .apply()
+    }
+
+    private fun showAddTonePresetDialog(
+        minFrequency: Int,
+        maxFrequency: Int,
+        existingFrequencies: Set<Int>,
+        onAdded: () -> Unit
+    ) {
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).roundToInt()
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(16), dp(18), dp(16))
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(14, 21, 31))
+                cornerRadius = dp(20).toFloat()
+            }
+        }
+        content.addView(TextView(this).apply {
+            text = "Add frequency preset"
+            textSize = 18f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(Color.WHITE)
+        })
+        content.addView(TextView(this).apply {
+            text = "Enter a frequency from $minFrequency to $maxFrequency Hz."
+            textSize = 13f
+            setTextColor(Color.LTGRAY)
+            setPadding(0, dp(6), 0, dp(10))
+        })
+        val input = EditText(this).apply {
+            setText(toneFrequency.toString())
+            textSize = 19f
+            setTextColor(Color.rgb(255, 213, 90))
+            gravity = Gravity.CENTER
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            filters = arrayOf(InputFilter.LengthFilter(5))
+            isSingleLine = true
+            isCursorVisible = true
+            isFocusableInTouchMode = true
+            showSoftInputOnFocus = false
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(15, 23, 36))
+                cornerRadius = dp(12).toFloat()
+                setStroke(dp(1), Color.rgb(67, 91, 119))
+            }
+            setSelection(text.length)
+        }
+        content.addView(input, LinearLayout.LayoutParams(-1, dp(48)))
+
+        val keypad = android.widget.GridLayout(this).apply {
+            columnCount = 3
+            rowCount = 4
+        }
+        fun addFrequencyKey(label: String, action: () -> Unit) {
+            val button = Button(this).apply {
+                text = label
+                textSize = 16f
+                minWidth = dp(48)
+                minimumWidth = dp(48)
+                minHeight = dp(42)
+                minimumHeight = dp(42)
+                isFocusable = false
+                setPadding(0, 0, 0, 0)
+                setTextColor(Color.rgb(255, 213, 90))
+                setOnClickListener { action() }
+            }
+            styleNumericDialogButton(button)
+            keypad.addView(button, android.widget.GridLayout.LayoutParams().apply {
+                width = dp(52)
+                height = dp(42)
+                setMargins(dp(2), dp(2), dp(2), dp(2))
+            })
+        }
+        fun appendFrequencyDigit(digit: String) {
+            val editable = input.text
+            val start = input.selectionStart.coerceIn(0, editable.length)
+            val end = input.selectionEnd.coerceIn(start, editable.length)
+            if (editable.length - (end - start) < 5) {
+                editable.replace(start, end, digit)
+                input.setSelection(start + digit.length)
+            }
+        }
+        addFrequencyKey("1") { appendFrequencyDigit("1") }
+        addFrequencyKey("2") { appendFrequencyDigit("2") }
+        addFrequencyKey("3") { appendFrequencyDigit("3") }
+        addFrequencyKey("4") { appendFrequencyDigit("4") }
+        addFrequencyKey("5") { appendFrequencyDigit("5") }
+        addFrequencyKey("6") { appendFrequencyDigit("6") }
+        addFrequencyKey("7") { appendFrequencyDigit("7") }
+        addFrequencyKey("8") { appendFrequencyDigit("8") }
+        addFrequencyKey("9") { appendFrequencyDigit("9") }
+        addFrequencyKey("⌫") {
+            val editable = input.text
+            val start = input.selectionStart.coerceIn(0, editable.length)
+            val end = input.selectionEnd.coerceIn(start, editable.length)
+            when {
+                end > start -> editable.delete(start, end)
+                start > 0 -> editable.delete(start - 1, start)
+            }
+            input.setSelection((if (end > start) start else (start - 1).coerceAtLeast(0)).coerceAtMost(editable.length))
+        }
+        addFrequencyKey("0") { appendFrequencyDigit("0") }
+        addFrequencyKey("CLR") {
+            input.setText("")
+            input.setSelection(0)
+        }
+        content.addView(keypad, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            topMargin = dp(5)
+        })
+
+        lateinit var dialog: Dialog
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(12), 0, 0)
+        }
+        val cancel = Button(this).apply {
+            text = "Cancel"
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(42, 57, 75))
+                cornerRadius = dp(14).toFloat()
+            }
+            setOnClickListener { dialog.dismiss() }
+        }
+        actions.addView(cancel, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(8) })
+        val add = Button(this).apply {
+            text = "Add"
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(39, 113, 147))
+                cornerRadius = dp(14).toFloat()
+            }
+            setOnClickListener {
+                val frequency = input.text.toString().trim().toIntOrNull()
+                when {
+                    frequency == null -> input.error = "Enter a frequency in Hz"
+                    frequency !in minFrequency..maxFrequency -> input.error = "Use $minFrequency–$maxFrequency Hz"
+                    frequency in existingFrequencies || frequency in loadCustomToneFrequencies() ->
+                        input.error = "That frequency is already in the presets"
+                    else -> {
+                        saveCustomToneFrequencies(loadCustomToneFrequencies() + frequency)
+                        dialog.dismiss()
+                        onAdded()
+                    }
+                }
+            }
+        }
+        actions.addView(add, LinearLayout.LayoutParams(0, dp(44), 1f))
+        content.addView(actions)
+        dialog = Dialog(this)
+        dialog.setContentView(content)
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.window?.apply {
+            setBackgroundDrawableResource(android.R.color.transparent)
+            setSoftInputMode(
+                android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                    android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+            )
+        }
+        centerDialogOnScreen(dialog, dp(320))
+        dialog.show()
+        input.requestFocus()
+        input.setSelection(input.text.length)
+    }
+
+    private fun showDeleteTonePresetDialog(frequency: Int, onDelete: () -> Unit) {
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).roundToInt()
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(16), dp(18), dp(16))
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(14, 21, 31))
+                cornerRadius = dp(20).toFloat()
+            }
+        }
+        content.addView(TextView(this).apply {
+            text = "Delete $frequency Hz preset?"
+            textSize = 18f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(Color.WHITE)
+        })
+        content.addView(TextView(this).apply {
+            text = "This removes the custom frequency from your saved presets."
+            textSize = 13f
+            setTextColor(Color.LTGRAY)
+            setPadding(0, dp(7), 0, dp(12))
+        })
+        lateinit var dialog: Dialog
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        actions.addView(Button(this).apply {
+            text = "Cancel"
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(42, 57, 75))
+                cornerRadius = dp(14).toFloat()
+            }
+            setOnClickListener { dialog.dismiss() }
+        }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(8) })
+        actions.addView(Button(this).apply {
+            text = "Delete"
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(164, 69, 80))
+                cornerRadius = dp(14).toFloat()
+            }
+            setOnClickListener {
+                saveCustomToneFrequencies(loadCustomToneFrequencies().filterNot { it == frequency })
+                dialog.dismiss()
+                onDelete()
+            }
+        }, LinearLayout.LayoutParams(0, dp(44), 1f))
+        content.addView(actions)
+        dialog = Dialog(this)
+        dialog.setContentView(content)
+        dialog.setCanceledOnTouchOutside(true)
+        centerDialogOnScreen(dialog, dp(320))
+        dialog.show()
+    }
+
+    private fun isNoiseTone(): Boolean = toneWaveform == "White noise" || toneWaveform == "Pink noise"
+
+    private fun isUsableTonePeak(frequency: Double, peakDb: Double, rmsDb: Double): Boolean {
+        return frequency.isFinite() && frequency in 20.0..20000.0 &&
+                peakDb > -85.0 && rmsDb > -90.0 && peakDb - rmsDb >= 1.5
+    }
+
+    private fun setTonePeakFollowEnabled(enabled: Boolean, refreshUi: Boolean = true) {
+        tonePeakFollowEnabled = enabled
+        tonePeakFollowWindowStartedAt = if (enabled) SystemClock.elapsedRealtime() else 0L
+        tonePeakBestFrequency = 0.0
+        tonePeakBestDb = -120.0
+        if (enabled && isUsableTonePeak(latestAnalyzedPeakFrequency, latestAnalyzedPeakDb, latestAnalyzedRmsDb)) {
+            tonePeakBestFrequency = latestAnalyzedPeakFrequency
+            tonePeakBestDb = latestAnalyzedPeakDb
+            toneFrequency = latestAnalyzedPeakFrequency.roundToInt().coerceIn(20, 20000)
+        }
+        tonePeakPresetButton?.backgroundTintList = if (enabled) {
+            android.content.res.ColorStateList.valueOf(Color.rgb(29, 105, 145))
+        } else null
+        tonePeakPresetButton?.contentDescription = if (enabled) {
+            "Peak tracking active; frequency updates every five seconds and holds its last value. Tap to change."
+        } else "Frequency presets"
+        if (refreshUi) toneSweepUiUpdate?.invoke()
+    }
+
+    private fun updateTonePeakFollow(frequency: Double, peakDb: Double, rmsDb: Double) {
+        if (!tonePeakFollowEnabled) return
+
+        if (isUsableTonePeak(frequency, peakDb, rmsDb) && peakDb > tonePeakBestDb) {
+            tonePeakBestFrequency = frequency
+            tonePeakBestDb = peakDb
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        if (now - tonePeakFollowWindowStartedAt < 5000L) return
+
+        if (tonePeakBestFrequency > 0.0) {
+            toneFrequency = tonePeakBestFrequency.roundToInt().coerceIn(20, 20000)
+            toneSweepUiUpdate?.invoke()
+        }
+
+        // Keep the selected frequency when the room falls quiet. Only a new valid
+        // peak in the next five-second window can replace it.
+        tonePeakFollowWindowStartedAt = now
+        tonePeakBestFrequency = 0.0
+        tonePeakBestDb = -120.0
+        if (isUsableTonePeak(frequency, peakDb, rmsDb)) {
+            tonePeakBestFrequency = frequency
+            tonePeakBestDb = peakDb
+        }
+    }
+
     private val toneSweepRunnable = object : Runnable {
         override fun run() {
             if (!toneSweepActive) return
-            val low = toneMinFrequency.coerceAtLeast(20)
-            val high = toneMaxFrequency.coerceAtMost(20000).coerceAtLeast(low + 1)
+            val low = toneSweepStartFrequency.coerceIn(20, 19999)
+            val high = toneSweepEndFrequency.coerceIn(low + 1, 20000)
+            val start = if (toneSweepAscending) low else high
+            val end = if (toneSweepAscending) high else low
             val progress = ((SystemClock.elapsedRealtime() - toneSweepStartedAt).toDouble() / toneSweepDurationMs)
                 .coerceIn(0.0, 1.0)
-            toneFrequency = (low * exp(progress * ln(high.toDouble() / low))).roundToInt().coerceIn(low, high)
+            toneFrequency = (start * exp(progress * ln(end.toDouble() / start))).roundToInt().coerceIn(low, high)
             toneSweepUiUpdate?.invoke()
             if (progress >= 1.0) {
-                toneSweepActive = false
+                cancelToneSweep()
                 stopTone()
                 resetTonePlayButton()
             } else {
@@ -749,13 +1382,16 @@ class MainActivity : Activity() {
         setContentView(R.layout.activity_main)
         hideSystemBars()
 
+        val savedSplOffset = getSharedPreferences("sound_level_calibration", Context.MODE_PRIVATE)
+            .getFloat("offset_db", Float.NaN)
+        splManualCalibrationOffsetDb = savedSplOffset.takeIf { it.isFinite() }?.toDouble()
+        splCalibrationOffsetDb = splManualCalibrationOffsetDb
+
         spectrumView = findViewById(R.id.spectrumView)
         statusText = findViewById(R.id.statusText)
         peakText = findViewById(R.id.peakText)
         startButton = findViewById(R.id.startButton)
         configureSpectrumHeader()
-        // Preload piano samples during launch so the keyboard is ready before the first tap.
-        initializePianoSamples()
         spectrumView.setControlStateListener { axisMode, _, _, _ ->
             headerTitleText?.text = if (axisMode == "LINEAR") {
                 "SPECTRUM ANALYZER (LINEAR)"
@@ -827,6 +1463,7 @@ class MainActivity : Activity() {
 
             // Reset remains the rightmost graph control after analysis start/stop is removed.
             val resetButton = AnalyzerIconButton(this, AnalyzerIconButton.Icon.RESET)
+            resetDisplayButton = resetButton
             configureActionButton(resetButton)
             resetButton.layoutParams = (resetButton.layoutParams as LinearLayout.LayoutParams).apply {
                 width = dp(39)
@@ -846,6 +1483,7 @@ class MainActivity : Activity() {
                     icon = if (enabled) AnalyzerIconButton.Icon.SPECTRUM else AnalyzerIconButton.Icon.SPECTROGRAM
                 }
             }
+            spectrogramModeButton = spectrogramButton
             configureActionButton(spectrogramButton)
 
             val axisButton = AnalyzerIconButton(this, if (spectrumView.isLinearFrequencyAxis()) AnalyzerIconButton.Icon.LOG else AnalyzerIconButton.Icon.LIN).apply {
@@ -919,8 +1557,31 @@ class MainActivity : Activity() {
             actionRow.addView(axisButton)
             actionRow.addView(spectrogramButton)
             actionRow.addView(resetButton)
+            mainActionRow = actionRow
+            val actionBar = android.widget.FrameLayout(this).apply {
+                clipChildren = false
+                clipToPadding = false
+            }
+            actionBar.addView(
+                actionRow,
+                android.widget.FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(42)
+                )
+            )
+            rangePickerButton?.let { rangeButton ->
+                (rangeButton.parent as? ViewGroup)?.removeView(rangeButton)
+                actionBar.addView(
+                    rangeButton,
+                    android.widget.FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        dp(38),
+                        Gravity.CENTER
+                    )
+                )
+            }
             originalParams.height = dp(42)
-            startParent.addView(actionRow, startIndex, originalParams)
+            startParent.addView(actionBar, startIndex, originalParams)
             startButton.visibility = View.GONE
             installToneGeneratorSplit(toneButton, keysButton)
         }
@@ -932,6 +1593,12 @@ class MainActivity : Activity() {
         } else {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), permissionRequest)
         }
+
+        // Begin decoding piano samples shortly after the first screen is shown.
+        // The decoder workers prioritize the middle octave and never block the UI thread.
+        window.decorView.postDelayed({
+            if (!isFinishing) initializePianoSamples()
+        }, 250L)
 
     }
 
@@ -949,7 +1616,10 @@ class MainActivity : Activity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemBars()
+        if (hasFocus) {
+            hideSystemBars()
+            keyboardControlsRow?.post { applyKeyboardVolumeSafeInset() }
+        }
     }
     private fun installToneGeneratorSplit(toggleButton: Button, keysButton: Button) {
         val parent = spectrumView.parent as? ViewGroup ?: return
@@ -964,9 +1634,23 @@ class MainActivity : Activity() {
         }
         spectrumView.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.35f)
         split.addView(spectrumView)
+        val portraitControlsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+        }
+        portraitGraphControlsRow = portraitControlsRow
+        split.addView(
+            portraitControlsRow,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                (42f * resources.displayMetrics.density).roundToInt()
+            )
+        )
         val panel = createToneGeneratorPanel()
         tonePanel = panel
-        split.addView(panel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.65f))
+        // Keep the graph dominant while slightly widening the tone controls.
+        split.addView(panel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.75f))
         panel.visibility = View.GONE
 
         fun dp(v: Int): Int = (v * resources.displayMetrics.density).roundToInt()
@@ -986,7 +1670,7 @@ class MainActivity : Activity() {
         keyboardControlsRow = controls
         fun controlButton(label: String, action: () -> Unit) = Button(this).apply {
             text = label
-            textSize = 11f
+            textSize = 10f
             isAllCaps = false
             minHeight = dp(34)
             minimumHeight = dp(34)
@@ -1000,18 +1684,50 @@ class MainActivity : Activity() {
             }
             setOnClickListener { action() }
         }
-        val volumeButton = controlButton("VOLUME 80%") {
-            pianoVolume = if (pianoVolume >= 0.99f) 0.2f else (pianoVolume + 0.2f).coerceAtMost(1f)
-            pianoVolumeButton?.text = "VOLUME ${(pianoVolume * 100).roundToInt()}%"
+        val volumeCell = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(5), 0, dp(5), 0)
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(22, 32, 42))
+                cornerRadius = dp(13).toFloat()
+                setStroke(dp(1).coerceAtLeast(1), Color.rgb(56, 68, 77))
+            }
+            contentDescription = "Piano volume"
         }
-        val volumeParams = volumeButton.layoutParams as LinearLayout.LayoutParams
-        volumeParams.marginStart = 0
-        volumeButton.layoutParams = volumeParams
-        volumeButton.gravity = Gravity.CENTER
-        volumeButton.textAlignment = View.TEXT_ALIGNMENT_CENTER
+        val volumeLabel = TextView(this).apply {
+            text = "VOL ${(pianoVolume * 100).roundToInt()}%"
+            textSize = 10f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+        }
+        val volumeSlider = SeekBar(this).apply {
+            max = 100
+            progress = (pianoVolume * 100).roundToInt().coerceIn(0, 100)
+            contentDescription = "Piano volume level"
+            progressTintList = android.content.res.ColorStateList.valueOf(Color.rgb(75, 196, 255))
+            thumbTintList = android.content.res.ColorStateList.valueOf(Color.rgb(130, 216, 255))
+            progressBackgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(60, 76, 91))
+        }
+        volumeCell.addView(volumeLabel, LinearLayout.LayoutParams(dp(58), ViewGroup.LayoutParams.MATCH_PARENT))
+        volumeCell.addView(volumeSlider, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+        volumeSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (!fromUser) return
+                pianoVolume = progress.coerceIn(0, 100).toFloat() / 100f
+                updatePianoVolumeControls()
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+            override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+        })
+        pianoVolumeSlider = volumeSlider
+        pianoVolumeLabel = volumeLabel
         val octaveButton = controlButton("OCTAVE 0") {
             pianoTranspose = when (pianoTranspose) { 0 -> 12; 12 -> -12; else -> 0 }
             pianoOctaveButton?.text = when (pianoTranspose) { 12 -> "OCTAVE +1"; -12 -> "OCTAVE -1"; else -> "OCTAVE 0" }
+            (keyboardPanel as? PianoKeyboardView)?.setTranspose(pianoTranspose)
         }
         val reverbButton = controlButton(if (pianoReverbEnabled) "REVERB ON" else "REVERB OFF") {
             pianoReverbEnabled = !pianoReverbEnabled
@@ -1020,13 +1736,32 @@ class MainActivity : Activity() {
                 styleXButton(this, primary = pianoReverbEnabled)
             }
         }
-        pianoVolumeButton = volumeButton
         pianoOctaveButton = octaveButton
         pianoReverbButton = reverbButton
         styleXButton(reverbButton, primary = pianoReverbEnabled)
-        controls.addView(volumeButton)
-        controls.addView(octaveButton)
-        controls.addView(reverbButton)
+        val noteReadout = TextView(this).apply {
+            text = "--\n-- Hz"
+            textSize = 9f
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            setTextColor(Color.rgb(255, 213, 90))
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            maxLines = 2
+            minHeight = dp(34)
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(22, 32, 42))
+                cornerRadius = dp(10).toFloat()
+                setStroke(dp(1), Color.rgb(49, 66, 83))
+            }
+            contentDescription = "Last played piano note and frequency"
+        }
+        pianoNoteReadout = noteReadout
+        controls.addView(volumeCell, LinearLayout.LayoutParams(0, dp(38), 2.3f).apply { marginEnd = dp(3) })
+        controls.addView(octaveButton, LinearLayout.LayoutParams(0, dp(38), 0.9f).apply { marginEnd = dp(3) })
+        controls.addView(reverbButton, LinearLayout.LayoutParams(0, dp(38), 0.9f).apply { marginEnd = dp(3) })
+        controls.addView(noteReadout, LinearLayout.LayoutParams(0, dp(38), 0.9f).apply {
+            marginEnd = dp(3)
+        })
         keyboardSection.addView(controls, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
 
         val keys = PianoKeyboardView(this) { midiNote, pressed ->
@@ -1037,17 +1772,33 @@ class MainActivity : Activity() {
                 releasePianoSample(midiNote)
             }
         }
+        keys.setTranspose(pianoTranspose)
         keyboardPanel = keys
         keyboardSection.addView(keys, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         keyboardSection.visibility = View.GONE
         split.addView(keyboardSection, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         splitContainer = split
         parent.addView(split, index, originalParams)
+        controls.post { applyKeyboardVolumeSafeInset() }
 
         fun showMode(mode: String) {
+            val wasSoundModeOpen = soundModeOpen
+            val wasKeyboardModeOpen = keyboardModeOpen
             toneModeOpen = mode == "tone"
             keyboardModeOpen = mode == "keys"
             soundModeOpen = mode == "sound"
+            if (keyboardModeOpen) {
+                pianoAudioShutdownHandler.removeCallbacks(pianoAudioShutdownRunnable)
+                initializePianoSamples()
+            } else if (wasKeyboardModeOpen) {
+                schedulePianoAudioShutdown()
+            }
+            requestedOrientation = if (soundModeOpen) {
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            } else {
+                ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            }
+            spectrumView.setSoundIdPortraitLayoutActive(soundModeOpen)
             fullScaleKeyboardOpen = false
             spectrumView.setKeysFrequencyRangeActive(keyboardModeOpen)
             spectrumView.setDbRangeMode(when {
@@ -1059,15 +1810,43 @@ class MainActivity : Activity() {
             soundIdPanel?.visibility = if (soundModeOpen) View.VISIBLE else View.GONE
             keyboardSection.visibility = if (keyboardModeOpen) View.VISIBLE else View.GONE
             spectrumView.visibility = View.VISIBLE
-            if (keyboardModeOpen) {
+            val portraitControls = listOfNotNull(spectrogramModeButton, axisToggleButton, resetDisplayButton)
+            val landscapeControls = listOfNotNull(axisToggleButton, spectrogramModeButton, resetDisplayButton)
+            if (soundModeOpen && !wasSoundModeOpen) {
+                portraitControls.forEach { control ->
+                    (control.parent as? ViewGroup)?.removeView(control)
+                    portraitGraphControlsRow?.addView(control)
+                }
+            } else if (!soundModeOpen && wasSoundModeOpen) {
+                landscapeControls.forEach { control ->
+                    (control.parent as? ViewGroup)?.removeView(control)
+                    mainActionRow?.addView(control)
+                }
+            }
+            portraitGraphControlsRow?.visibility = if (soundModeOpen) View.VISIBLE else View.GONE
+            rangePickerButton?.visibility = if (soundModeOpen) View.GONE else View.VISIBLE
+            if (keyboardModeOpen || soundModeOpen) {
                 split.orientation = LinearLayout.VERTICAL
                 spectrumView.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
-                keyboardSection.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+                if (keyboardModeOpen) {
+                    keyboardSection.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+                }
+                if (soundModeOpen) {
+                    soundIdPanel?.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+                }
             } else {
                 split.orientation = LinearLayout.HORIZONTAL
                 spectrumView.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.35f)
-                panel.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.65f)
+                panel.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.75f)
                 keyboardSection.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+                soundIdPanel?.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.75f)
+            }
+            mainActionRow?.let { row ->
+                row.gravity = if (soundModeOpen) Gravity.CENTER else Gravity.CENTER_VERTICAL or Gravity.START
+                for (index in 0 until row.childCount) {
+                    val child = row.getChildAt(index)
+                    child.visibility = if (!soundModeOpen || child === soundIdModeButton) View.VISIBLE else View.GONE
+                }
             }
             toggleButton.text = ""
             toggleButton.contentDescription = "Tone generator"
@@ -1090,6 +1869,7 @@ class MainActivity : Activity() {
             }
             split.requestLayout()
             spectrumView.invalidate()
+            if (keyboardModeOpen) keyboardControlsRow?.post { applyKeyboardVolumeSafeInset() }
         }
         switchAnalyzerMode = ::showMode
         toggleButton.setOnClickListener {
@@ -1135,43 +1915,128 @@ class MainActivity : Activity() {
             }
         }
 
-        // Keep the compact frequency and waveform cells together, centered in the panel.
+        // Keep frequency, waveform selection, and presets together in one compact row.
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-        header.addView(valueLabel, LinearLayout.LayoutParams(dp(112), dp(42)).apply {
-            marginEnd = dp(8)
-        })
-        val waveSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
-                arrayOf("Sine", "Square", "Triangle", "Sawtooth"))
-            setSelection(arrayOf("Sine", "Square", "Triangle", "Sawtooth").indexOf(toneWaveform).coerceAtLeast(0))
-            background = null
-            setPadding(dp(8), 0, dp(24), 0)
+        val presetsButton = AnalyzerIconButton(this, AnalyzerIconButton.Icon.PRESETS).apply {
+            contentDescription = "Frequency presets"
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(22, 32, 45))
+                cornerRadius = dp(11).toFloat()
+                setStroke(dp(1), Color.rgb(56, 73, 91))
+            }
+            stateListAnimator = null
         }
+        tonePeakPresetButton = presetsButton
+        header.addView(presetsButton, LinearLayout.LayoutParams(dp(44), dp(42)).apply {
+            marginEnd = dp(6)
+        })
+        header.addView(valueLabel, LinearLayout.LayoutParams(dp(112), dp(42)).apply {
+            marginEnd = dp(6)
+        })
+        val selectedWaveformIcon = ToneWaveformIconView(this, toneWaveform, Color.rgb(255, 213, 90))
         val waveCell = android.widget.FrameLayout(this).apply {
             background = GradientDrawable().apply {
                 setColor(Color.rgb(15, 23, 36))
                 cornerRadius = dp(12).toFloat()
                 setStroke(dp(1), Color.rgb(67, 91, 119))
             }
-            addView(waveSpinner, android.widget.FrameLayout.LayoutParams(dp(132), dp(42)))
-            addView(TextView(this@MainActivity).apply {
-                text = "▾"
-                textSize = 16f
-                setTextColor(Color.rgb(225, 233, 243))
-                gravity = Gravity.CENTER
-                isClickable = false
-            }, android.widget.FrameLayout.LayoutParams(dp(28), dp(42), Gravity.END or Gravity.CENTER_VERTICAL))
+            isClickable = true
+            isFocusable = true
+            contentDescription = "$toneWaveform signal. Tap to choose signal type."
+            addView(selectedWaveformIcon, android.widget.FrameLayout.LayoutParams(dp(56), dp(38), Gravity.CENTER))
         }
-        header.addView(waveCell, LinearLayout.LayoutParams(dp(132), dp(42)))
-        panel.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        waveSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
-                toneWaveform = arrayOf("Sine", "Square", "Triangle", "Sawtooth")[position]
+        toneWaveformButton = waveCell
+        header.addView(waveCell, LinearLayout.LayoutParams(dp(64), dp(42)).apply { marginEnd = dp(6) })
+        val playButton = AnalyzerIconButton(this, AnalyzerIconButton.Icon.PLAY).apply {
+            playStopIconScale = 0.72f
+            roundedPlayStopGlyphs = true
+            contentDescription = "Play selected tone"
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(29, 125, 65))
+                cornerRadius = dp(16).toFloat()
+                setStroke(dp(1), Color.rgb(67, 91, 86))
             }
-            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+            backgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(29, 125, 65))
+            setTextColor(Color.WHITE)
+            stateListAnimator = null
+            setOnClickListener {
+                if (tonePlaying) {
+                    if (toneSweepActive) cancelToneSweep()
+                    stopTone()
+                    resetTonePlayButton()
+                } else {
+                    startTone()
+                    if (tonePlaying) setTonePlayButtonPlaying(true)
+                }
+            }
+        }
+        tonePlayButton = playButton
+        header.addView(playButton, LinearLayout.LayoutParams(dp(44), dp(42)))
+        panel.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        waveCell.setOnClickListener {
+            val waveforms = arrayOf("Sine", "Square", "Triangle", "Sawtooth", "White noise", "Pink noise")
+            val picker = Dialog(this)
+            val pickerContent = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(24, 31, 42))
+                    cornerRadius = dp(20).toFloat()
+                    setStroke(dp(1), Color.rgb(49, 66, 83))
+                }
+            }
+            pickerContent.addView(TextView(this).apply {
+                text = "SIGNAL"
+                textSize = 13f
+                setTextColor(Color.rgb(225, 233, 243))
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, dp(8))
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            for (rowValues in waveforms.toList().chunked(2)) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER
+                }
+                rowValues.forEachIndexed { columnIndex, waveform ->
+                    val option = android.widget.FrameLayout(this).apply {
+                        background = GradientDrawable().apply {
+                            setColor(if (toneWaveform == waveform) Color.rgb(48, 59, 75) else Color.rgb(15, 23, 36))
+                            cornerRadius = dp(11).toFloat()
+                            setStroke(dp(1), if (toneWaveform == waveform) Color.rgb(255, 213, 90) else Color.rgb(67, 91, 119))
+                        }
+                        isClickable = true
+                        isFocusable = true
+                        contentDescription = if (waveform.endsWith("noise", ignoreCase = true)) "$waveform signal" else "$waveform waveform"
+                        addView(ToneWaveformIconView(this@MainActivity, waveform), android.widget.FrameLayout.LayoutParams(dp(58), dp(34), Gravity.CENTER))
+                        setOnClickListener {
+                            setTonePeakFollowEnabled(false, refreshUi = false)
+                            toneWaveform = waveform
+                            selectedWaveformIcon.waveform = waveform
+                            waveCell.contentDescription = "$waveform signal. Tap to choose signal type."
+                            toneSweepUiUpdate?.invoke()
+                            setTonePlayButtonPlaying(tonePlaying)
+                            picker.dismiss()
+                        }
+                    }
+                    row.addView(option, LinearLayout.LayoutParams(dp(72), dp(48)).apply {
+                        if (columnIndex > 0) marginStart = dp(4)
+                        if (columnIndex == 0) marginEnd = dp(4)
+                    })
+                }
+                pickerContent.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply {
+                    if (pickerContent.childCount > 1) topMargin = dp(5)
+                })
+            }
+            picker.setContentView(pickerContent)
+            picker.window?.setBackgroundDrawableResource(android.R.color.transparent)
+            centerDialogOnScreen(picker, dp(184))
+            picker.show()
         }
 
         // Keep the sliders and actions centered directly beneath the selector row.
@@ -1189,16 +2054,6 @@ class MainActivity : Activity() {
         controls.addView(slider, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             setMargins(dp(2), dp(5), dp(2), 0)
         })
-        val limits = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        limits.addView(TextView(this).apply { text = "$toneMinFrequency Hz"; textSize = 10f; setTextColor(Color.LTGRAY) }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        limits.addView(TextView(this).apply { text = "${String.format(java.util.Locale.US, "%,d", toneMaxFrequency)} Hz"; textSize = 10f; gravity = Gravity.END; setTextColor(Color.LTGRAY) }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        controls.addView(limits, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-
-        val utilityRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            setPadding(0, dp(2), 0, dp(1))
-        }
         fun utilityIcon(icon: AnalyzerIconButton.Icon, description: String) = AnalyzerIconButton(this, icon).apply {
             contentDescription = description
             background = GradientDrawable().apply {
@@ -1208,90 +2063,136 @@ class MainActivity : Activity() {
             }
             stateListAnimator = null
         }
-        val presetsButton = utilityIcon(AnalyzerIconButton.Icon.PRESETS, "Frequency presets")
         presetsButton.setOnClickListener {
             val low = toneMinFrequency.coerceAtLeast(20)
             val high = toneMaxFrequency.coerceAtMost(20000)
-            val presets = listOf(20, 50, 60, 100, 120, 250, 440, 500, 1000, 2000, 5000, 10000, 15000, 20000)
+            val builtInPresets = listOf(20, 50, 60, 100, 120, 250, 440, 500, 1000, 2000, 5000, 10000, 15000, 20000)
                 .filter { it in low..high }
-            if (presets.isEmpty()) {
-                Toast.makeText(this, "No presets in the selected tone range.", Toast.LENGTH_SHORT).show()
-            } else {
-                val presetDialog = Dialog(this@MainActivity)
-                val presetContent = LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    gravity = Gravity.CENTER
-                    setPadding(dp(12), dp(10), dp(12), dp(10))
-                    background = GradientDrawable().apply {
-                        setColor(Color.rgb(24, 31, 42))
-                        cornerRadius = dp(22).toFloat()
-                        setStroke(dp(1), Color.rgb(49, 66, 83))
-                    }
+            val customPresets = loadCustomToneFrequencies().filter { it in low..high }
+            val frequencies = (builtInPresets + customPresets).distinct()
+            val presetItems: List<Pair<Int?, Boolean>> = frequencies.map { it to (it in customPresets) } + listOf(null to false)
+            val presetDialog = Dialog(this@MainActivity)
+            val presetContent = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(24, 31, 42))
+                    cornerRadius = dp(22).toFloat()
+                    setStroke(dp(1), Color.rgb(49, 66, 83))
                 }
-                presetContent.addView(TextView(this@MainActivity).apply {
-                    text = "FREQUENCY PRESETS"
-                    textSize = 13f
-                    setTextColor(Color.rgb(225, 233, 243))
-                    setTypeface(typeface, android.graphics.Typeface.BOLD)
-                    gravity = Gravity.CENTER
-                    setPadding(0, 0, 0, dp(8))
-                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-                val presetGrid = LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.VERTICAL
+            }
+            presetContent.addView(TextView(this@MainActivity).apply {
+                text = "FREQUENCY PRESETS"
+                textSize = 13f
+                setTextColor(Color.rgb(225, 233, 243))
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, dp(8))
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            val presetGrid = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+            }
+            for ((rowIndex, rowValues) in presetItems.chunked(3).withIndex()) {
+                val row = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
                 }
-                for ((rowIndex, rowValues) in presets.chunked(3).withIndex()) {
-                    val row = LinearLayout(this@MainActivity).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                    }
-                    rowValues.forEachIndexed { columnIndex, frequency ->
-                        val label = if (frequency >= 1000) "${frequency / 1000} kHz" else "$frequency Hz"
-                        val presetButton = Button(this@MainActivity).apply {
-                            text = label
-                            textSize = 13f
-                            isAllCaps = false
-                            minHeight = dp(42)
-                            minimumHeight = dp(42)
-                            setOnClickListener {
-                                cancelToneSweep()
+                rowValues.forEachIndexed { columnIndex, item ->
+                    val frequency = item.first
+                    val isCustom = item.second
+                    val label = frequency?.let {
+                        if (it >= 1000 && it % 1000 == 0) "${it / 1000} kHz" else "$it Hz"
+                    } ?: "PEAK"
+                    val presetButton = Button(this@MainActivity).apply {
+                        text = label
+                        textSize = 13f
+                        isAllCaps = false
+                        minHeight = dp(42)
+                        minimumHeight = dp(42)
+                        contentDescription = when {
+                            frequency == null -> "Follow the strongest detected frequency, updating every five seconds and holding the last value."
+                            isCustom -> "Set tone frequency to $frequency hertz. Long-press to delete this custom preset."
+                            else -> "Set tone frequency to $frequency hertz"
+                        }
+                        setOnClickListener {
+                            cancelToneSweep()
+                            if (frequency == null) {
+                                setTonePeakFollowEnabled(true)
+                            } else {
+                                setTonePeakFollowEnabled(false, refreshUi = false)
                                 toneFrequency = frequency
                                 toneSweepUiUpdate?.invoke()
-                                presetDialog.dismiss()
                             }
+                            presetDialog.dismiss()
                         }
-                        styleNumericDialogButton(presetButton)
-                        presetButton.setTextColor(Color.rgb(255, 213, 90))
-                        row.addView(presetButton, LinearLayout.LayoutParams(0, dp(42), 1f).apply {
-                            if (columnIndex > 0) marginStart = dp(3)
-                            if (columnIndex < 2) marginEnd = dp(3)
-                        })
                     }
-                    repeat(3 - rowValues.size) { index ->
-                        val columnIndex = rowValues.size + index
-                        row.addView(View(this@MainActivity), LinearLayout.LayoutParams(0, dp(42), 1f).apply {
-                            if (columnIndex > 0) marginStart = dp(3)
-                            if (columnIndex < 2) marginEnd = dp(3)
-                        })
+                    styleNumericDialogButton(presetButton)
+                    presetButton.setTextColor(if (frequency == null) Color.rgb(125, 211, 252) else Color.rgb(255, 213, 90))
+                    if (isCustom && frequency != null) {
+                        presetButton.setOnLongClickListener {
+                            showDeleteTonePresetDialog(frequency) {
+                                presetDialog.dismiss()
+                                presetsButton.post { presetsButton.performClick() }
+                            }
+                            true
+                        }
                     }
-                    presetGrid.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)).apply {
-                        if (rowIndex > 0) topMargin = dp(5)
+                    row.addView(presetButton, LinearLayout.LayoutParams(0, dp(42), 1f).apply {
+                        if (columnIndex > 0) marginStart = dp(3)
+                        if (columnIndex < 2) marginEnd = dp(3)
                     })
                 }
-                presetContent.addView(presetGrid, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-                val closeButton = Button(this@MainActivity).apply {
-                    text = "CANCEL"
-                    textSize = 11f
-                    setOnClickListener { presetDialog.dismiss() }
+                repeat(3 - rowValues.size) { index ->
+                    val columnIndex = rowValues.size + index
+                    row.addView(View(this@MainActivity), LinearLayout.LayoutParams(0, dp(42), 1f).apply {
+                        if (columnIndex > 0) marginStart = dp(3)
+                        if (columnIndex < 2) marginEnd = dp(3)
+                    })
                 }
-                styleNumericDialogButton(closeButton)
-                closeButton.setTextColor(Color.rgb(225, 233, 243))
-                presetContent.addView(closeButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)).apply {
-                    topMargin = dp(8)
+                presetGrid.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)).apply {
+                    if (rowIndex > 0) topMargin = dp(5)
                 })
-                presetDialog.setContentView(presetContent)
-                presetDialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
-                centerDialogOnScreen(presetDialog, dp(260))
-                presetDialog.show()
             }
+            val presetScroll = android.widget.ScrollView(this@MainActivity).apply {
+                isFillViewport = false
+                isVerticalScrollBarEnabled = presetItems.size > 15
+                overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+                addView(presetGrid)
+            }
+            val visibleRows = ((presetItems.size + 2) / 3).coerceAtMost(5)
+            val visibleGridHeight = dp(visibleRows * 42 + (visibleRows - 1).coerceAtLeast(0) * 5)
+            presetContent.addView(presetScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, visibleGridHeight))
+            val addPresetButton = Button(this@MainActivity).apply {
+                text = "+  ADD FREQUENCY"
+                isAllCaps = false
+                textSize = 12f
+                setTextColor(Color.WHITE)
+                setOnClickListener {
+                    showAddTonePresetDialog(low, high, (builtInPresets + customPresets).toSet()) {
+                        presetDialog.dismiss()
+                        presetsButton.post { presetsButton.performClick() }
+                    }
+                }
+            }
+            styleNumericDialogButton(addPresetButton)
+            addPresetButton.setTextColor(Color.rgb(105, 220, 185))
+            presetContent.addView(addPresetButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)).apply {
+                topMargin = dp(7)
+            })
+            val closeButton = Button(this@MainActivity).apply {
+                text = "CANCEL"
+                textSize = 11f
+                setOnClickListener { presetDialog.dismiss() }
+            }
+            styleNumericDialogButton(closeButton)
+            closeButton.setTextColor(Color.rgb(225, 233, 243))
+            presetContent.addView(closeButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)).apply {
+                topMargin = dp(7)
+            })
+            presetDialog.setContentView(presetContent)
+            presetDialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+            centerDialogOnScreen(presetDialog, dp(260))
+            presetDialog.show()
         }
         val sweepButton = utilityIcon(AnalyzerIconButton.Icon.SWEEP, "Play frequency sweep")
         toneSweepButton = sweepButton
@@ -1301,25 +2202,280 @@ class MainActivity : Activity() {
                 stopTone()
                 resetTonePlayButton()
             } else {
-                toneFrequency = toneMinFrequency.coerceAtLeast(20)
+                setTonePeakFollowEnabled(false, refreshUi = false)
+                toneFrequency = if (toneSweepAscending) toneSweepStartFrequency else toneSweepEndFrequency
                 toneSweepUiUpdate?.invoke()
                 if (!tonePlaying) startTone()
                 if (tonePlaying) {
                     toneSweepStartedAt = SystemClock.elapsedRealtime()
                     toneSweepActive = true
+                    toneSweepRangeButton?.isEnabled = false
+                    toneSweepDurationButton?.isEnabled = false
+                    toneSweepDirectionButton?.isEnabled = false
+                    toneDtmfModeButton?.isEnabled = false
+                    toneWaveformButton?.isEnabled = false
                     sweepButton.contentDescription = "Stop frequency sweep"
                     sweepButton.backgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(29, 105, 145))
-                    tonePlayButton?.apply {
-                        text = "STOP TONE"
-                        backgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(150, 40, 45))
-                    }
+                    setTonePlayButtonPlaying(true)
                     toneSweepHandler.post(toneSweepRunnable)
                 }
             }
         }
-        utilityRow.addView(presetsButton, LinearLayout.LayoutParams(dp(44), dp(38)).apply { marginEnd = dp(8) })
-        utilityRow.addView(sweepButton, LinearLayout.LayoutParams(dp(44), dp(38)))
-        controls.addView(utilityRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        fun formatSweepFrequency(frequency: Int): String = when {
+            frequency >= 1000 && frequency % 1000 == 0 -> "${frequency / 1000} kHz"
+            frequency >= 1000 -> String.format(java.util.Locale.US, "%.1f kHz", frequency / 1000.0)
+            else -> "$frequency Hz"
+        }
+        fun styleSweepSettingButton(button: Button) {
+            button.isAllCaps = false
+            button.textSize = 11f
+            button.minWidth = 0
+            button.minimumWidth = 0
+            button.minHeight = dp(36)
+            button.minimumHeight = dp(36)
+            button.setPadding(dp(5), 0, dp(5), 0)
+            button.setTextColor(Color.rgb(225, 233, 243))
+            button.background = GradientDrawable().apply {
+                setColor(Color.rgb(15, 23, 36))
+                cornerRadius = dp(11).toFloat()
+                setStroke(dp(1), Color.rgb(67, 91, 119))
+            }
+            button.stateListAnimator = null
+        }
+        val sweepSettingsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val sweepRangeButton = Button(this).apply {
+            text = "${formatSweepFrequency(toneSweepStartFrequency)} → ${formatSweepFrequency(toneSweepEndFrequency)}"
+            contentDescription = "Frequency sweep from $toneSweepStartFrequency to $toneSweepEndFrequency Hz. Tap to change."
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        styleSweepSettingButton(sweepRangeButton)
+        val widestSweepRangeText = "${formatSweepFrequency(19999)} → ${formatSweepFrequency(20000)}"
+        val sweepRangeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = 11f * resources.displayMetrics.scaledDensity
+            typeface = sweepRangeButton.typeface
+        }
+        val sweepRangeMinimumWidth = (sweepRangeTextPaint.measureText(widestSweepRangeText) + dp(16)).roundToInt()
+        sweepRangeButton.minWidth = sweepRangeMinimumWidth
+        sweepRangeButton.minimumWidth = sweepRangeMinimumWidth
+        sweepRangeButton.setPadding(dp(8), 0, dp(8), 0)
+        toneSweepRangeButton = sweepRangeButton
+        val sweepDirectionButton = Button(this).apply {
+            text = if (toneSweepAscending) "↗" else "↙"
+            contentDescription = if (toneSweepAscending) "Sweep from low to high frequency. Tap to reverse." else "Sweep from high to low frequency. Tap to reverse."
+        }
+        styleSweepSettingButton(sweepDirectionButton)
+        sweepDirectionButton.textSize = 18f
+        toneSweepDirectionButton = sweepDirectionButton
+        sweepDirectionButton.setOnClickListener {
+            if (!toneSweepActive) {
+                toneSweepAscending = !toneSweepAscending
+                sweepDirectionButton.text = if (toneSweepAscending) "↗" else "↙"
+                sweepDirectionButton.contentDescription = if (toneSweepAscending) {
+                    "Sweep from low to high frequency. Tap to reverse."
+                } else {
+                    "Sweep from high to low frequency. Tap to reverse."
+                }
+            }
+        }
+        sweepRangeButton.setOnClickListener {
+            val rangeDialog = Dialog(this)
+            val content = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(dp(14), dp(10), dp(14), dp(10))
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(24, 31, 42))
+                    cornerRadius = dp(22).toFloat()
+                    setStroke(dp(1), Color.rgb(49, 66, 83))
+                }
+            }
+            fun sweepFrequencyInput(initial: Int): EditText = EditText(this).apply {
+                setText(initial.toString())
+                textSize = 20f
+                setTextColor(Color.rgb(255, 213, 90))
+                gravity = Gravity.CENTER
+                inputType = InputType.TYPE_CLASS_NUMBER
+                filters = arrayOf(InputFilter.LengthFilter(5))
+                isSingleLine = true
+                showSoftInputOnFocus = false
+                isFocusableInTouchMode = true
+                isCursorVisible = true
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(15, 23, 36))
+                    cornerRadius = dp(12).toFloat()
+                    setStroke(dp(1), Color.rgb(67, 91, 119))
+                }
+                setPadding(dp(6), dp(2), dp(6), dp(2))
+            }
+            val sweepStartInput = sweepFrequencyInput(toneSweepStartFrequency)
+            val sweepEndInput = sweepFrequencyInput(toneSweepEndFrequency)
+            sweepStartInput.contentDescription = "Sweep start frequency in hertz"
+            sweepEndInput.contentDescription = "Sweep end frequency in hertz"
+            val fields = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            fields.addView(sweepStartInput, LinearLayout.LayoutParams(0, dp(46), 1f))
+            fields.addView(TextView(this).apply {
+                text = "→"
+                textSize = 18f
+                gravity = Gravity.CENTER
+                setTextColor(Color.rgb(255, 213, 90))
+            }, LinearLayout.LayoutParams(dp(30), dp(46)))
+            fields.addView(sweepEndInput, LinearLayout.LayoutParams(0, dp(46), 1f))
+            content.addView(fields, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)))
+
+            var activeInput = sweepStartInput
+            fun updateInputFocus(input: EditText, hasFocus: Boolean) {
+                if (hasFocus) activeInput = input
+                input.background = GradientDrawable().apply {
+                    setColor(Color.rgb(15, 23, 36))
+                    cornerRadius = dp(12).toFloat()
+                    setStroke(dp(1), if (hasFocus) Color.rgb(255, 213, 90) else Color.rgb(67, 91, 119))
+                }
+            }
+            sweepStartInput.setOnFocusChangeListener { _, hasFocus -> updateInputFocus(sweepStartInput, hasFocus) }
+            sweepEndInput.setOnFocusChangeListener { _, hasFocus -> updateInputFocus(sweepEndInput, hasFocus) }
+
+            val keypad = android.widget.GridLayout(this).apply {
+                columnCount = 3
+                rowCount = 4
+            }
+            fun addKey(label: String, action: () -> Unit) {
+                val button = Button(this).apply {
+                    text = label
+                    textSize = 16f
+                    minWidth = dp(48)
+                    minimumWidth = dp(48)
+                    minHeight = dp(42)
+                    minimumHeight = dp(42)
+                    isFocusable = false
+                    setPadding(0, 0, 0, 0)
+                    setTextColor(Color.rgb(255, 213, 90))
+                    setOnClickListener { action() }
+                }
+                styleNumericDialogButton(button)
+                keypad.addView(button, android.widget.GridLayout.LayoutParams().apply {
+                    width = dp(52)
+                    height = dp(42)
+                    setMargins(dp(2), dp(2), dp(2), dp(2))
+                })
+            }
+            fun appendDigit(digit: String) {
+                val editable = activeInput.text
+                val start = activeInput.selectionStart.coerceIn(0, editable.length)
+                val end = activeInput.selectionEnd.coerceIn(start, editable.length)
+                if (editable.length - (end - start) < 5) {
+                    editable.replace(start, end, digit)
+                    activeInput.setSelection(start + digit.length)
+                }
+            }
+            addKey("1") { appendDigit("1") }
+            addKey("2") { appendDigit("2") }
+            addKey("3") { appendDigit("3") }
+            addKey("4") { appendDigit("4") }
+            addKey("5") { appendDigit("5") }
+            addKey("6") { appendDigit("6") }
+            addKey("7") { appendDigit("7") }
+            addKey("8") { appendDigit("8") }
+            addKey("9") { appendDigit("9") }
+            addKey("⌫") {
+                val editable = activeInput.text
+                val start = activeInput.selectionStart.coerceIn(0, editable.length)
+                val end = activeInput.selectionEnd.coerceIn(start, editable.length)
+                if (end > start) editable.delete(start, end) else if (start > 0) editable.delete(start - 1, start)
+                activeInput.setSelection((if (end > start) start else (start - 1).coerceAtLeast(0)).coerceAtMost(editable.length))
+            }
+            addKey("0") { appendDigit("0") }
+            addKey("CLR") {
+                activeInput.setText("")
+                activeInput.setSelection(0)
+            }
+            content.addView(keypad, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                topMargin = dp(4)
+                bottomMargin = dp(5)
+            })
+
+            val actions = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            val cancelButton = Button(this).apply {
+                text = "CANCEL"
+                textSize = 11f
+                setOnClickListener { rangeDialog.dismiss() }
+            }
+            val applyButton = Button(this).apply {
+                text = "APPLY"
+                textSize = 11f
+                setOnClickListener {
+                    val startHz = sweepStartInput.text.toString().trim().toIntOrNull()
+                    val endHz = sweepEndInput.text.toString().trim().toIntOrNull()
+                    when {
+                        startHz == null || endHz == null -> Toast.makeText(this@MainActivity, "Enter both frequencies.", Toast.LENGTH_SHORT).show()
+                        startHz !in 20..19999 || endHz !in 21..20000 -> Toast.makeText(this@MainActivity, "Use frequencies from 20 to 20,000 Hz.", Toast.LENGTH_SHORT).show()
+                        startHz >= endHz -> Toast.makeText(this@MainActivity, "The end frequency must be higher than the start.", Toast.LENGTH_SHORT).show()
+                        else -> {
+                            toneSweepStartFrequency = startHz
+                            toneSweepEndFrequency = endHz
+                            sweepRangeButton.text = "${formatSweepFrequency(startHz)} → ${formatSweepFrequency(endHz)}"
+                            sweepRangeButton.contentDescription = "Frequency sweep from $startHz to $endHz Hz. Tap to change."
+                            rangeDialog.dismiss()
+                        }
+                    }
+                }
+            }
+            for (button in listOf(cancelButton, applyButton)) {
+                styleNumericDialogButton(button)
+                button.setTextColor(Color.rgb(255, 213, 90))
+                actions.addView(button, LinearLayout.LayoutParams(0, dp(40), 1f).apply {
+                    setMargins(dp(3), 0, dp(3), 0)
+                })
+            }
+            content.addView(actions, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)))
+            rangeDialog.setContentView(content)
+            rangeDialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+            rangeDialog.show()
+            centerDialogOnScreen(rangeDialog, dp(320))
+            sweepStartInput.requestFocus()
+            sweepStartInput.setSelection(sweepStartInput.text.length)
+        }
+        val sweepDurationOptions = intArrayOf(4, 8, 16, 32)
+        var sweepDurationIndex = sweepDurationOptions.indexOf((toneSweepDurationMs / 1000L).toInt()).coerceAtLeast(0)
+        val sweepDurationButton = Button(this).apply {
+            val seconds = sweepDurationOptions[sweepDurationIndex]
+            text = "$seconds s"
+            contentDescription = "Sweep duration, $seconds seconds. Tap to change."
+        }
+        styleSweepSettingButton(sweepDurationButton)
+        toneSweepDurationButton = sweepDurationButton
+        sweepDurationButton.setOnClickListener {
+            if (!toneSweepActive) {
+                sweepDurationIndex = (sweepDurationIndex + 1) % sweepDurationOptions.size
+                val seconds = sweepDurationOptions[sweepDurationIndex]
+                toneSweepDurationMs = seconds * 1000L
+                sweepDurationButton.text = "$seconds s"
+                sweepDurationButton.contentDescription = "Sweep duration, $seconds seconds. Tap to change."
+            }
+        }
+        val sweepRangeGroup = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        sweepRangeGroup.addView(sweepRangeButton, LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginEnd = dp(4) })
+        sweepRangeGroup.addView(sweepDirectionButton, LinearLayout.LayoutParams(dp(40), dp(36)))
+        sweepSettingsRow.addView(sweepButton, LinearLayout.LayoutParams(dp(44), dp(36)).apply { marginEnd = dp(6) })
+        sweepSettingsRow.addView(sweepRangeGroup, LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginEnd = dp(6) })
+        sweepSettingsRow.addView(sweepDurationButton, LinearLayout.LayoutParams(dp(62), dp(36)))
+        controls.addView(sweepSettingsRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(36)).apply {
+            topMargin = dp(3)
+            bottomMargin = dp(2)
+        })
 
         val volumeHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1352,46 +2508,214 @@ class MainActivity : Activity() {
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
         })
 
-        val playButton = Button(this).apply {
-            text = "PLAY TONE"
-            textSize = 13f
-            minHeight = dp(38)
-            isAllCaps = true
-            stateListAnimator = null
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(29, 125, 65))
-                cornerRadius = dp(13).toFloat()
-                setStroke(dp(1), Color.rgb(67, 91, 86))
+        var dtmfModeEnabled = false
+        val dtmfModeButton = Button(this).apply {
+            text = "DTMF"
+            contentDescription = "Open DTMF two-tone keypad"
+            textSize = 11f
+            minHeight = dp(36)
+            minimumHeight = dp(36)
+            setPadding(dp(6), 0, dp(6), 0)
+            styleXButton(this, primary = false)
+        }
+        toneDtmfModeButton = dtmfModeButton
+        controls.addView(dtmfModeButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(36)).apply {
+            topMargin = dp(3)
+        })
+
+        val outputChannelPreferences = getSharedPreferences("tone_generator", Context.MODE_PRIVATE)
+        toneOutputChannel = outputChannelPreferences.getString("output_channel", "Stereo")
+            ?.takeIf { it in setOf("Left", "Right", "Stereo") } ?: "Stereo"
+        val outputChannelRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val outputChannelButtons = linkedMapOf<String, Button>()
+        fun refreshOutputChannelButtons() {
+            outputChannelButtons.forEach { (channel, button) ->
+                val selected = channel == toneOutputChannel
+                button.background = GradientDrawable().apply {
+                    setColor(if (selected) Color.rgb(39, 113, 147) else Color.rgb(22, 32, 45))
+                    cornerRadius = dp(10).toFloat()
+                    setStroke(dp(1), if (selected) Color.rgb(93, 173, 213) else Color.rgb(56, 73, 91))
+                }
+                button.contentDescription = if (selected) "$channel audio output selected" else "Select $channel audio output"
             }
-            backgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(29, 125, 65))
-            setTextColor(Color.WHITE)
-            setOnClickListener {
-                if (tonePlaying) {
-                    stopTone()
-                    resetTonePlayButton()
-                } else {
-                    startTone()
-                    if (tonePlaying) {
-                        text = "STOP TONE"
-                        backgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(150, 40, 45))
+        }
+        listOf("Left", "Right", "Stereo").forEachIndexed { index, channel ->
+            val channelButton = Button(this).apply {
+                text = channel.uppercase(java.util.Locale.ROOT)
+                textSize = 10f
+                isAllCaps = false
+                minHeight = dp(32)
+                minimumHeight = dp(32)
+                setPadding(dp(3), 0, dp(3), 0)
+                setTextColor(Color.WHITE)
+                stateListAnimator = null
+                setOnClickListener {
+                    toneOutputChannel = channel
+                    outputChannelPreferences.edit().putString("output_channel", channel).apply()
+                    refreshOutputChannelButtons()
+                }
+            }
+            outputChannelButtons[channel] = channelButton
+            outputChannelRow.addView(channelButton, LinearLayout.LayoutParams(0, dp(32), 1f).apply {
+                if (index > 0) marginStart = dp(4)
+            })
+        }
+        refreshOutputChannelButtons()
+        controls.addView(outputChannelRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(32)).apply {
+            topMargin = dp(3)
+        })
+
+        val dtmfInfo = TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.rgb(225, 233, 243))
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+            contentDescription = "Selected DTMF symbol and its two frequencies"
+        }
+        controls.addView(dtmfInfo, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(22)))
+
+        val dtmfGrid = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+        }
+        val dtmfKeyButtons = linkedMapOf<String, Button>()
+        val dtmfLowFrequencies = intArrayOf(697, 770, 852, 941)
+        val dtmfHighFrequencies = intArrayOf(1209, 1336, 1477)
+        val dtmfKeys = arrayOf(
+            arrayOf("1", "2", "3"),
+            arrayOf("4", "5", "6"),
+            arrayOf("7", "8", "9"),
+            arrayOf("*", "0", "#")
+        )
+        var refreshDtmfKeySelection: () -> Unit = {}
+        dtmfKeys.forEachIndexed { rowIndex, rowKeys ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            rowKeys.forEachIndexed { columnIndex, key ->
+                val keyButton = Button(this).apply {
+                    text = key
+                    textSize = 15f
+                    isAllCaps = false
+                    minWidth = 0
+                    minimumWidth = 0
+                    minHeight = dp(36)
+                    minimumHeight = dp(36)
+                    setPadding(0, 0, 0, 0)
+                    setTextColor(Color.WHITE)
+                    stateListAnimator = null
+                    background = GradientDrawable().apply {
+                        setColor(Color.rgb(22, 32, 45))
+                        cornerRadius = dp(11).toFloat()
+                        setStroke(dp(1), Color.rgb(56, 73, 91))
                     }
+                    setOnClickListener {
+                        toneDtmfSelectedKey = key
+                        toneDtmfLowFrequency = dtmfLowFrequencies[rowIndex]
+                        toneDtmfHighFrequency = dtmfHighFrequencies[columnIndex]
+                        toneDtmfActive = dtmfModeEnabled
+                        dtmfInfo.text = "$key  ·  ${toneDtmfLowFrequency} + ${toneDtmfHighFrequency} Hz"
+                        valueLabel.text = "DTMF $key"
+                        refreshDtmfKeySelection()
+                    }
+                }
+                keyButton.contentDescription = "DTMF $key: ${dtmfLowFrequencies[rowIndex]} and ${dtmfHighFrequencies[columnIndex]} hertz"
+                dtmfKeyButtons[key] = keyButton
+                row.addView(keyButton, LinearLayout.LayoutParams(0, dp(38), 1f).apply {
+                    setMargins(dp(3), dp(1), dp(3), dp(1))
+                })
+            }
+            dtmfGrid.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
+        }
+        refreshDtmfKeySelection = {
+            dtmfKeyButtons.forEach { (key, button) ->
+                val selected = key == toneDtmfSelectedKey
+                button.background = GradientDrawable().apply {
+                    setColor(if (selected) Color.rgb(29, 105, 145) else Color.rgb(22, 32, 45))
+                    cornerRadius = dp(11).toFloat()
+                    setStroke(dp(1), if (selected) Color.rgb(93, 173, 213) else Color.rgb(56, 73, 91))
                 }
             }
         }
-        tonePlayButton = playButton
-        controls.addView(playButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            setMargins(0, dp(1), 0, 0)
-        })
+        dtmfInfo.text = "1  ·  697 + 1209 Hz"
+        refreshDtmfKeySelection()
+        controls.addView(dtmfGrid, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        fun updateDtmfMode(enabled: Boolean) {
+            if (enabled == dtmfModeEnabled) return
+            if (enabled) setTonePeakFollowEnabled(false, refreshUi = false)
+            if (toneSweepActive) cancelToneSweep()
+            if (tonePlaying) stopTone()
+            dtmfModeEnabled = enabled
+            toneDtmfActive = enabled
+            valueLabel.text = if (enabled) "DTMF ${toneDtmfSelectedKey}" else "$toneFrequency Hz"
+            valueLabel.textSize = if (enabled) 13f else 18f
+            valueLabel.isClickable = !enabled
+            valueLabel.isEnabled = true
+            valueLabel.contentDescription = if (enabled) "Selected DTMF key $toneDtmfSelectedKey" else "Select tone frequency"
+            presetsButton.visibility = if (enabled) View.GONE else View.VISIBLE
+            waveCell.visibility = if (enabled) View.GONE else View.VISIBLE
+            slider.visibility = if (enabled) View.GONE else View.VISIBLE
+            sweepSettingsRow.visibility = if (enabled) View.GONE else View.VISIBLE
+            dtmfInfo.visibility = if (enabled) View.VISIBLE else View.GONE
+            dtmfGrid.visibility = if (enabled) View.VISIBLE else View.GONE
+            dtmfModeButton.text = if (enabled) "SINGLE TONE" else "DTMF"
+            dtmfModeButton.contentDescription = if (enabled) "Return to single tone controls" else "Open DTMF two-tone keypad"
+            styleXButton(dtmfModeButton, primary = enabled)
+            resetTonePlayButton()
+            if (!enabled) toneSweepUiUpdate?.invoke()
+        }
+        dtmfModeButton.setOnClickListener { updateDtmfMode(!dtmfModeEnabled) }
+
         fun updateToneSliderFromFrequency() {
+            val noiseSelected = isNoiseTone()
+            val selectedToneControlsEnabled = !noiseSelected && !toneSweepActive && !dtmfModeEnabled
+            if (dtmfModeEnabled) {
+                valueLabel.isEnabled = true
+                slider.isEnabled = false
+                presetsButton.isEnabled = false
+                sweepButton.isEnabled = false
+                toneWaveformButton?.isEnabled = false
+                toneSweepRangeButton?.isEnabled = false
+                toneSweepDurationButton?.isEnabled = false
+                toneSweepDirectionButton?.isEnabled = false
+                toneDtmfModeButton?.isEnabled = !toneSweepActive
+                return
+            }
+            valueLabel.isEnabled = !noiseSelected
+            slider.isEnabled = !noiseSelected
+            presetsButton.isEnabled = !noiseSelected
+            sweepButton.isEnabled = !noiseSelected
+            toneWaveformButton?.isEnabled = !toneSweepActive
+            toneSweepRangeButton?.isEnabled = selectedToneControlsEnabled
+            toneSweepDurationButton?.isEnabled = selectedToneControlsEnabled
+            toneSweepDirectionButton?.isEnabled = selectedToneControlsEnabled
+            toneDtmfModeButton?.isEnabled = !toneSweepActive
+            if (noiseSelected) {
+                valueLabel.text = if (toneWaveform == "White noise") "WHITE" else "PINK"
+                valueLabel.textSize = 14f
+                valueLabel.contentDescription = "$toneWaveform selected; tone frequency controls are unavailable."
+                if (!tonePlaying) tonePlayButton?.contentDescription = "Play ${toneWaveform.lowercase()}"
+                return
+            }
             val low = toneMinFrequency.coerceAtLeast(20)
             val high = toneMaxFrequency.coerceAtMost(20000).coerceAtLeast(low + 1)
             toneFrequency = toneFrequency.coerceIn(low, high)
             slider.progress = ((kotlin.math.ln(toneFrequency / low.toDouble()) / kotlin.math.ln(high / low.toDouble())) * slider.max).roundToInt().coerceIn(0, slider.max)
             valueLabel.text = "$toneFrequency Hz"
-            limits.getChildAt(0).let { (it as TextView).text = "$low Hz" }
-            limits.getChildAt(1).let { (it as TextView).text = "${String.format(java.util.Locale.US, "%,d", high)} Hz" }
+            valueLabel.textSize = 18f
+            valueLabel.contentDescription = if (tonePeakFollowEnabled) {
+                "Peak hold: $toneFrequency hertz. The strongest detected tonal peak refreshes every five seconds and remains selected if it disappears."
+            } else "Select tone frequency"
+            if (!tonePlaying) tonePlayButton?.contentDescription = "Play selected tone"
         }
         toneSweepUiUpdate = ::updateToneSliderFromFrequency
+        updateToneSliderFromFrequency()
         valueLabel.setOnClickListener {
             // Use the same custom numeric keypad as the Spectrum Analyzer.
             // Confirming a value only updates the frequency; it never starts playback.
@@ -1511,6 +2835,7 @@ class MainActivity : Activity() {
                     if (frequency == null || frequency !in 20..20000) {
                         display.error = "Enter 20–20000 Hz"
                     } else {
+                        setTonePeakFollowEnabled(false, refreshUi = false)
                         toneFrequency = frequency
                         updateToneSliderFromFrequency()
                         dialog.dismiss()
@@ -1535,11 +2860,13 @@ class MainActivity : Activity() {
         slider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 if (fromUser) {
+                    setTonePeakFollowEnabled(false, refreshUi = false)
                     val low = toneMinFrequency.coerceAtLeast(20)
                     val high = toneMaxFrequency.coerceAtMost(20000).coerceAtLeast(low + 1)
                     toneFrequency = (low * kotlin.math.exp(progress.toDouble() / slider.max * kotlin.math.ln(high.toDouble() / low))).roundToInt().coerceIn(low, high)
                 }
                 valueLabel.text = "$toneFrequency Hz"
+                if (!tonePeakFollowEnabled) valueLabel.contentDescription = "Select tone frequency"
             }
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
@@ -1564,16 +2891,82 @@ class MainActivity : Activity() {
         dialog.setOnShowListener { applyCenter() }
     }
 
-    private fun resetTonePlayButton() {
-        tonePlayButton?.apply {
-            text = "PLAY TONE"
-            backgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(29, 125, 65))
+    private fun attachSplDialogDragHandle(
+        dialog: Dialog,
+        handle: View,
+        screenWidth: Int,
+        screenHeight: Int
+    ) {
+        val margin = (16f * resources.displayMetrics.density).roundToInt()
+        var downRawX = 0f
+        var downRawY = 0f
+        var startOffsetX = 0
+        var startOffsetY = 0
+        var dragging = false
+        val touchSlop = android.view.ViewConfiguration.get(this).scaledTouchSlop
+        handle.setOnTouchListener { _, event ->
+            val window = dialog.window ?: return@setOnTouchListener false
+            val decor = window.decorView
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downRawX = event.rawX
+                    downRawY = event.rawY
+                    val attributes = window.attributes
+                    startOffsetX = attributes.x
+                    startOffsetY = attributes.y
+                    dragging = false
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val deltaX = event.rawX - downRawX
+                    val deltaY = event.rawY - downRawY
+                    if (!dragging && hypot(deltaX, deltaY) < touchSlop) return@setOnTouchListener true
+                    dragging = true
+                    val attributes = window.attributes
+                    val halfWidth = decor.width / 2
+                    val halfHeight = decor.height / 2
+                    val minX = margin + halfWidth - screenWidth / 2
+                    val maxX = screenWidth / 2 - margin - halfWidth
+                    val minY = margin + halfHeight - screenHeight / 2
+                    val maxY = screenHeight / 2 - margin - halfHeight
+                    attributes.gravity = Gravity.CENTER
+                    attributes.x = (startOffsetX + deltaX).roundToInt().coerceIn(minX, maxX.coerceAtLeast(minX))
+                    attributes.y = (startOffsetY + deltaY).roundToInt().coerceIn(minY, maxY.coerceAtLeast(minY))
+                    window.attributes = attributes
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    dragging = false
+                    true
+                }
+                else -> false
+            }
         }
+    }
+
+    private fun setTonePlayButtonPlaying(playing: Boolean) {
+        val button = tonePlayButton as? AnalyzerIconButton ?: return
+        button.icon = if (playing) AnalyzerIconButton.Icon.STOP else AnalyzerIconButton.Icon.PLAY
+        button.contentDescription = when {
+            playing && toneDtmfActive -> "Stop DTMF tone"
+            playing && isNoiseTone() -> "Stop ${toneWaveform.lowercase()}"
+            playing -> "Stop tone"
+            toneDtmfActive -> "Play selected DTMF tone"
+            isNoiseTone() -> "Play ${toneWaveform.lowercase()}"
+            else -> "Play selected tone"
+        }
+        button.backgroundTintList = android.content.res.ColorStateList.valueOf(
+            if (playing) Color.rgb(150, 40, 45) else Color.rgb(29, 125, 65)
+        )
+    }
+
+    private fun resetTonePlayButton() {
+        setTonePlayButtonPlaying(false)
     }
 
     private fun startTone() {
         if (tonePlaying) return
-        val minBuffer = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val minBuffer = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT)
         if (minBuffer <= 0) {
             Toast.makeText(this, "Audio output is unavailable.", Toast.LENGTH_SHORT).show()
             return
@@ -1581,7 +2974,7 @@ class MainActivity : Activity() {
         try {
             val track = AudioTrack(
                 AudioManager.STREAM_MUSIC, sampleRate,
-                AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT,
+                AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT,
                 max(minBuffer, 4096), AudioTrack.MODE_STREAM
             )
             toneTrack = track
@@ -1590,19 +2983,54 @@ class MainActivity : Activity() {
             track.play()
             toneThread = Thread {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
-                val buffer = ShortArray(1024)
+                val buffer = ShortArray(2048)
                 var phase = 0.0
+                var secondPhase = 0.0
+                var noiseState = System.nanoTime().toInt().let { if (it == 0) 1 else it }
+                var pink0 = 0.0
+                var pink1 = 0.0
+                var pink2 = 0.0
+                var pink3 = 0.0
+                var pink4 = 0.0
+                var pink5 = 0.0
+                var pink6 = 0.0
+                fun nextWhiteNoise(): Double {
+                    noiseState = noiseState xor (noiseState shl 13)
+                    noiseState = noiseState xor (noiseState ushr 17)
+                    noiseState = noiseState xor (noiseState shl 5)
+                    return (noiseState.toDouble() / Int.MAX_VALUE.toDouble()).coerceIn(-1.0, 1.0)
+                }
+                fun nextPinkNoise(): Double {
+                    val white = nextWhiteNoise()
+                    pink0 = 0.99886 * pink0 + white * 0.0555179
+                    pink1 = 0.99332 * pink1 + white * 0.0750759
+                    pink2 = 0.96900 * pink2 + white * 0.1538520
+                    pink3 = 0.86650 * pink3 + white * 0.3104856
+                    pink4 = 0.55000 * pink4 + white * 0.5329522
+                    pink5 = -0.7616 * pink5 - white * 0.0168980
+                    val pink = pink0 + pink1 + pink2 + pink3 + pink4 + pink5 + pink6 + white * 0.5362
+                    pink6 = white * 0.115926
+                    return (pink * 0.20).coerceIn(-1.0, 1.0)
+                }
                 var fadeRemaining = -1
                 val fadeSamples = (sampleRate * 0.04).toInt()
                 while (!Thread.currentThread().isInterrupted) {
                     if (toneStopRequested && fadeRemaining < 0) fadeRemaining = fadeSamples
                     if (!tonePlaying && fadeRemaining <= 0) break
-                    val frequency = toneFrequency.toDouble().coerceIn(20.0, 20000.0)
+                    val dtmf = toneDtmfActive
+                    val frequency = (if (dtmf) toneDtmfLowFrequency else toneFrequency).toDouble().coerceIn(20.0, 20000.0)
                     val step = 2.0 * PI * frequency / sampleRate
+                    val secondFrequency = toneDtmfHighFrequency.toDouble().coerceIn(20.0, 20000.0)
+                    val secondStep = 2.0 * PI * secondFrequency / sampleRate
                     val waveform = toneWaveform
                     val volume = toneVolume
-                    for (i in buffer.indices) {
-                        val normalized = when (waveform) {
+                    val outputChannel = toneOutputChannel
+                    for (frameIndex in 0 until buffer.size / 2) {
+                        val normalized = if (dtmf) {
+                            (sin(phase) + sin(secondPhase)) * 0.5
+                        } else when (waveform) {
+                            "White noise" -> nextWhiteNoise()
+                            "Pink noise" -> nextPinkNoise()
                             "Square" -> if (sin(phase) >= 0.0) 1.0 else -1.0
                             "Triangle" -> 2.0 / PI * kotlin.math.asin(sin(phase))
                             "Sawtooth" -> 2.0 * (phase / (2.0 * PI)) - 1.0
@@ -1613,9 +3041,27 @@ class MainActivity : Activity() {
                             envelope = (fadeRemaining.toDouble() / fadeSamples).coerceIn(0.0, 1.0)
                             fadeRemaining--
                         }
-                        buffer[i] = (normalized * 12000.0 * volume * envelope).toInt().toShort()
+                        val sample = (normalized.coerceIn(-1.0, 1.0) * 12000.0 * volume * envelope).toInt().toShort()
+                        val leftIndex = frameIndex * 2
+                        val rightIndex = leftIndex + 1
+                        when (outputChannel) {
+                            "Left" -> {
+                                buffer[leftIndex] = sample
+                                buffer[rightIndex] = 0
+                            }
+                            "Right" -> {
+                                buffer[leftIndex] = 0
+                                buffer[rightIndex] = sample
+                            }
+                            else -> {
+                                buffer[leftIndex] = sample
+                                buffer[rightIndex] = sample
+                            }
+                        }
                         phase += step
                         if (phase >= 2.0 * PI) phase -= 2.0 * PI
+                        secondPhase += secondStep
+                        if (secondPhase >= 2.0 * PI) secondPhase -= 2.0 * PI
                     }
                     try { track.write(buffer, 0, buffer.size) } catch (_: Exception) { break }
                     if (toneStopRequested && fadeRemaining <= 0) break
@@ -1652,6 +3098,12 @@ class MainActivity : Activity() {
         toneSweepHandler.removeCallbacks(toneSweepRunnable)
         toneSweepButton?.contentDescription = "Play frequency sweep"
         toneSweepButton?.backgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(22, 32, 45))
+        toneSweepRangeButton?.isEnabled = true
+        toneSweepDurationButton?.isEnabled = true
+        toneSweepDirectionButton?.isEnabled = true
+        toneDtmfModeButton?.isEnabled = true
+        toneWaveformButton?.isEnabled = true
+        toneSweepUiUpdate?.invoke()
     }
 
     private fun styleXButton(button: Button, primary: Boolean) {
@@ -1702,6 +3154,11 @@ class MainActivity : Activity() {
 
         val index = parent.indexOfChild(title)
         val oldParams = title.layoutParams
+        val headerHeight = maxOf(
+            dp(26),
+            (22f * resources.configuration.fontScale * resources.displayMetrics.density).roundToInt()
+        )
+        spectrumHeaderCompactHeightPx = headerHeight
         parent.removeView(title)
         headerTitleText = null
         title.visibility = View.GONE
@@ -1710,7 +3167,7 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, 0)
         }
         spectrumHeader = header
-        // The title is intentionally removed. Frequency range controls will be centered in this row.
+        // The title is intentionally removed; the peak readout remains in this header.
 
         fun frequencyInput(initialValue: String, description: String): EditText = EditText(this).apply {
             setText(initialValue)
@@ -1918,8 +3375,9 @@ class MainActivity : Activity() {
         rangeDialog.setContentView(rangeContent)
         rangeDialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
 
+        val initialRange = spectrumView.getVisibleFrequencyRangeHz()
         val rangeButton = Button(this).apply {
-            text = "RANGE"
+            text = "(${initialRange.first}–${initialRange.second} Hz)"
             textSize = 14f
             minHeight = dp(42)
             minimumHeight = dp(42)
@@ -1941,11 +3399,11 @@ class MainActivity : Activity() {
         rangeButton.isAllCaps = false
         rangeButton.setTextColor(Color.rgb(255, 213, 90))
         rangeButton.textSize = 14f
-        val rangeButtonWidth = rangeButton.paint.measureText("RANGE").roundToInt() +
+        val rangeButtonWidth = rangeButton.paint.measureText(rangeButton.text.toString()).roundToInt() +
                 rangeButton.paddingLeft + rangeButton.paddingRight + dp(4)
-        header.addView(rangeButton, android.widget.FrameLayout.LayoutParams(rangeButtonWidth, dp(42), Gravity.CENTER))
+        rangeButton.layoutParams = android.widget.FrameLayout.LayoutParams(rangeButtonWidth, dp(42), Gravity.CENTER)
         spectrumView.setFrequencyRangeListener { minHz, maxHz ->
-            rangeButton.text = "RANGE ($minHz–$maxHz Hz)"
+            rangeButton.text = "($minHz–$maxHz Hz)"
             val width = rangeButton.paint.measureText(rangeButton.text.toString()).roundToInt() +
                     rangeButton.paddingLeft + rangeButton.paddingRight + dp(4)
             val params = rangeButton.layoutParams as android.widget.FrameLayout.LayoutParams
@@ -1953,9 +3411,9 @@ class MainActivity : Activity() {
             params.gravity = Gravity.CENTER
             rangeButton.layoutParams = params
         }
-        // Peak readout in the upper-right corner of the frequency-selection row.
+        // Keep SPL at the upper-left and peak information at the upper-right of the graph header.
         val peakReadout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+            orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL or Gravity.END
             setPadding(dp(6), 0, dp(8), 0)
         }
@@ -1968,17 +3426,354 @@ class MainActivity : Activity() {
             includeFontPadding = false
         }
         headerPeakDbText = TextView(this).apply {
-            text = "-- dB"
+            text = "-- dBFS"
             textSize = 11f
             setTextColor(Color.rgb(210, 220, 232))
             gravity = Gravity.END
             includeFontPadding = false
         }
+        headerSplText = TextView(this).apply {
+            textSize = 17f
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            setTextColor(Color.rgb(255, 213, 90))
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            includeFontPadding = false
+            isClickable = true
+            isFocusable = true
+            minHeight = headerHeight
+            setPadding(dp(8), 0, dp(8), 0)
+            contentDescription = "Show enlarged SPL estimate"
+            setOnClickListener { showSplDetailDialog() }
+        }
+        updateSplReadout()
         peakReadout.addView(headerPeakFrequencyText)
-        peakReadout.addView(headerPeakDbText)
-        header.addView(peakReadout, android.widget.FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(42), Gravity.CENTER_VERTICAL or Gravity.END))
+        peakReadout.addView(headerPeakDbText, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            marginStart = dp(7)
+        })
+        header.addView(headerSplText, android.widget.FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, headerHeight, Gravity.CENTER_VERTICAL or Gravity.START))
+        header.addView(peakReadout, android.widget.FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, headerHeight, Gravity.CENTER_VERTICAL or Gravity.END))
 
+        oldParams.height = headerHeight
         parent.addView(header, index, oldParams)
+    }
+
+    private fun updateSplReadout() {
+        val offset = splCalibrationOffsetDb
+        val currentSpl = if (offset != null && running && splHasCurrentSample) {
+            (latestAnalyzedRmsDb + offset).takeIf { it.isFinite() }
+        } else {
+            null
+        }
+        val displayValue = currentSpl?.let {
+            String.format(java.util.Locale.US, "SPL ≈ %.1f dB", it)
+        } ?: "SPL -- dB"
+        var deltaOverOneSecond: Double? = null
+        if (currentSpl != null) {
+            val now = SystemClock.elapsedRealtime()
+            splRecentReadings.addLast(now to currentSpl)
+            while (splRecentReadings.peekFirst()?.first?.let { it < now - 2000L } == true) {
+                splRecentReadings.removeFirst()
+            }
+            val reference = splRecentReadings.lastOrNull { it.first <= now - 1000L }
+            deltaOverOneSecond = reference?.let { currentSpl - it.second }
+        } else {
+            splRecentReadings.clear()
+        }
+        val detail = when {
+            !running -> "Start audio analysis to see the live SPL estimate."
+            offset == null -> "This phone does not report usable microphone sensitivity. Tap Calibrate to enter a reference meter reading."
+            splManualCalibrationOffsetDb != null -> "Unweighted SPL estimate · using your reference calibration. Phone microphone processing can affect accuracy."
+            else -> "Unweighted SPL estimate · using microphone sensitivity reported by Android. Phone processing can affect accuracy."
+        }
+        headerSplText?.apply {
+            text = displayValue
+            contentDescription = "Show enlarged SPL estimate. $detail"
+        }
+        splDetailValueView?.text = displayValue
+        splDetailInfoView?.text = detail
+        splDetailDeltaView?.text = deltaOverOneSecond?.let {
+            String.format(java.util.Locale.US, "Δ 1 s   %+.1f dB", it)
+        } ?: "Δ 1 s   —"
+        splScaleMeterView?.setLevel(currentSpl)
+    }
+
+    private fun readSystemSplCalibrationOffset(audioRecord: AudioRecord): Double? {
+        if (android.os.Build.VERSION.SDK_INT < 28) return null
+        return try {
+            audioRecord.getActiveMicrophones()
+                .asSequence()
+                .map { it.getSensitivity() }
+                .firstOrNull { it.isFinite() && it in -150f..0f }
+                ?.let { 94.0 - it.toDouble() }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private inner class SplScaleMeterView(context: Context) : View(context) {
+        private val density = resources.displayMetrics.density
+        private var levelDb: Double? = null
+        private fun dp(value: Float) = value * density
+
+        private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(174, 188, 205)
+            textSize = dp(11f)
+            textAlign = Paint.Align.RIGHT
+        }
+        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(65, 82, 101)
+            strokeWidth = dp(3f)
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val majorTickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(119, 141, 163)
+            strokeWidth = dp(1.4f)
+        }
+        private val minorTickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(67, 82, 98)
+            strokeWidth = dp(1f)
+        }
+        private val levelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(255, 213, 90)
+            strokeWidth = dp(2f)
+            strokeCap = Paint.Cap.ROUND
+        }
+
+        fun setLevel(value: Double?) {
+            levelDb = value?.takeIf { it.isFinite() }
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val top = dp(7f)
+            val bottom = (height - dp(7f)).coerceAtLeast(top + dp(20f))
+            val labelRight = dp(32f)
+            val tickStart = dp(39f)
+            val trackX = width - dp(12f)
+            canvas.drawLine(trackX, top, trackX, bottom, trackPaint)
+            for (db in 30..130 step 10) {
+                val y = bottom - ((db - 30) / 100f) * (bottom - top)
+                canvas.drawText(db.toString(), labelRight, y + labelPaint.textSize * 0.35f, labelPaint)
+                val tickPaint = if (db % 20 == 0 || db == 30 || db == 130) majorTickPaint else minorTickPaint
+                canvas.drawLine(tickStart, y, trackX + dp(5f), y, tickPaint)
+            }
+            val level = levelDb ?: return
+            val ratio = ((level - 30.0) / 100.0).coerceIn(0.0, 1.0)
+            val markerY = bottom - ((bottom - top) * ratio).toFloat()
+            canvas.drawLine(trackX, bottom, trackX, markerY, levelPaint)
+            canvas.drawLine(tickStart, markerY, trackX + dp(7f), markerY, levelPaint)
+            canvas.drawCircle(trackX, markerY, dp(5f), levelPaint)
+        }
+    }
+
+    private fun showSplDetailDialog() {
+        if (splDetailDialog?.isShowing == true) return
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).roundToInt()
+        fun rounded(color: Int, radius: Int) = GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = dp(radius).toFloat()
+        }
+        val hasAutomaticCalibration = splSystemCalibrationOffsetDb != null
+        val content = LinearLayout(this).apply {
+            orientation = if (hasAutomaticCalibration) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(
+                dp(if (hasAutomaticCalibration) 18 else 22),
+                dp(if (hasAutomaticCalibration) 16 else 20),
+                dp(if (hasAutomaticCalibration) 18 else 22),
+                dp(if (hasAutomaticCalibration) 16 else 18)
+            )
+            background = rounded(Color.rgb(14, 21, 31), 22)
+        }
+        if (!hasAutomaticCalibration) {
+            content.addView(TextView(this).apply {
+                text = "SOUND PRESSURE LEVEL"
+                textSize = 12f
+                letterSpacing = 0.08f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setTextColor(Color.rgb(170, 187, 204))
+                gravity = Gravity.CENTER
+            }, LinearLayout.LayoutParams(-1, -2))
+        }
+        val value = TextView(this).apply {
+            text = headerSplText?.text ?: "SPL -- dB"
+            textSize = 34f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(Color.rgb(255, 213, 90))
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            maxLines = 1
+            isSingleLine = true
+            setPadding(0, dp(14), 0, dp(10))
+        }
+        splDetailValueView = value
+        val dialog = Dialog(this)
+        splDetailInfoView = null
+        splDetailDeltaView = null
+        splScaleMeterView = null
+        if (hasAutomaticCalibration) {
+            val readout = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+            }
+            readout.addView(value, LinearLayout.LayoutParams(-1, -2))
+            val delta = TextView(this).apply {
+                text = "Δ 1 s   —"
+                textSize = 13f
+                setTextColor(Color.rgb(178, 192, 208))
+                gravity = Gravity.CENTER
+                includeFontPadding = false
+                maxLines = 1
+                setPadding(0, dp(8), 0, 0)
+            }
+            splDetailDeltaView = delta
+            readout.addView(delta, LinearLayout.LayoutParams(-1, -2))
+            content.addView(readout, LinearLayout.LayoutParams(0, -2, 1f))
+            val meter = SplScaleMeterView(this)
+            splScaleMeterView = meter
+            content.addView(meter, LinearLayout.LayoutParams(dp(100), dp(236)))
+        } else {
+            content.addView(value, LinearLayout.LayoutParams(-1, -2))
+            val info = TextView(this).apply {
+                textSize = 13f
+                setTextColor(Color.LTGRAY)
+                gravity = Gravity.CENTER
+            }
+            splDetailInfoView = info
+            content.addView(info, LinearLayout.LayoutParams(-1, -2).apply {
+                bottomMargin = dp(16)
+            })
+            val actions = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            actions.addView(Button(this).apply {
+                text = "Calibrate"
+                isAllCaps = false
+                setTextColor(Color.WHITE)
+                background = rounded(Color.rgb(42, 57, 75), 14)
+                setOnClickListener { showSplCalibrationDialog() }
+            }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(8) })
+            actions.addView(Button(this).apply {
+                text = "Done"
+                isAllCaps = false
+                setTextColor(Color.WHITE)
+                background = rounded(Color.rgb(39, 113, 147), 14)
+                setOnClickListener { dialog.dismiss() }
+            }, LinearLayout.LayoutParams(0, dp(44), 1f))
+            content.addView(actions)
+        }
+        dialog.setContentView(content)
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.setOnDismissListener {
+            if (splDetailDialog === dialog) {
+                splDetailDialog = null
+                splDetailValueView = null
+                splDetailInfoView = null
+                splDetailDeltaView = null
+                splScaleMeterView = null
+            }
+        }
+        splDetailDialog = dialog
+        updateSplReadout()
+        val compactWidth = if (hasAutomaticCalibration) {
+            val maxValueWidth = value.paint.measureText("SPL ≈ 280.0 dB").roundToInt()
+            (maxValueWidth + dp(18 * 2 + 100 + 8))
+                .coerceAtMost((resources.displayMetrics.widthPixels - dp(32)).coerceAtLeast(dp(1)))
+        } else {
+            null
+        }
+        val displaySize = android.graphics.Point().also { windowManager.defaultDisplay.getRealSize(it) }
+        val displayWidth = displaySize.x.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+        val dialogWidth = compactWidth ?: (displayWidth * 0.82f).roundToInt()
+        dialog.window?.apply {
+            setBackgroundDrawableResource(android.R.color.transparent)
+            setDimAmount(0.38f)
+        }
+        centerDialogOnScreen(dialog, dialogWidth, horizontalOffsetDp = -10)
+        dialog.show()
+        attachSplDialogDragHandle(dialog, content, displayWidth, displaySize.y)
+    }
+
+    private fun showSplCalibrationDialog() {
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).roundToInt()
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(8), dp(18), dp(4))
+        }
+        content.addView(TextView(this).apply {
+            text = "Place the phone beside a calibrated SPL meter, or use an acoustic calibrator. Keep the reference sound steady and enter its reading below. This gives an unweighted estimate; the phone microphone’s response and processing affect accuracy."
+            textSize = 14f
+            setTextColor(Color.LTGRAY)
+            setPadding(0, 0, 0, dp(10))
+        })
+        content.addView(TextView(this).apply {
+            text = "Reference level (dB SPL)"
+            textSize = 13f
+            setTextColor(Color.WHITE)
+        })
+        val referenceInput = EditText(this).apply {
+            hint = "e.g. 94.0"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setSingleLine(true)
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            setPadding(dp(12), 0, dp(12), 0)
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(30, 41, 55))
+                cornerRadius = dp(12).toFloat()
+            }
+        }
+        content.addView(referenceInput, LinearLayout.LayoutParams(-1, dp(46)).apply {
+            topMargin = dp(6)
+        })
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Calibrate SPL estimate")
+            .setView(content)
+            .setPositiveButton("Calibrate", null)
+            .setNegativeButton("Cancel", null)
+            .setNeutralButton("Auto", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.apply {
+                visibility = if (splManualCalibrationOffsetDb == null) View.GONE else View.VISIBLE
+                setOnClickListener {
+                    splManualCalibrationOffsetDb = null
+                    splCalibrationOffsetDb = splSystemCalibrationOffsetDb
+                    splRecentReadings.clear()
+                    getSharedPreferences("sound_level_calibration", Context.MODE_PRIVATE)
+                        .edit().remove("offset_db").apply()
+                    updateSplReadout()
+                    dialog.dismiss()
+                }
+            }
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
+                val referenceSpl = referenceInput.text.toString().toDoubleOrNull()
+                when {
+                    !running -> referenceInput.error = "Start audio analysis first"
+                    referenceSpl == null || referenceSpl !in 20.0..160.0 ->
+                        referenceInput.error = "Enter a reference from 20 to 160 dB SPL"
+                    !latestAnalyzedRmsDb.isFinite() ->
+                        referenceInput.error = "No microphone level is available yet"
+                    else -> {
+                        val offset = referenceSpl - latestAnalyzedRmsDb
+                        splManualCalibrationOffsetDb = offset
+                        splCalibrationOffsetDb = offset
+                        splRecentReadings.clear()
+                        getSharedPreferences("sound_level_calibration", Context.MODE_PRIVATE)
+                            .edit().putFloat("offset_db", offset.toFloat()).apply()
+                        updateSplReadout()
+                        dialog.dismiss()
+                    }
+                }
+            }
+        }
+        dialog.show()
     }
 
     private fun updateStartButtonAppearance() {
@@ -2040,7 +3835,8 @@ class MainActivity : Activity() {
         val accent = Color.rgb(75, 196, 255)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(6), dp(6), dp(6), dp(6))
+            gravity = Gravity.TOP
+            setPadding(dp(6), 0, dp(6), dp(6))
             setBackgroundColor(background)
         }
 
@@ -2073,18 +3869,18 @@ class MainActivity : Activity() {
             this.background = roundedBackground(Color.rgb(42, 57, 75), 15f)
             setOnClickListener { showMySoundIdsDialog() }
         }
-        val toggle = Button(this).apply {
+        val toggle = AnalyzerIconButton(this, if (soundIdActive) AnalyzerIconButton.Icon.STOP else AnalyzerIconButton.Icon.MIC).apply {
+            minWidth = dp(46)
+            minimumWidth = dp(46)
+            minHeight = dp(46)
+            minimumHeight = dp(46)
+            setPadding(0, 0, 0, 0)
             setTextColor(Color.WHITE)
-            isAllCaps = false
-            textSize = 15f
-            setPadding(dp(16), dp(6), dp(16), dp(6))
+            playStopIconScale = 0.48f
             setOnClickListener {
                 val start = !soundIdActive
                 soundIdActive = start
-                soundIdToggleButton?.text = if (start) "Stop listening" else "Listen again"
-                soundIdToggleButton?.background = roundedBackground(
-                    if (start) Color.rgb(164, 69, 80) else Color.rgb(27, 121, 157), 14f
-                )
+                updateSoundIdToggleStyle()
                 if (start) {
                     soundIdLastSummary = null
                     soundIdLivePanel?.visibility = View.VISIBLE
@@ -2130,13 +3926,12 @@ class MainActivity : Activity() {
             this.background = roundedBackground(cardColor, 20f)
             visibility = View.GONE
         }
-        summaryPanel.addView(label("SESSION SUMMARY", 12f, accent, true).apply { letterSpacing = 0.08f })
-        summaryPanel.addView(label("Weighted share of analyzed time", 12f, Color.LTGRAY).apply {
-            setPadding(0, dp(3), 0, dp(5))
-        })
         val chart = SoundSessionChartView(this)
         soundIdSummaryChart = chart
         summaryPanel.addView(chart, LinearLayout.LayoutParams(-1, dp(132)))
+        val timeline = SoundSessionTimelineView(this)
+        soundIdSummaryTimeline = timeline
+        summaryPanel.addView(timeline, LinearLayout.LayoutParams(-1, dp(22)))
         val summaryPersonalSounds = Button(this).apply {
             text = "＋ 〰"
             isAllCaps = false
@@ -2170,17 +3965,17 @@ class MainActivity : Activity() {
             addView(summaryPanel, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(7) })
         }
         val panelScroll = android.widget.ScrollView(this).apply {
-            isFillViewport = true
+            isFillViewport = false
             addView(panels)
         }
         val actionRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(toggle, LinearLayout.LayoutParams(0, dp(46), 1f))
-            addView(export, LinearLayout.LayoutParams(-2, dp(46)).apply { marginStart = dp(7) })
+            gravity = Gravity.CENTER
+            addView(toggle, LinearLayout.LayoutParams(dp(46), dp(46)).apply { marginEnd = dp(10) })
+            addView(export, LinearLayout.LayoutParams(-2, dp(46)))
         }
-        root.addView(actionRow, LinearLayout.LayoutParams(-1, dp(46)))
-        root.addView(panelScroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(7) })
+        root.addView(panelScroll, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(actionRow, LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(4) })
 
         soundIdLivePanel = livePanel
         soundIdSummaryPanel = summaryPanel
@@ -2189,11 +3984,8 @@ class MainActivity : Activity() {
         if (soundIdActive) {
             livePanel.visibility = View.VISIBLE
             summaryPanel.visibility = View.GONE
-            toggle.text = "Stop listening"
         } else if (soundIdLastSummary != null) {
             showSoundIdSummary(soundIdLastSummary!!)
-        } else {
-            toggle.text = "Start listening"
         }
 
         soundIdPanel = root
@@ -2206,7 +3998,8 @@ class MainActivity : Activity() {
     private fun showDialogCenteredOnScreen(
         dialog: Dialog,
         dragHandle: View? = null,
-        widthFraction: Float? = null
+        widthFraction: Float? = null,
+        anchorTop: View? = null
     ) {
         val window = dialog.window ?: return
         window.setBackgroundDrawableResource(android.R.color.transparent)
@@ -2245,8 +4038,16 @@ class MainActivity : Activity() {
                 attributes.gravity = Gravity.TOP or Gravity.LEFT
                 attributes.x = ((screenWidth - dialogWidth) / 2)
                     .coerceIn(margin, (screenWidth - dialogWidth - margin).coerceAtLeast(margin))
-                attributes.y = ((screenHeight - dialogHeight) / 2)
-                    .coerceIn(margin, (screenHeight - dialogHeight - margin).coerceAtLeast(margin))
+                val anchorPosition = IntArray(2)
+                val visibleAnchor = anchorTop?.takeIf { it.isShown && it.height > 0 }
+                visibleAnchor?.getLocationOnScreen(anchorPosition)
+                val lowestAllowedY = (screenHeight - dialogHeight - margin).coerceAtLeast(margin)
+                attributes.y = if (visibleAnchor != null) {
+                    val moveUpBy = (32f * resources.displayMetrics.density).roundToInt()
+                    (anchorPosition[1] - moveUpBy).coerceAtLeast(margin)
+                } else {
+                    ((screenHeight - dialogHeight) / 2).coerceIn(margin, lowestAllowedY)
+                }
                 attributes.dimAmount = 0.38f
                 window.attributes = attributes
                 decor.alpha = 1f
@@ -2318,7 +4119,7 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
         })
         content.addView(TextView(this).apply {
-            text = "Export creates a ZIP containing the saved WAV recordings, their names, and the matching sound profiles. You can listen to each WAV and check that its label is correct before sharing the archive."
+            text = "Choose an export folder the first time. New recordings are saved there as individual WAV files named after their sound. Already exported samples are skipped, so each export adds only new recordings."
             textSize = 14f
             setTextColor(Color.LTGRAY)
             setPadding(0, dp(10), 0, dp(14))
@@ -2340,7 +4141,11 @@ class MainActivity : Activity() {
         showDialogCenteredOnScreen(dialog)
     }
 
-    private fun showDeletePersonalSoundDialog(profile: PersonalSoundProfile, onDeleted: () -> Unit) {
+    private fun showDeletePersonalSoundDialog(
+        profile: PersonalSoundProfile,
+        sampleIds: Set<String>,
+        onDeleted: () -> Unit
+    ) {
         val density = resources.displayMetrics.density
         fun dp(value: Int) = (value * density).roundToInt()
         val content = LinearLayout(this).apply {
@@ -2352,13 +4157,15 @@ class MainActivity : Activity() {
             }
         }
         content.addView(TextView(this).apply {
-            text = "Delete recording?"
+            text = "Delete saved sound?"
             textSize = 18f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setTextColor(Color.WHITE)
         })
         content.addView(TextView(this).apply {
-            text = "Remove “${profile.name}” and its saved WAV sample from this phone?"
+            val sampleCount = sampleIds.size
+            text = if (sampleCount == 1) "Remove “${profile.name}” and its saved recording from this phone?"
+            else "Remove “${profile.name}” and all $sampleCount saved recordings from this phone?"
             textSize = 14f
             setTextColor(Color.LTGRAY)
             setPadding(0, dp(8), 0, dp(14))
@@ -2387,8 +4194,8 @@ class MainActivity : Activity() {
                 cornerRadius = dp(14).toFloat()
             }
             setOnClickListener {
-                if (personalPreviewKey == "saved:${profile.id}") stopPersonalSoundPreview()
-                soundIdEngine.removePersonalSound(profile.id)
+                if (personalPreviewKey?.removePrefix("saved:")?.let { it in sampleIds } == true) stopPersonalSoundPreview()
+                soundIdEngine.removePersonalSounds(profile.name)
                 onDeleted()
                 dialog.dismiss()
             }
@@ -2433,7 +4240,7 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(-2, dp(40)))
         content.addView(header)
         content.addView(TextView(this).apply {
-            text = "Saved samples"
+            text = "Saved sounds · recordings are grouped by name"
             textSize = 12f
             setTextColor(Color.LTGRAY)
             setPadding(0, dp(10), 0, dp(4))
@@ -2448,6 +4255,7 @@ class MainActivity : Activity() {
         fun refreshList() {
             list.removeAllViews()
             val profiles = soundIdEngine.getPersonalSounds()
+            val rowHeightDp = maxOf(54, (22f * resources.configuration.fontScale + 8f).roundToInt())
             if (profiles.isEmpty()) {
                 list.addView(TextView(this).apply {
                     text = "No personal sounds yet. Record a short sample, then give it a name."
@@ -2456,20 +4264,31 @@ class MainActivity : Activity() {
                     gravity = Gravity.CENTER_VERTICAL
                     setPadding(0, dp(4), 0, dp(10))
                 })
-            } else profiles.asReversed().forEach { profile ->
+            } else profiles.asReversed()
+                .groupBy { it.name.trim().lowercase(java.util.Locale.ROOT) }
+                .values
+                .forEach { samples ->
+                val profile = samples.first()
+                val groupIds = samples.map { it.id }.toSet()
                 val row = LinearLayout(this).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER_VERTICAL
-                    setPadding(dp(12), dp(5), dp(7), dp(5))
+                    minimumHeight = dp(rowHeightDp)
+                    clipChildren = false
+                    clipToPadding = false
+                    setPadding(dp(12), dp(2), dp(7), dp(2))
                     background = panel(Color.rgb(30, 41, 55), 13)
                 }
                 row.addView(TextView(this).apply {
-                    text = "〰   ${profile.name}"
-                    textSize = 15f
+                    text = "〰   ${profile.name}\n${samples.size} sample${if (samples.size == 1) "" else "s"}"
+                    textSize = 14f
                     setTextColor(Color.WHITE)
-                    maxLines = 1
+                    gravity = Gravity.CENTER_VERTICAL
+                    includeFontPadding = true
+                    setPadding(0, dp(2), 0, dp(10))
+                    maxLines = 2
                     ellipsize = android.text.TextUtils.TruncateAt.END
-                }, LinearLayout.LayoutParams(0, -1, 1f))
+                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                 row.addView(Button(this).apply {
                     text = "▶"
                     isAllCaps = false
@@ -2480,7 +4299,27 @@ class MainActivity : Activity() {
                     setOnClickListener { view ->
                         togglePersonalSoundPreview(profile.id, profile.name, view as Button)
                     }
-                }, LinearLayout.LayoutParams(dp(42), dp(40)))
+                }, LinearLayout.LayoutParams(dp(42), dp(42)))
+                row.addView(Button(this).apply {
+                    text = "+"
+                    isAllCaps = false
+                    textSize = 19f
+                    setTextColor(Color.rgb(105, 220, 185))
+                    background = panel(Color.TRANSPARENT, 12)
+                    contentDescription = "Add another sample for ${profile.name}"
+                    setOnClickListener {
+                        showPersonalSoundRecorderDialog({ refreshList() }, profile.name)
+                    }
+                }, LinearLayout.LayoutParams(dp(42), dp(42)))
+                row.addView(Button(this).apply {
+                    text = "✎"
+                    isAllCaps = false
+                    textSize = 17f
+                    setTextColor(Color.rgb(135, 205, 255))
+                    background = panel(Color.TRANSPARENT, 12)
+                    contentDescription = "Rename ${profile.name}"
+                    setOnClickListener { showRenamePersonalSoundDialog(profile, samples.size) { refreshList() } }
+                }, LinearLayout.LayoutParams(dp(42), dp(42)))
                 row.addView(Button(this).apply {
                     text = "×"
                     isAllCaps = false
@@ -2489,14 +4328,15 @@ class MainActivity : Activity() {
                     background = panel(Color.TRANSPARENT, 12)
                     contentDescription = "Delete ${profile.name}"
                     setOnClickListener {
-                        showDeletePersonalSoundDialog(profile) { refreshList() }
+                        showDeletePersonalSoundDialog(profile, groupIds) { refreshList() }
                     }
-                }, LinearLayout.LayoutParams(dp(42), dp(40)))
-                list.addView(row, LinearLayout.LayoutParams(-1, dp(50)).apply { bottomMargin = dp(7) })
+                }, LinearLayout.LayoutParams(dp(42), dp(42)))
+                list.addView(row, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(7) })
             }
-            val visibleRows = if (profiles.isEmpty()) 1 else minOf(profiles.size, 3)
-            listScroll.layoutParams = LinearLayout.LayoutParams(-1, dp(visibleRows * 57))
-            listScroll.isVerticalScrollBarEnabled = profiles.size > 3
+            val soundCount = profiles.asReversed().groupBy { it.name.trim().lowercase(java.util.Locale.ROOT) }.size
+            val visibleRows = if (profiles.isEmpty()) 1 else minOf(soundCount, 3)
+            listScroll.layoutParams = LinearLayout.LayoutParams(-1, dp(visibleRows * (rowHeightDp + 7)))
+            listScroll.isVerticalScrollBarEnabled = soundCount > 3
         }
         content.addView(listScroll)
         content.addView(Button(this).apply {
@@ -2505,7 +4345,7 @@ class MainActivity : Activity() {
             textSize = 15f
             setTextColor(Color.WHITE)
             background = panel(Color.rgb(39, 113, 147), 16)
-            setOnClickListener { showPersonalSoundRecorderDialog { refreshList() } }
+            setOnClickListener { showPersonalSoundRecorderDialog(onSaved = { refreshList() }) }
         }, LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(6) })
         val fileActions = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -2543,78 +4383,347 @@ class MainActivity : Activity() {
         managerDialog = Dialog(this)
         managerDialog.setContentView(content)
         managerDialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        managerDialog.setCancelable(false)
+        managerDialog.setCanceledOnTouchOutside(false)
         managerDialog.setOnDismissListener {
             if (personalSoundListRefresh === refreshCallback) personalSoundListRefresh = null
         }
-        showDialogCenteredOnScreen(managerDialog, title)
+        showDialogCenteredOnScreen(managerDialog, title, anchorTop = soundIdPanel)
+    }
+
+    private fun showRenamePersonalSoundDialog(profile: PersonalSoundProfile, sampleCount: Int, onRenamed: () -> Unit) {
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).roundToInt()
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(16), dp(18), dp(16))
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(14, 21, 31))
+                cornerRadius = dp(20).toFloat()
+            }
+        }
+        content.addView(TextView(this).apply {
+            text = "Rename saved sound"
+            textSize = 18f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(Color.WHITE)
+        })
+        val nameInput = EditText(this).apply {
+            setText(profile.name)
+            isSingleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(30, 41, 55))
+                cornerRadius = dp(14).toFloat()
+            }
+            setPadding(dp(14), 0, dp(14), 0)
+        }
+        content.addView(nameInput, LinearLayout.LayoutParams(-1, dp(48)).apply {
+            topMargin = dp(12)
+            bottomMargin = dp(if (sampleCount > 1) 5 else 12)
+        })
+        if (sampleCount > 1) content.addView(TextView(this).apply {
+            text = "This name applies to all $sampleCount samples."
+            textSize = 12f
+            setTextColor(Color.LTGRAY)
+            setPadding(dp(2), 0, 0, dp(10))
+        })
+        val dialog = Dialog(this)
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+        }
+        actions.addView(Button(this).apply {
+            text = "Cancel"
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(42, 57, 75))
+                cornerRadius = dp(14).toFloat()
+            }
+            setOnClickListener { dialog.dismiss() }
+        }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(8) })
+        val saveName: () -> Unit = {
+            val name = nameInput.text.toString().trim()
+            if (name.isBlank()) {
+                nameInput.error = "Enter a name"
+            } else {
+                val renamedIds = soundIdEngine.renamePersonalSounds(profile.name, name)
+                if (renamedIds.isNotEmpty()) {
+                    if (personalPreviewKey?.removePrefix("saved:")?.let { it in renamedIds } == true) {
+                        personalPreviewButton?.contentDescription = "Play saved recording: $name"
+                    }
+                    onRenamed()
+                    dialog.dismiss()
+                    Toast.makeText(this, "Renamed to $name", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        actions.addView(Button(this).apply {
+            text = "Save"
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(39, 132, 166))
+                cornerRadius = dp(14).toFloat()
+            }
+            setOnClickListener { saveName() }
+        }, LinearLayout.LayoutParams(0, dp(44), 1f))
+        content.addView(actions)
+        dialog.setContentView(content)
+        dialog.setCanceledOnTouchOutside(true)
+        val renameDialogWidth = (resources.displayMetrics.widthPixels - dp(24)).coerceAtLeast(dp(260))
+        dialog.window?.apply {
+            setBackgroundDrawableResource(android.R.color.transparent)
+            setSoftInputMode(
+                android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                    android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE
+            )
+            setGravity(Gravity.CENTER)
+            setLayout(renameDialogWidth, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        dialog.setOnShowListener {
+            nameInput.requestFocus()
+            nameInput.selectAll()
+            nameInput.post {
+                (getSystemService(Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)
+                    ?.showSoftInput(nameInput, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+            }
+        }
+        nameInput.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_DONE) {
+                saveName()
+                true
+            } else false
+        }
+        dialog.show()
+        dialog.window?.setLayout(renameDialogWidth, ViewGroup.LayoutParams.WRAP_CONTENT)
+    }
+
+    private fun requestPersonalSoundExportFolder() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+            )
+        }
+        try {
+            startActivityForResult(intent, personalSoundExportFolderRequestCode)
+        } catch (_: Exception) {
+            Toast.makeText(this, "Could not choose an export folder.", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun exportPersonalSoundProfiles() {
+        if (!personalSoundExportInProgress.compareAndSet(false, true)) {
+            Toast.makeText(this, "An export is already running.", Toast.LENGTH_SHORT).show()
+            return
+        }
         val profiles = soundIdEngine.getPersonalSounds()
         if (profiles.isEmpty()) {
+            personalSoundExportInProgress.set(false)
             Toast.makeText(this, "Record and save a personal sound first.", Toast.LENGTH_SHORT).show()
             return
         }
-        try {
-            val manifestProfiles = JSONArray()
-            val output = ByteArrayOutputStream()
-            val zip = java.util.zip.ZipOutputStream(output)
-            profiles.forEach { profile ->
-                val audio = soundIdEngine.getPersonalSoundAudio(profile.id) ?: return@forEach
-                val audioPath = "samples/${profile.id}.wav"
-                zip.putNextEntry(java.util.zip.ZipEntry(audioPath))
-                zip.write(encodePersonalSoundWav(audio))
-                zip.closeEntry()
-                val vector = JSONArray()
-                profile.embedding.forEach { value -> vector.put(value.toDouble()) }
-                manifestProfiles.put(JSONObject()
-                    .put("id", profile.id)
-                    .put("name", profile.name)
-                    .put("audio", audioPath)
-                    .put("sample_rate", 48_000)
-                    .put("embedding", vector))
-            }
-            if (manifestProfiles.length() == 0) {
-                zip.close()
-                Toast.makeText(this, "No recordings are available to export.", Toast.LENGTH_LONG).show()
-                return
-            }
-            val manifest = JSONObject()
-                .put("format", "spectrum-analyzer-personal-sound-samples")
-                .put("format_version", 1)
-                .put("profile_model", "yamnet-audioset-plus-log-spectrum-v1")
-                .put("sample_count", manifestProfiles.length())
-                .put("samples", manifestProfiles)
-                .toString(2)
-                .toByteArray(Charsets.UTF_8)
-            zip.putNextEntry(java.util.zip.ZipEntry("manifest.json"))
-            zip.write(manifest)
-            zip.closeEntry()
-            zip.close()
-            pendingPersonalSoundExport = output.toByteArray()
-            val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE)
-                type = "application/zip"
-                putExtra(Intent.EXTRA_TITLE, "my-sound-id-samples.zip")
-            }
-            startActivityForResult(intent, personalSoundExportRequestCode)
-        } catch (_: Exception) {
-            pendingPersonalSoundExport = null
-            Toast.makeText(this, "Could not prepare the sample archive.", Toast.LENGTH_LONG).show()
+        val preferences = getSharedPreferences("personal_sound_export", Context.MODE_PRIVATE)
+        val exportedIds = preferences.getStringSet("exported_profile_ids", emptySet()).orEmpty()
+        val newProfiles = profiles.filter { it.id !in exportedIds }
+        if (newProfiles.isEmpty()) {
+            personalSoundExportInProgress.set(false)
+            Toast.makeText(this, "There are no new samples to export.", Toast.LENGTH_SHORT).show()
+            return
         }
+        val folderString = preferences.getString("folder_uri", null)
+        if (folderString.isNullOrBlank()) {
+            personalSoundExportInProgress.set(false)
+            requestPersonalSoundExportFolder()
+            return
+        }
+        val folderUri = Uri.parse(folderString)
+        val hasWritePermission = contentResolver.persistedUriPermissions.any {
+            it.uri == folderUri && it.isWritePermission
+        }
+        if (!hasWritePermission) {
+            preferences.edit().remove("folder_uri").apply()
+            personalSoundExportInProgress.set(false)
+            requestPersonalSoundExportFolder()
+            return
+        }
+
+        Toast.makeText(this, "Saving new WAV samples…", Toast.LENGTH_SHORT).show()
+        Thread({
+            var exportedCount = 0
+            val failures = mutableListOf<String>()
+            val markedExported = exportedIds.toMutableSet()
+            try {
+                val folderDocumentId = android.provider.DocumentsContract.getTreeDocumentId(folderUri)
+                val parentUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(folderUri, folderDocumentId)
+                for (profile in newProfiles) {
+                    try {
+                        val audio = soundIdEngine.getPersonalSoundAudio(profile.id)
+                            ?: error("Recording is missing for ${profile.name}.")
+                        val safeName = profile.name.trim()
+                            .replace(Regex("[^\\p{L}\\p{N}._-]+"), "_")
+                            .trim('.', '_', '-')
+                            .take(48)
+                            .ifBlank { "sound" }
+                        val fileName = "${safeName}__${profile.id.take(8)}.wav"
+                        val documentUri = android.provider.DocumentsContract.createDocument(
+                            contentResolver,
+                            parentUri,
+                            "audio/wav",
+                            fileName
+                        ) ?: error("Could not create $fileName in the selected folder.")
+                        val wav = encodePersonalSoundWav(audio)
+                        val output = contentResolver.openOutputStream(documentUri, "w")
+                            ?: error("Could not write $fileName.")
+                        output.use { it.write(wav) }
+                        markedExported.add(profile.id)
+                        preferences.edit().putStringSet("exported_profile_ids", markedExported.toSet()).apply()
+                        exportedCount++
+                    } catch (error: Exception) {
+                        failures.add(error.message ?: "Could not export ${profile.name}.")
+                    }
+                }
+            } catch (error: Exception) {
+                failures.add(error.message ?: "Could not access the selected folder.")
+            } finally {
+                personalSoundExportInProgress.set(false)
+                runOnUiThread {
+                    val message = when {
+                        failures.isEmpty() -> "Saved $exportedCount new WAV sample(s) to the selected folder."
+                        exportedCount == 0 -> "Could not export samples: ${failures.first()}"
+                        else -> "Saved $exportedCount sample(s); skipped ${failures.size}. ${failures.first()}"
+                    }
+                    Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                }
+            }
+        }, "PersonalSoundExporter").apply { priority = Thread.NORM_PRIORITY; start() }
     }
 
     private fun importPersonalSoundProfiles() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/zip"
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(
+                "application/zip",
+                "application/x-zip-compressed",
+                "application/octet-stream",
+                "audio/wav",
+                "audio/x-wav",
+                "audio/vnd.wave"
+            ))
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         }
         try {
             startActivityForResult(intent, personalSoundImportRequestCode)
         } catch (_: Exception) {
-            Toast.makeText(this, "Could not open a sample archive.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Could not open sample files.", Toast.LENGTH_LONG).show()
         }
     }
+
+    private fun importPersonalSoundFiles(uris: List<Uri>) {
+        if (!personalSoundImportInProgress.compareAndSet(false, true)) {
+            Toast.makeText(this, "A sample import is already running.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Toast.makeText(this, "Importing sound samples…", Toast.LENGTH_SHORT).show()
+        Thread({
+            var imported = 0
+            val failures = mutableListOf<String>()
+            try {
+                for (uri in uris) {
+                    val fileName = getImportedDocumentName(uri)
+                    try {
+                        val bytes = readImportedDocument(uri, 32 * 1024 * 1024)
+                        when {
+                            isZipArchive(bytes) -> imported += importPersonalSoundArchive(bytes)
+                            isWavFile(bytes) -> {
+                                val audio = decodePersonalSoundWav(bytes)
+                                    ?: error("Unsupported WAV format or duration. Use a PCM or 32-bit float WAV between 1 and 30 seconds.")
+                                val soundName = fileName.substringBeforeLast('.', fileName)
+                                    .replace(Regex("__[0-9a-fA-F]{8}$"), "")
+                                    .trim().take(80).ifBlank { "Imported sound" }
+                                val result = arrayOfNulls<String>(1)
+                                val finished = java.util.concurrent.CountDownLatch(1)
+                                soundIdEngine.createPersonalSoundFromAudio(soundName, audio) { errorMessage ->
+                                    result[0] = errorMessage
+                                    finished.countDown()
+                                }
+                                finished.await()
+                                result[0]?.let { error(it) }
+                                imported++
+                            }
+                            else -> error("Choose a My Sound ID ZIP archive or WAV recording.")
+                        }
+                    } catch (error: Exception) {
+                        failures.add("$fileName: ${error.message ?: "could not import"}")
+                    }
+                }
+            } catch (error: InterruptedException) {
+                Thread.currentThread().interrupt()
+                failures.add("Import was interrupted.")
+            } finally {
+                personalSoundImportInProgress.set(false)
+                runOnUiThread {
+                    personalSoundListRefresh?.invoke()
+                    val message = when {
+                        failures.isEmpty() -> "Imported $imported sound sample(s)."
+                        imported == 0 -> "Could not import samples: ${failures.first()}"
+                        else -> "Imported $imported sample(s); skipped ${failures.size}. ${failures.first()}"
+                    }
+                    Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                }
+            }
+        }, "PersonalSoundImporter").apply { priority = Thread.NORM_PRIORITY; start() }
+    }
+
+    private fun getImportedDocumentName(uri: Uri): String {
+        val name = contentResolver.query(
+            uri,
+            arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+            null,
+            null,
+            null
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }
+        return name?.takeIf { it.isNotBlank() }
+            ?: uri.lastPathSegment?.substringAfterLast('/')
+            ?: "sample"
+    }
+
+    private fun readImportedDocument(uri: Uri, maxBytes: Int): ByteArray {
+        val input = contentResolver.openInputStream(uri) ?: error("Could not read the selected file.")
+        return input.use { stream ->
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(8192)
+            var total = 0
+            while (true) {
+                val count = stream.read(buffer)
+                if (count < 0) break
+                total += count
+                require(total <= maxBytes) { "File is too large." }
+                output.write(buffer, 0, count)
+            }
+            output.toByteArray()
+        }
+    }
+
+    private fun isZipArchive(bytes: ByteArray): Boolean =
+        bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4b.toByte() &&
+                (bytes[2] == 0x03.toByte() || bytes[2] == 0x05.toByte() || bytes[2] == 0x07.toByte()) &&
+                (bytes[3] == 0x04.toByte() || bytes[3] == 0x06.toByte() || bytes[3] == 0x08.toByte())
+
+    private fun isWavFile(bytes: ByteArray): Boolean =
+        bytes.size >= 12 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" &&
+                String(bytes, 8, 4, Charsets.US_ASCII) == "WAVE"
 
     private fun encodePersonalSoundWav(samples: ShortArray): ByteArray {
         val dataBytes = samples.size * 2
@@ -2683,20 +4792,96 @@ class MainActivity : Activity() {
     }
 
     private fun decodePersonalSoundWav(wav: ByteArray): ShortArray? {
-        if (wav.size < 44) return null
+        if (wav.size < 44 || String(wav, 0, 4, Charsets.US_ASCII) != "RIFF" ||
+            String(wav, 8, 4, Charsets.US_ASCII) != "WAVE") return null
         val buffer = ByteBuffer.wrap(wav).order(ByteOrder.LITTLE_ENDIAN)
-        if (String(wav, 0, 4, Charsets.US_ASCII) != "RIFF" ||
-            String(wav, 8, 4, Charsets.US_ASCII) != "WAVE" ||
-            String(wav, 36, 4, Charsets.US_ASCII) != "data") return null
-        if (buffer.getShort(20).toInt() != 1 || buffer.getShort(22).toInt() != 1 ||
-            buffer.getInt(24) != 48_000 || buffer.getShort(34).toInt() != 16) return null
-        val dataSize = buffer.getInt(40)
-        if (dataSize <= 0 || dataSize % 2 != 0 || dataSize > wav.size - 44) return null
-        buffer.position(44)
-        return ShortArray(dataSize / 2) { buffer.short }
+        var offset = 12
+        var format = -1
+        var channels = 0
+        var sampleRate = 0
+        var bitsPerSample = 0
+        var blockAlign = 0
+        var dataOffset = -1
+        var dataSize = 0
+        while (offset + 8 <= wav.size) {
+            val chunkId = String(wav, offset, 4, Charsets.US_ASCII)
+            val chunkSizeLong = buffer.getInt(offset + 4).toLong() and 0xffff_ffffL
+            val chunkData = offset + 8
+            if (chunkSizeLong > wav.size - chunkData) return null
+            val chunkSize = chunkSizeLong.toInt()
+            when (chunkId) {
+                "fmt " -> {
+                    if (chunkSize < 16) return null
+                    format = buffer.getShort(chunkData).toInt() and 0xffff
+                    if (format == 0xfffe && chunkSize >= 40) {
+                        // WAVE_FORMAT_EXTENSIBLE stores the underlying PCM/float format in its GUID.
+                        format = buffer.getInt(chunkData + 24)
+                    }
+                    channels = buffer.getShort(chunkData + 2).toInt() and 0xffff
+                    sampleRate = buffer.getInt(chunkData + 4)
+                    blockAlign = buffer.getShort(chunkData + 12).toInt() and 0xffff
+                    bitsPerSample = buffer.getShort(chunkData + 14).toInt() and 0xffff
+                }
+                "data" -> {
+                    dataOffset = chunkData
+                    dataSize = chunkSize
+                }
+            }
+            val next = chunkData.toLong() + chunkSizeLong + (chunkSizeLong and 1L)
+            if (next > wav.size) break
+            offset = next.toInt()
+        }
+        val bytesPerSample = bitsPerSample / 8
+        if ((format != 1 && format != 3) || channels !in 1..8 || sampleRate !in 8_000..192_000 ||
+            bitsPerSample !in setOf(8, 16, 24, 32) || (format == 3 && bitsPerSample != 32) ||
+            blockAlign != channels * bytesPerSample || dataOffset < 0 || dataSize < blockAlign) return null
+        val frameCount = dataSize / blockAlign
+        val durationSeconds = frameCount.toDouble() / sampleRate
+        if (durationSeconds < 0.975 || durationSeconds > 30.0) return null
+
+        val mono = FloatArray(frameCount) { frame ->
+            var mixed = 0.0
+            val frameOffset = dataOffset + frame * blockAlign
+            for (channel in 0 until channels) {
+                val sampleOffset = frameOffset + channel * bytesPerSample
+                val sample = when {
+                    format == 3 -> Float.fromBits(buffer.getInt(sampleOffset)).toDouble()
+                        .takeIf { it.isFinite() }?.coerceIn(-1.0, 1.0) ?: 0.0
+                    bitsPerSample == 8 -> ((wav[sampleOffset].toInt() and 0xff) - 128) / 128.0
+                    bitsPerSample == 16 -> buffer.getShort(sampleOffset).toInt() / 32768.0
+                    bitsPerSample == 24 -> {
+                        var value = (wav[sampleOffset].toInt() and 0xff) or
+                                ((wav[sampleOffset + 1].toInt() and 0xff) shl 8) or
+                                ((wav[sampleOffset + 2].toInt() and 0xff) shl 16)
+                        if (value and 0x800000 != 0) value = value or -0x1000000
+                        value / 8_388_608.0
+                    }
+                    else -> buffer.getInt(sampleOffset) / 2_147_483_648.0
+                }
+                mixed += sample
+            }
+            (mixed / channels).coerceIn(-1.0, 1.0).toFloat()
+        }
+        val outputCount = (frameCount.toLong() * 48_000L / sampleRate).toInt()
+        if (outputCount < 46_800 || outputCount > 48_000 * 30) return null
+        return ShortArray(outputCount) { index ->
+            val sourcePosition = index.toDouble() * sampleRate / 48_000.0
+            val first = sourcePosition.toInt().coerceIn(0, mono.lastIndex)
+            val second = (first + 1).coerceAtMost(mono.lastIndex)
+            val fraction = (sourcePosition - first).coerceIn(0.0, 1.0)
+            ((mono[first] * (1.0 - fraction) + mono[second] * fraction) * 32767.0)
+                .roundToInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+        }
     }
 
-    private fun showPersonalSoundRecorderDialog(onSaved: () -> Unit) {
+    private fun setLiveSoundPredictionsVisible(visible: Boolean) {
+        val visibility = if (visible) View.VISIBLE else View.GONE
+        soundIdBestSoundView?.visibility = visibility
+        soundIdScoreView?.visibility = visibility
+        soundIdAlternativesView?.visibility = visibility
+    }
+
+    private fun showPersonalSoundRecorderDialog(onSaved: () -> Unit, initialName: String? = null) {
         val density = resources.displayMetrics.density
         fun dp(value: Int) = (value * density).roundToInt()
         val content = LinearLayout(this).apply {
@@ -2718,7 +4903,7 @@ class MainActivity : Activity() {
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setTextColor(Color.WHITE)
         }, LinearLayout.LayoutParams(0, -2, 1f))
-        header.addView(Button(this).apply {
+        val closeButton = Button(this).apply {
             text = "×"
             isAllCaps = false
             textSize = 21f
@@ -2729,10 +4914,11 @@ class MainActivity : Activity() {
             }
             contentDescription = "Close"
             setOnClickListener { dialog.dismiss() }
-        }, LinearLayout.LayoutParams(dp(42), dp(42)))
+        }
+        header.addView(closeButton, LinearLayout.LayoutParams(dp(42), dp(42)))
         content.addView(header)
         val instruction = TextView(this).apply {
-            text = "After the countdown, play the sound near your phone for 10 seconds. YAMNet analyzes overlapping windows."
+            text = "Choose a length, then play a clear example of the sound near your phone."
             textSize = 13f
             setTextColor(Color.LTGRAY)
             setPadding(0, dp(8), 0, dp(12))
@@ -2748,6 +4934,37 @@ class MainActivity : Activity() {
             }
             setPadding(dp(8), dp(15), dp(8), dp(15))
         }
+        var selectedRecordingSeconds = PERSONAL_SOUND_SAMPLE_SECONDS
+        fun durationButton(label: String) = Button(this).apply {
+            text = label
+            isAllCaps = false
+            textSize = 13f
+            minHeight = dp(42)
+            minimumHeight = dp(42)
+            setPadding(dp(5), 0, dp(5), 0)
+            setTextColor(Color.WHITE)
+        }
+        val fiveSecondButton = durationButton("5 s · Quick")
+        val tenSecondButton = durationButton("10 s · Recommended")
+        fun updateDurationChoices() {
+            fiveSecondButton.background = GradientDrawable().apply {
+                setColor(if (selectedRecordingSeconds == 5) Color.rgb(39, 113, 147) else Color.rgb(30, 41, 55))
+                cornerRadius = dp(13).toFloat()
+                setStroke(dp(1), if (selectedRecordingSeconds == 5) Color.rgb(75, 196, 255) else Color.rgb(56, 73, 91))
+            }
+            tenSecondButton.background = GradientDrawable().apply {
+                setColor(if (selectedRecordingSeconds == 10) Color.rgb(39, 113, 147) else Color.rgb(30, 41, 55))
+                cornerRadius = dp(13).toFloat()
+                setStroke(dp(1), if (selectedRecordingSeconds == 10) Color.rgb(75, 196, 255) else Color.rgb(56, 73, 91))
+            }
+        }
+        val durationChoices = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        durationChoices.addView(fiveSecondButton, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(6) })
+        durationChoices.addView(tenSecondButton, LinearLayout.LayoutParams(0, dp(42), 1.25f))
+        updateDurationChoices()
         val record = Button(this).apply {
             text = "●   Start recording"
             isAllCaps = false
@@ -2758,7 +4975,22 @@ class MainActivity : Activity() {
                 cornerRadius = dp(17).toFloat()
             }
         }
+        fiveSecondButton.setOnClickListener {
+            if (record.isEnabled) {
+                selectedRecordingSeconds = 5
+                updateDurationChoices()
+                countdown.text = "Ready · 5 seconds"
+            }
+        }
+        tenSecondButton.setOnClickListener {
+            if (record.isEnabled) {
+                selectedRecordingSeconds = 10
+                updateDurationChoices()
+                countdown.text = "Ready · 10 seconds"
+            }
+        }
         content.addView(instruction)
+        content.addView(durationChoices, LinearLayout.LayoutParams(-1, dp(42)).apply { bottomMargin = dp(10) })
         content.addView(countdown, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         content.addView(record, LinearLayout.LayoutParams(-1, dp(50)))
         dialog = Dialog(this)
@@ -2767,6 +4999,7 @@ class MainActivity : Activity() {
         dialog.setCanceledOnTouchOutside(true)
         val handler = Handler(Looper.getMainLooper())
         var cancelled = false
+        var handingOffToNaming = false
         var countdownRemaining = 3
         var recordingRemaining = 10
         var recordingStarted = false
@@ -2774,8 +5007,11 @@ class MainActivity : Activity() {
         captureTimeout = Runnable {
             if (dialog.isShowing && !cancelled) {
                 soundIdEngine.cancelPersonalSoundCapture()
+                setLiveSoundPredictionsVisible(true)
                 countdown.text = "No usable sample captured. Try again."
                 record.isEnabled = true
+                fiveSecondButton.isEnabled = true
+                tenSecondButton.isEnabled = true
                 record.text = "●  Record again"
             }
         }
@@ -2791,9 +5027,9 @@ class MainActivity : Activity() {
                     }
                     !recordingStarted -> {
                         recordingStarted = true
-                        countdown.text = "Recording · 10 seconds remaining"
+                        countdown.text = "Recording · $selectedRecordingSeconds seconds remaining"
                         if (!soundIdActive) soundIdToggleButton?.performClick()
-                        soundIdEngine.beginPersonalSoundCapture()
+                        soundIdEngine.beginPersonalSoundCapture(selectedRecordingSeconds)
                         handler.postDelayed(captureTimeout, 20_000L)
                         handler.postDelayed(this, 1000L)
                     }
@@ -2810,9 +5046,12 @@ class MainActivity : Activity() {
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), permissionRequest)
             }
+            setLiveSoundPredictionsVisible(false)
             record.isEnabled = false
+            fiveSecondButton.isEnabled = false
+            tenSecondButton.isEnabled = false
             countdownRemaining = 3
-            recordingRemaining = 10
+            recordingRemaining = selectedRecordingSeconds
             recordingStarted = false
             handler.post(ticker)
         }
@@ -2823,8 +5062,9 @@ class MainActivity : Activity() {
                     handler.removeCallbacks(ticker)
                     handler.removeCallbacks(captureTimeout)
                     soundIdEngine.setPersonalSoundCapturedListener(null)
+                    handingOffToNaming = true
                     dialog.dismiss()
-                    showPersonalSoundNamingDialog(embedding, audio, onSaved)
+                    showPersonalSoundNamingDialog(embedding, audio, onSaved, initialName)
                 }
             }
         }
@@ -2834,11 +5074,17 @@ class MainActivity : Activity() {
             handler.removeCallbacks(captureTimeout)
             soundIdEngine.cancelPersonalSoundCapture()
             soundIdEngine.setPersonalSoundCapturedListener(null)
+            if (!handingOffToNaming) setLiveSoundPredictionsVisible(true)
         }
         showDialogCenteredOnScreen(dialog)
     }
 
-    private fun showPersonalSoundNamingDialog(embedding: FloatArray, audio: ShortArray, onSaved: () -> Unit) {
+    private fun showPersonalSoundNamingDialog(
+        embedding: FloatArray,
+        audio: ShortArray,
+        onSaved: () -> Unit,
+        initialName: String? = null
+    ) {
         val density = resources.displayMetrics.density
         fun dp(value: Int) = (value * density).roundToInt()
         val content = LinearLayout(this).apply {
@@ -2860,7 +5106,7 @@ class MainActivity : Activity() {
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setTextColor(Color.WHITE)
         }, LinearLayout.LayoutParams(0, -2, 1f))
-        header.addView(Button(this).apply {
+        val closeButton = Button(this).apply {
             text = "×"
             isAllCaps = false
             textSize = 21f
@@ -2870,8 +5116,8 @@ class MainActivity : Activity() {
                 cornerRadius = dp(14).toFloat()
             }
             contentDescription = "Close"
-            setOnClickListener { dialog.dismiss() }
-        }, LinearLayout.LayoutParams(dp(42), dp(42)))
+        }
+        header.addView(closeButton, LinearLayout.LayoutParams(dp(42), dp(42)))
         content.addView(header)
         content.addView(TextView(this).apply {
             text = "Listen, name it, and save."
@@ -2881,9 +5127,9 @@ class MainActivity : Activity() {
         })
         val input = EditText(this).apply {
             hint = "e.g. Elephant"
+            setText(initialName?.takeIf { it.isNotBlank() } ?: soundIdEngine.suggestPersonalSoundName())
             isSingleLine = true
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-            setShowSoftInputOnFocus(false)
             imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
             textSize = 16f
             setTextColor(Color.WHITE)
@@ -2927,116 +5173,6 @@ class MainActivity : Activity() {
         inputRow.addView(save, LinearLayout.LayoutParams(dp(48), dp(46)))
         content.addView(inputRow)
 
-        val keyboard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(3), dp(5), dp(3), dp(4))
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(20, 29, 40))
-                cornerRadius = dp(13).toFloat()
-                setStroke(dp(1), Color.rgb(42, 57, 73))
-            }
-        }
-        var shiftOn = true
-        var symbolMode = false
-        lateinit var renderKeyboard: () -> Unit
-        fun insertAtCursor(value: String) {
-            val text = input.text
-            val start = input.selectionStart.coerceIn(0, text.length)
-            val end = input.selectionEnd.coerceIn(0, text.length)
-            val from = min(start, end)
-            val to = max(start, end)
-            text.replace(from, to, value)
-            input.setSelection((from + value.length).coerceIn(0, input.text.length))
-        }
-        fun handleKeyboardKey(key: String) {
-            when (key) {
-                "⇧" -> {
-                    shiftOn = !shiftOn
-                    renderKeyboard()
-                }
-                "⌫" -> {
-                    val start = input.selectionStart.coerceIn(0, input.text.length)
-                    val end = input.selectionEnd.coerceIn(0, input.text.length)
-                    if (start != end) insertAtCursor("")
-                    else if (start > 0) {
-                        input.text.delete(start - 1, start)
-                        input.setSelection(start - 1)
-                    }
-                }
-                "?123" -> {
-                    symbolMode = true
-                    renderKeyboard()
-                }
-                "ABC" -> {
-                    symbolMode = false
-                    renderKeyboard()
-                }
-                "Space" -> insertAtCursor(" ")
-                else -> {
-                    val character = if (key.length == 1 && key[0].isLetter()) {
-                        if (shiftOn) key.uppercase() else key.lowercase()
-                    } else key
-                    insertAtCursor(character)
-                    if (shiftOn && key.length == 1 && key[0].isLetter()) {
-                        shiftOn = false
-                        renderKeyboard()
-                    }
-                }
-            }
-        }
-        fun addKeyboardRow(keys: List<Pair<String, Float>>) {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER
-            }
-            keys.forEach { (key, weight) ->
-                val special = key in setOf("⇧", "⌫", "?123", "ABC")
-                val button = Button(this).apply {
-                    text = when {
-                        key.length == 1 && key[0].isLetter() ->
-                            if (shiftOn) key.uppercase() else key.lowercase()
-                        key == "Space" -> "space"
-                        else -> key
-                    }
-                    isAllCaps = false
-                    textSize = if (key == "Space") 11f else 14f
-                    setTextColor(Color.WHITE)
-                    minWidth = 0
-                    minHeight = 0
-                    setPadding(0, 0, 0, 0)
-                    isFocusable = false
-                    isFocusableInTouchMode = false
-                    stateListAnimator = null
-                    background = GradientDrawable().apply {
-                        setColor(if (special) Color.rgb(52, 75, 96) else Color.rgb(35, 47, 62))
-                        cornerRadius = dp(9).toFloat()
-                        setStroke(dp(1), Color.rgb(58, 73, 91))
-                    }
-                    setOnClickListener { handleKeyboardKey(key) }
-                }
-                row.addView(button, LinearLayout.LayoutParams(0, dp(38), weight).apply {
-                    setMargins(dp(2), dp(2), dp(2), dp(2))
-                })
-            }
-            keyboard.addView(row, LinearLayout.LayoutParams(-1, dp(42)))
-        }
-        renderKeyboard = {
-            keyboard.removeAllViews()
-            if (symbolMode) {
-                addKeyboardRow(listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "0").map { it to 1f })
-                addKeyboardRow(listOf("@", "#", "$", "%", "&", "-", "+", "(", ")", "/").map { it to 1f })
-                addKeyboardRow(listOf("á", "č", "ď", "é", "í", "ľ", "ň", "ó", "š", "⌫").map { it to 1f })
-                addKeyboardRow(listOf("ABC" to 1.4f, "ť" to 1f, "ú" to 1f, "ý" to 1f, "ž" to 1f, "Space" to 2.7f, "," to 0.8f, "." to 0.8f))
-            } else {
-                addKeyboardRow("qwertyuiop".map { it.toString() to 1f })
-                addKeyboardRow("asdfghjkl".map { it.toString() to 1f })
-                addKeyboardRow(listOf("⇧" to 1.35f) + "zxcvbnm".map { it.toString() to 1f } + listOf("⌫" to 1.35f))
-                addKeyboardRow(listOf("?123" to 1.5f, "," to 1f, "Space" to 4.5f, "." to 1f))
-            }
-        }
-        renderKeyboard()
-        content.addView(keyboard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
-
         fun saveSample() {
             val soundName = input.text.toString().trim()
             if (soundName.isEmpty()) {
@@ -3046,8 +5182,76 @@ class MainActivity : Activity() {
                 soundIdEngine.savePersonalSound(soundName, embedding, audio)
                 Toast.makeText(this, "Saved $soundName", Toast.LENGTH_SHORT).show()
                 onSaved()
+                setLiveSoundPredictionsVisible(true)
                 dialog.dismiss()
             }
+        }
+        closeButton.setOnClickListener {
+            val inputManager = getSystemService(Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
+            input.clearFocus()
+            inputManager?.hideSoftInputFromWindow(input.windowToken, 0)
+
+            val confirmationContent = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(18), dp(16), dp(18), dp(16))
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(14, 21, 31))
+                    cornerRadius = dp(20).toFloat()
+                }
+            }
+            confirmationContent.addView(TextView(this).apply {
+                text = "Discard this recording?"
+                textSize = 18f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setTextColor(Color.WHITE)
+            })
+            confirmationContent.addView(TextView(this).apply {
+                text = "Are you sure you want to leave naming? The unsaved recording will be lost."
+                textSize = 14f
+                setTextColor(Color.LTGRAY)
+                setPadding(0, dp(8), 0, dp(14))
+            })
+            val confirmation = Dialog(this)
+            val actions = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.END
+            }
+            actions.addView(Button(this).apply {
+                text = "Keep editing"
+                isAllCaps = false
+                setTextColor(Color.WHITE)
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(42, 57, 75))
+                    cornerRadius = dp(14).toFloat()
+                }
+                setOnClickListener {
+                    confirmation.dismiss()
+                    input.requestFocus()
+                    input.post { inputManager?.showSoftInput(input, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT) }
+                }
+            }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(8) })
+            actions.addView(Button(this).apply {
+                text = "Discard"
+                isAllCaps = false
+                setTextColor(Color.WHITE)
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(164, 69, 80))
+                    cornerRadius = dp(14).toFloat()
+                }
+                setOnClickListener {
+                    if (personalPreviewKey == "pending:${System.identityHashCode(audio)}") {
+                        stopPersonalSoundPreview()
+                    }
+                    setLiveSoundPredictionsVisible(true)
+                    confirmation.dismiss()
+                    dialog.dismiss()
+                }
+            }, LinearLayout.LayoutParams(0, dp(44), 0.75f))
+            confirmationContent.addView(actions)
+            confirmation.setContentView(confirmationContent)
+            confirmation.setCanceledOnTouchOutside(false)
+            confirmation.setCancelable(false)
+            showDialogCenteredOnScreen(confirmation, widthFraction = 0.92f)
         }
         save.setOnClickListener { saveSample() }
         input.setOnEditorActionListener { _, actionId, _ ->
@@ -3058,9 +5262,28 @@ class MainActivity : Activity() {
         }
         dialog = Dialog(this)
         dialog.setContentView(content)
-        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
-        dialog.setOnShowListener { input.requestFocus() }
-        showDialogCenteredOnScreen(dialog, widthFraction = 0.98f)
+        val namingDialogWidth = (resources.displayMetrics.widthPixels - dp(24)).coerceAtLeast(dp(260))
+        dialog.window?.apply {
+            setBackgroundDrawableResource(android.R.color.transparent)
+            setSoftInputMode(
+                android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                    android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE
+            )
+            setGravity(Gravity.CENTER)
+            setLayout(namingDialogWidth, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        dialog.setCanceledOnTouchOutside(false)
+        dialog.setCancelable(false)
+        dialog.setOnShowListener {
+            input.requestFocus()
+            input.setSelection(0, input.text.length)
+            input.post {
+                (getSystemService(Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)
+                    ?.showSoftInput(input, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+            }
+        }
+        dialog.show()
+        dialog.window?.setLayout(namingDialogWidth, ViewGroup.LayoutParams.WRAP_CONTENT)
     }
 
     private fun togglePersonalSoundPreview(id: String, name: String, button: Button) {
@@ -3177,7 +5400,10 @@ class MainActivity : Activity() {
             setColor(if (soundIdActive) Color.rgb(164, 69, 80) else Color.rgb(27, 121, 157))
             cornerRadius = 14f * density
         }
-        soundIdToggleButton?.text = if (soundIdActive) "Stop listening" else "Start listening"
+        (soundIdToggleButton as? AnalyzerIconButton)?.apply {
+            icon = if (soundIdActive) AnalyzerIconButton.Icon.STOP else AnalyzerIconButton.Icon.MIC
+            contentDescription = if (soundIdActive) "Stop listening" else "Start listening"
+        }
     }
 
     private fun showSoundIdSummary(summary: SoundSessionSummary) {
@@ -3192,6 +5418,7 @@ class MainActivity : Activity() {
         soundIdScoreView?.text = ""
         soundIdAlternativesView?.text = ""
         soundIdSummaryChart?.setSummary(summary)
+        soundIdSummaryTimeline?.setSummary(summary)
         updateSoundIdToggleStyle()
     }
 
@@ -3217,19 +5444,43 @@ class MainActivity : Activity() {
         canvas.drawText("Sound session summary", 42f, 62f, titlePaint)
         canvas.drawText("Analyzed ${formatSoundDuration(summary.totalSeconds)}", 42f, 91f, smallPaint)
         canvas.drawLine(42f, 111f, 553f, 111f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.LTGRAY; strokeWidth = 1f })
-        var y = 151f
+        canvas.drawText("Timeline · start to end · each segment is a classified window", 42f, 130f, smallPaint)
+        val timelineLeft = 42f
+        val timelineRight = 553f
+        val timelineTop = 139f
+        val timelineBottom = 153f
+        canvas.drawRoundRect(timelineLeft, timelineTop, timelineRight, timelineBottom, 5f, 5f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(224, 229, 235) })
+        if (summary.timeline.isNotEmpty()) {
+            val colorByLabel = summary.entries.take(SOUND_SESSION_COLORS.size)
+                .mapIndexed { index, entry -> entry.label to SOUND_SESSION_COLORS[index] }.toMap()
+            val columns = minOf(summary.timeline.size, (timelineRight - timelineLeft).toInt().coerceAtLeast(1))
+            for (column in 0 until columns) {
+                val eventIndex = (((column.toLong() + 1L) * summary.timeline.size.toLong()) / columns.toLong() - 1L)
+                    .toInt().coerceIn(0, summary.timeline.lastIndex)
+                val label = summary.timeline[eventIndex]
+                val color = if (label.startsWith("Unclear")) SOUND_SESSION_OTHER_COLOR
+                    else colorByLabel[label] ?: Color.rgb(68, 78, 91)
+                val left = timelineLeft + (timelineRight - timelineLeft) * (column.toFloat() / columns.toFloat())
+                val right = timelineLeft + (timelineRight - timelineLeft) * ((column + 1).toFloat() / columns.toFloat())
+                barPaint.color = color
+                canvas.drawRect(left, timelineTop, right + 0.25f, timelineBottom, barPaint)
+            }
+        }
+        var y = 183f
         summary.entries.take(10).forEachIndexed { index, entry ->
             val label = entry.label.take(42)
             textPaint.typeface = if (index == 0) android.graphics.Typeface.DEFAULT_BOLD else android.graphics.Typeface.DEFAULT
             canvas.drawText(label, 42f, y, textPaint)
             canvas.drawText(String.format(java.util.Locale.US, "%.1f%% · %.1f s", entry.percent, entry.seconds), 553f, y, textPaint.apply { textAlign = Paint.Align.RIGHT })
             textPaint.textAlign = Paint.Align.LEFT
-            barPaint.color = if (index == 0) Color.rgb(126, 75, 210) else Color.rgb(117, 160, 205)
+            barPaint.color = if (entry.label.startsWith("Unclear")) SOUND_SESSION_OTHER_COLOR
+                else SOUND_SESSION_COLORS[index % SOUND_SESSION_COLORS.size]
             val barWidth = (entry.percent.coerceAtLeast(0.0) / 100.0 * 470.0).toFloat().coerceIn(0f, 470f)
             canvas.drawRoundRect(42f, y + 10f, 42f + barWidth, y + 17f, 3f, 3f, barPaint)
             y += 56f
         }
-        canvas.drawText("Shares are weighted within each top-3 result; they are not calibrated probabilities.", 42f, 790f, smallPaint)
+        canvas.drawText("Scores are ranking values, not probabilities.", 42f, 782f, smallPaint)
+        canvas.drawText("Percentages show normalized shares; the timeline shows each window's strongest candidate.", 42f, 800f, smallPaint)
         pdf.finishPage(page)
         val output = java.io.ByteArrayOutputStream()
         try {
@@ -3290,7 +5541,8 @@ class MainActivity : Activity() {
         (controls.parent as? ViewGroup)?.removeView(controls)
         rangePickerButton?.visibility = View.GONE
         val density = resources.displayMetrics.density
-        val peakReadoutSpace = (100f * density).roundToInt()
+        header.layoutParams = header.layoutParams.apply { height = (42f * density).roundToInt() }
+        val peakReadoutSpace = (220f * density).roundToInt()
         val availableWidth = (header.width - peakReadoutSpace * 2 - (12f * density).roundToInt())
             .coerceAtLeast((180f * density).roundToInt())
         val targetWidth = minOf(availableWidth, (360f * density).roundToInt())
@@ -3304,11 +5556,17 @@ class MainActivity : Activity() {
         val controls = keyboardControlsRow ?: return
         val keyboardSection = keyboardSectionView as? ViewGroup ?: return
         (controls.parent as? ViewGroup)?.removeView(controls)
+        spectrumHeader?.let { header ->
+            if (spectrumHeaderCompactHeightPx > 0) {
+                header.layoutParams = header.layoutParams.apply { height = spectrumHeaderCompactHeightPx }
+            }
+        }
         keyboardSection.addView(
             controls,
             0,
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (40f * resources.displayMetrics.density).roundToInt())
         )
+        controls.post { applyKeyboardVolumeSafeInset() }
         rangePickerButton?.visibility = View.VISIBLE
         (keyboardPanel as? PianoKeyboardView)?.setSafeEdgeInset(0f)
     }
@@ -3374,7 +5632,7 @@ class MainActivity : Activity() {
         }
         val volume = control("VOLUME ${(pianoVolume * 100).roundToInt()}%") { button ->
             pianoVolume = if (pianoVolume >= 0.99f) 0.2f else (pianoVolume + 0.2f).coerceAtMost(1f)
-            pianoVolumeButton?.text = "VOLUME ${(pianoVolume * 100).roundToInt()}%"
+            updatePianoVolumeControls()
             button.text = "VOLUME ${(pianoVolume * 100).roundToInt()}%"
         }
         val octave = control(when (pianoTranspose) { 12 -> "OCTAVE +1"; -12 -> "OCTAVE -1"; else -> "OCTAVE 0" }) { button ->
@@ -3437,30 +5695,41 @@ class MainActivity : Activity() {
                     Toast.makeText(this, "Could not save the summary.", Toast.LENGTH_LONG).show()
                 }
             }
-            personalSoundExportRequestCode -> {
-                val archive = pendingPersonalSoundExport
-                pendingPersonalSoundExport = null
-                if (resultCode != RESULT_OK || uri == null || archive == null) return
+            personalSoundExportFolderRequestCode -> {
+                if (resultCode != RESULT_OK || uri == null) return
                 try {
-                    val output = contentResolver.openOutputStream(uri)
-                        ?: throw java.io.IOException("Could not open the selected destination")
-                    output.use { it.write(archive) }
-                    Toast.makeText(this, "WAV samples and labels exported.", Toast.LENGTH_LONG).show()
-                } catch (_: Exception) {
-                    Toast.makeText(this, "Could not export the samples.", Toast.LENGTH_LONG).show()
+                    val returnedFlags = data?.flags ?: 0
+                    val readGranted = returnedFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0
+                    val writeGranted = returnedFlags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION != 0
+                    if (!writeGranted) {
+                        Toast.makeText(this, "The selected folder did not grant write access.", Toast.LENGTH_LONG).show()
+                        return
+                    }
+                    if (readGranted) {
+                        contentResolver.takePersistableUriPermission(
+                            uri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                        )
+                    } else {
+                        contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                    }
+                    getSharedPreferences("personal_sound_export", Context.MODE_PRIVATE)
+                        .edit().putString("folder_uri", uri.toString()).apply()
+                    exportPersonalSoundProfiles()
+                } catch (error: Exception) {
+                    Toast.makeText(this, "Could not save the export folder: ${error.message ?: "access denied"}", Toast.LENGTH_LONG).show()
                 }
             }
             personalSoundImportRequestCode -> {
-                if (resultCode != RESULT_OK || uri == null) return
-                try {
-                    val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                        ?: throw java.io.IOException("Could not read the selected file")
-                    val count = importPersonalSoundArchive(bytes)
-                    personalSoundListRefresh?.invoke()
-                    Toast.makeText(this, "Imported $count sound sample(s).", Toast.LENGTH_LONG).show()
-                } catch (error: Exception) {
-                    Toast.makeText(this, "Could not import samples: ${error.message ?: "invalid archive"}", Toast.LENGTH_LONG).show()
-                }
+                if (resultCode != RESULT_OK) return
+                val selectedUris = buildList {
+                    uri?.let { add(it) }
+                    data?.clipData?.let { clips ->
+                        for (index in 0 until clips.itemCount) add(clips.getItemAt(index).uri)
+                    }
+                }.distinct()
+                if (selectedUris.isEmpty()) return
+                importPersonalSoundFiles(selectedUris)
             }
         }
     }
@@ -3530,7 +5799,12 @@ class MainActivity : Activity() {
         }
 
         recorder = audioRecord
+        splSystemCalibrationOffsetDb = readSystemSplCalibrationOffset(audioRecord)
+        splCalibrationOffsetDb = splManualCalibrationOffsetDb ?: splSystemCalibrationOffsetDb
+        splRecentReadings.clear()
+        splHasCurrentSample = false
         running = true
+        updateSplReadout()
 
         (startButton as? AnalyzerIconButton)?.icon = AnalyzerIconButton.Icon.STOP
         updateStartButtonAppearance()
@@ -3647,24 +5921,30 @@ class MainActivity : Activity() {
             val levelDb = if (rms > 0.0) 20.0 * log10(rms) else -120.0
             val spectrumSnapshot = magnitudes.copyOf()
             val currentFftSize = activeFftSize
+            val peakDb = if (peakMagnitude > 0.0) {
+                20.0 * log10(peakMagnitude * 4.0 / currentFftSize)
+            } else {
+                -120.0
+            }
 
             runOnUiThread {
                 if (running && frameResetGeneration == spectrumView.getResetGeneration()) {
                     spectrumView.setSpectrum(spectrumSnapshot, sampleRate, currentFftSize, peakFrequency)
-                    val peakDb = if (peakMagnitude > 0.0) {
-                        20.0 * log10(peakMagnitude * 4.0 / currentFftSize)
-                    } else {
-                        -120.0
-                    }
+                    latestAnalyzedPeakFrequency = peakFrequency
+                    latestAnalyzedPeakDb = peakDb
+                    latestAnalyzedRmsDb = levelDb
+                    splHasCurrentSample = true
                     headerPeakFrequencyText?.text = if (peakFrequency >= 1000.0) {
                         String.format(java.util.Locale.US, "%.2f kHz", peakFrequency / 1000.0)
                     } else {
                         String.format(java.util.Locale.US, "%.1f Hz", peakFrequency)
                     }
-                    headerPeakDbText?.text = String.format(java.util.Locale.US, "%.1f dB", peakDb)
+                    headerPeakDbText?.text = String.format(java.util.Locale.US, "%.1f dBFS", peakDb)
+                    updateSplReadout()
+                    updateTonePeakFollow(peakFrequency, peakDb, levelDb)
                     peakText.text = String.format(
                         java.util.Locale.US,
-                        "Peak: %.1f Hz    Level: %.1f dB    FFT: %d",
+                        "Peak: %.1f Hz    Level: %.1f dBFS    FFT: %d",
                         peakFrequency,
                         levelDb,
                         currentFftSize
@@ -3753,6 +6033,9 @@ class MainActivity : Activity() {
 
     private fun stopAnalysis() {
         running = false
+        splHasCurrentSample = false
+        splRecentReadings.clear()
+        updateSplReadout()
         if (soundIdActive) {
             soundIdActive = false
             if (soundIdPanel != null) {
@@ -3782,19 +6065,13 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         fullScaleKeysDialog?.dismiss()
+        splDetailDialog?.dismiss()
         soundIdTimerHandler.removeCallbacks(soundIdTimerRunnable)
         stopPersonalSoundPreview()
         stopTone()
         stopAnalysis()
         if (soundIdPanel != null) soundIdEngine.close()
-        pianoEngineRunning = false
-        try { pianoAudioThread?.join(300) } catch (_: InterruptedException) {}
-        pianoAudioThread = null
-        try { pianoAudioTrack?.pause() } catch (_: Exception) {}
-        try { pianoAudioTrack?.flush() } catch (_: Exception) {}
-        pianoAudioTrack?.release()
-        pianoAudioTrack = null
-        synchronized(pianoAudioLock) { pianoVoices.clear() }
+        stopPianoAudioEngine()
         pianoSamples.clear()
         pianoHeldNotes.clear()
         super.onDestroy()
@@ -3815,8 +6092,15 @@ private data class SoundCandidate(val label: String, val scorePercent: Int)
 
 private data class SoundSessionSummary(
     val totalSeconds: Double,
-    val entries: List<SoundSessionEntry>
+    val entries: List<SoundSessionEntry>,
+    val timeline: List<String> = emptyList()
 )
+
+private val SOUND_SESSION_COLORS = intArrayOf(
+    Color.rgb(75, 196, 255), Color.rgb(80, 220, 176), Color.rgb(255, 190, 86),
+    Color.rgb(183, 139, 255), Color.rgb(255, 124, 145)
+)
+private val SOUND_SESSION_OTHER_COLOR = Color.rgb(136, 158, 181)
 
 private data class SoundIdResult(
     val status: String,
@@ -3829,7 +6113,7 @@ private data class SoundIdResult(
 
 private const val PERSONAL_SOUND_FEATURE_COUNT = 585
 private const val PERSONAL_SOUND_SAMPLE_SECONDS = 10
-private const val PERSONAL_SOUND_PROFILE_WINDOWS = 19
+private const val PERSONAL_SOUND_DEFAULT_PROFILE_WINDOWS = 19
 private const val PERSONAL_SOUND_MATCH_THRESHOLD = 0.72f
 private const val PERSONAL_SOUND_NOTE_THRESHOLD = 0.55f
 
@@ -3861,6 +6145,7 @@ private class SoundIdEngine(
 
     @Volatile private var listening = false
     @Volatile private var ready = false
+    @Volatile private var modelLoadError: String? = null
     private val loadStarted = AtomicBoolean(false)
     private val inferencePending = AtomicBoolean(false)
     private val worker = Executors.newSingleThreadExecutor { runnable ->
@@ -3884,12 +6169,14 @@ private class SoundIdEngine(
     @Volatile private var personalCaptureName: String? = null
     private var personalCaptureSum = FloatArray(PERSONAL_FEATURE_COUNT)
     private var personalCaptureWindows = 0
+    private var personalCaptureTargetWindows = PERSONAL_SOUND_DEFAULT_PROFILE_WINDOWS
     private var personalCaptureWarmup = true
     @Volatile private var personalSoundCapturedListener: ((FloatArray, ShortArray) -> Unit)? = null
     private var personalCapturePcm = ShortArray(0)
     private var personalCapturePcmCount = 0
     private var personalCapturePcmActive = false
     private val secondsByLabel = linkedMapOf<String, Double>()
+    private val timelineLabels = mutableListOf<String>()
     private var analyzedSeconds = 0.0
     private val filter = createDecimatorFilter()
 
@@ -3904,6 +6191,7 @@ private class SoundIdEngine(
         onResult(SoundIdResult("LOADING MODEL", "Waiting for the first sound…"))
         worker.execute {
             secondsByLabel.clear()
+            timelineLabels.clear()
             analyzedSeconds = 0.0
             smoothedScores.fill(0f)
             hasSmoothedScores = false
@@ -3914,6 +6202,21 @@ private class SoundIdEngine(
 
     fun getPersonalSounds(): List<PersonalSoundProfile> = synchronized(personalSoundLock) {
         personalSounds.map { PersonalSoundProfile(it.id, it.name, it.embedding.copyOf()) }
+    }
+
+    fun suggestPersonalSoundName(): String = synchronized(personalSoundLock) {
+        var index = 1
+        while (personalSounds.any { it.name.equals("My Sound $index", ignoreCase = true) }) index++
+        "My Sound $index"
+    }
+
+    fun renamePersonalSound(id: String, name: String): Boolean = synchronized(personalSoundLock) {
+        val cleanName = name.trim()
+        val index = personalSounds.indexOfFirst { it.id == id }
+        if (cleanName.isEmpty() || index < 0) return@synchronized false
+        personalSounds[index] = personalSounds[index].copy(name = cleanName)
+        persistPersonalSoundsLocked()
+        true
     }
 
     fun removePersonalSound(id: String) {
@@ -3928,13 +6231,43 @@ private class SoundIdEngine(
         }
     }
 
-    fun beginPersonalSoundCapture() {
+    fun renamePersonalSounds(existingName: String, newName: String): Set<String> = synchronized(personalSoundLock) {
+        val cleanName = newName.trim()
+        if (cleanName.isEmpty()) return@synchronized emptySet()
+        val matching = personalSounds.filter { it.name.equals(existingName.trim(), ignoreCase = true) }
+        if (matching.isEmpty()) return@synchronized emptySet()
+        val ids = matching.mapTo(linkedSetOf<String>()) { it.id }
+        for (index in personalSounds.indices) {
+            if (personalSounds[index].id in ids) personalSounds[index] = personalSounds[index].copy(name = cleanName)
+        }
+        persistPersonalSoundsLocked()
+        ids
+    }
+
+    fun removePersonalSounds(name: String): Set<String> = synchronized(personalSoundLock) {
+        val matchingIds = personalSounds.filter { it.name.equals(name.trim(), ignoreCase = true) }
+            .mapTo(linkedSetOf<String>()) { it.id }
+        if (matchingIds.isEmpty()) return@synchronized emptySet()
+        personalSounds.removeAll { profile ->
+            if (profile.id in matchingIds) {
+                File(context.filesDir, "personal_sound_samples/${profile.id}.pcm").delete()
+                true
+            } else false
+        }
+        persistPersonalSoundsLocked()
+        matchingIds
+    }
+
+    fun beginPersonalSoundCapture(durationSeconds: Int = PERSONAL_SOUND_SAMPLE_SECONDS) {
+        val sampleDurationSeconds = durationSeconds.coerceIn(5, 10)
         synchronized(personalSoundLock) {
             personalCaptureName = "pending"
             personalCaptureSum = FloatArray(PERSONAL_FEATURE_COUNT)
             personalCaptureWindows = 0
+            val capturedSampleCount = sampleDurationSeconds * 48_000
+            personalCaptureTargetWindows = 1 + maxOf(0, (capturedSampleCount - WINDOW_SAMPLES) / HOP_SAMPLES)
             personalCaptureWarmup = true
-            personalCapturePcm = ShortArray(MODEL_RATE * 3 * PERSONAL_SOUND_SAMPLE_SECONDS)
+            personalCapturePcm = ShortArray(MODEL_RATE * 3 * sampleDurationSeconds)
             personalCapturePcmCount = 0
             personalCapturePcmActive = true
         }
@@ -3976,6 +6309,51 @@ private class SoundIdEngine(
             File(directory, "$id.pcm").writeBytes(pcm.array())
             personalSounds.add(PersonalSoundProfile(id, name, normalized))
             persistPersonalSoundsLocked()
+        }
+    }
+
+    fun createPersonalSoundFromAudio(
+        name: String,
+        source48k: ShortArray,
+        onComplete: (String?) -> Unit
+    ) {
+        worker.execute {
+            val failure = try {
+                val cleanName = name.trim().take(80)
+                require(cleanName.isNotEmpty()) { "The sample needs a name." }
+                require(source48k.size in WINDOW_SAMPLES..(48_000 * 30)) {
+                    "WAV must contain between 1 and 30 seconds of audio."
+                }
+                if (!ready && loadStarted.compareAndSet(false, true)) loadModel(announceState = false)
+                check(ready) { modelLoadError ?: "The sound model could not be loaded." }
+                val model = interpreter ?: error("The sound model is not ready.")
+                val embeddingSum = DoubleArray(PERSONAL_FEATURE_COUNT)
+                var usableWindows = 0
+                var start = 0
+                while (start + WINDOW_SAMPLES <= source48k.size) {
+                    val frame = source48k.copyOfRange(start, start + WINDOW_SAMPLES)
+                    val audio16k = resample48kTo16k(frame)
+                    val rms = sqrt(audio16k.sumOf { it.toDouble() * it.toDouble() } / audio16k.size)
+                    val rmsDb = if (rms > 0.0) 20.0 * log10(rms) else -120.0
+                    if (rmsDb >= QUIET_DBFS) {
+                        val output = Array(1) { FloatArray(CLASS_COUNT) }
+                        model.run(arrayOf(audio16k), output)
+                        val embedding = createPersonalEmbedding(output[0], audio16k)
+                        for (index in embedding.indices) embeddingSum[index] += embedding[index]
+                        usableWindows++
+                    }
+                    start += HOP_SAMPLES
+                }
+                require(usableWindows > 0) { "No clear sound was found in this WAV." }
+                val averaged = FloatArray(PERSONAL_FEATURE_COUNT) { index ->
+                    (embeddingSum[index] / usableWindows).toFloat()
+                }
+                savePersonalSound(cleanName, averaged, source48k)
+                null
+            } catch (error: Exception) {
+                error.message ?: "Could not create a profile from this WAV."
+            }
+            onComplete(failure)
         }
     }
 
@@ -4033,7 +6411,7 @@ private class SoundIdEngine(
         }
     }
 
-    private fun loadModel() {
+    private fun loadModel(announceState: Boolean = true) {
         try {
             val modelBytes = context.assets.open("yamnet.tflite").use { it.readBytes() }
             require(modelBytes.isNotEmpty()) { "yamnet.tflite is empty" }
@@ -4077,13 +6455,12 @@ private class SoundIdEngine(
             interpreter = Interpreter(model, options)
             labels = classNames
             ready = true
-            onResult(SoundIdResult("LISTENING", "Listening for sounds…"))
+            modelLoadError = null
+            if (announceState) onResult(SoundIdResult("LISTENING", "Listening for sounds…"))
         } catch (error: Exception) {
             ready = false
-            onResult(SoundIdResult(
-                "MODEL COULD NOT LOAD",
-                error.message ?: "Check that the sound model is included in the app."
-            ))
+            modelLoadError = error.message ?: "Check that the sound model is included in the app."
+            if (announceState) onResult(SoundIdResult("MODEL COULD NOT LOAD", modelLoadError!!))
         }
     }
 
@@ -4101,15 +6478,18 @@ private class SoundIdEngine(
         interpreter?.run(arrayOf(audio16k), output)
             ?: error("The YAMNet interpreter is not ready")
         val scores = output[0]
-        val personalEmbedding = createPersonalEmbedding(scores, audio16k)
+        val needsPersonalEmbedding = synchronized(personalSoundLock) {
+            personalSounds.isNotEmpty() || personalCaptureName != null
+        }
+        val personalEmbedding = if (needsPersonalEmbedding) createPersonalEmbedding(scores, audio16k) else null
         val capturedEmbedding = synchronized(personalSoundLock) {
-            if (personalCaptureName == null) null else if (personalCaptureWarmup) {
+            if (personalCaptureName == null || personalEmbedding == null) null else if (personalCaptureWarmup) {
                 personalCaptureWarmup = false
                 null
             } else {
                 for (index in personalEmbedding.indices) personalCaptureSum[index] += personalEmbedding[index]
                 personalCaptureWindows++
-                if (personalCaptureWindows >= PERSONAL_SOUND_PROFILE_WINDOWS) {
+                if (personalCaptureWindows >= personalCaptureTargetWindows) {
                     val averaged = FloatArray(PERSONAL_FEATURE_COUNT) { personalCaptureSum[it] / personalCaptureWindows }
                     personalCaptureName = null
                     personalCaptureSum = FloatArray(PERSONAL_FEATURE_COUNT)
@@ -4142,7 +6522,7 @@ private class SoundIdEngine(
             .sortedByDescending { smoothedScores[it] }
             .take(3)
             .toList()
-        val personalMatch = findPersonalSoundMatch(personalEmbedding)
+        val personalMatch = personalEmbedding?.let(::findPersonalSoundMatch)
         val customCandidate = personalMatch?.takeIf { it.second >= PERSONAL_SOUND_MATCH_THRESHOLD }?.let { (profile, similarity) ->
             SoundCandidate(profile.name, (similarity * 100f).roundToInt())
         }
@@ -4323,6 +6703,7 @@ private class SoundIdEngine(
         analyzedSeconds += seconds
         val uniqueCandidates = candidates.distinctBy { it.label }
         if (uniqueCandidates.isEmpty()) return
+        uniqueCandidates.maxByOrNull { it.scorePercent }?.label?.let(timelineLabels::add)
         val scoreTotal = uniqueCandidates.sumOf { it.scorePercent.coerceAtLeast(0) }.takeIf { it > 0 }
         uniqueCandidates.forEach { candidate ->
             val share = if (scoreTotal == null) 1.0 / uniqueCandidates.size else candidate.scorePercent.coerceAtLeast(0).toDouble() / scoreTotal
@@ -4331,12 +6712,12 @@ private class SoundIdEngine(
     }
 
     private fun createSessionSummary(): SoundSessionSummary {
-        if (analyzedSeconds <= 0.0) return SoundSessionSummary(0.0, emptyList())
+        if (analyzedSeconds <= 0.0) return SoundSessionSummary(0.0, emptyList(), emptyList())
         val ranked = secondsByLabel.entries.sortedByDescending { it.value }
         val entries = ranked.take(5).map { (label, seconds) ->
             SoundSessionEntry(label, seconds, seconds / analyzedSeconds * 100.0)
         }
-        return SoundSessionSummary(analyzedSeconds, entries)
+        return SoundSessionSummary(analyzedSeconds, entries, timelineLabels.toList())
     }
 
     /** Windowed-sinc low-pass followed by 3:1 decimation; this is not rate reinterpretation. */
@@ -4520,24 +6901,22 @@ private class SoundSessionChartView(context: Context) : View(context) {
         val rowHeight = height.toFloat() / rows.size
         val labelBaselineOffset = 15f * density
         val trackHeight = 5f * density
-        val valueSpace = 48f * density
+        val valueSpace = 76f * density
         val barRight = (width - valueSpace).coerceAtLeast(0f)
         val labelLimit = barRight - 8f * density
-        val colors = intArrayOf(
-            Color.rgb(75, 196, 255), Color.rgb(80, 220, 176), Color.rgb(255, 190, 86),
-            Color.rgb(183, 139, 255), Color.rgb(255, 124, 145), Color.rgb(136, 158, 181)
-        )
         rows.forEachIndexed { index, row ->
             val top = index * rowHeight
             val baseline = top + labelBaselineOffset
             val label = ellipsize(row.label, textPaint, labelLimit)
             canvas.drawText(label, 0f, baseline, textPaint)
             percentPaint.color = Color.rgb(190, 207, 222)
-            canvas.drawText("${row.percent.roundToInt()}%", width.toFloat(), baseline, percentPaint)
+            val resultText = String.format(java.util.Locale.US, "%d%% · %.0fs", row.percent.roundToInt(), row.seconds)
+            canvas.drawText(resultText, width.toFloat(), baseline, percentPaint)
             val trackTop = top + 23f * density
             canvas.drawRoundRect(0f, trackTop, barRight, trackTop + trackHeight, trackHeight, trackHeight, trackPaint)
             val fillRight = (barRight * row.percent / 100.0).toFloat().coerceIn(0f, barRight)
-            barPaint.color = if (row.label.startsWith("Unclear")) Color.rgb(136, 158, 181) else colors[index % colors.size]
+            barPaint.color = if (row.label.startsWith("Unclear")) SOUND_SESSION_OTHER_COLOR
+                else SOUND_SESSION_COLORS[index % SOUND_SESSION_COLORS.size]
             canvas.drawRoundRect(0f, trackTop, fillRight, trackTop + trackHeight, trackHeight, trackHeight, barPaint)
         }
     }
@@ -4550,11 +6929,56 @@ private class SoundSessionChartView(context: Context) : View(context) {
     }
 }
 
+private class SoundSessionTimelineView(context: Context) : View(context) {
+    private val density = resources.displayMetrics.density
+    private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(35, 47, 62) }
+    private val segmentPaint = Paint().apply { style = Paint.Style.FILL }
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(190, 207, 222)
+        textSize = 10f * density
+    }
+    private var summary: SoundSessionSummary? = null
+
+    fun setSummary(value: SoundSessionSummary) {
+        summary = value
+        val labels = value.timeline.distinct().take(8)
+        contentDescription = if (labels.isEmpty()) "No sound timeline available" else
+            "Sound sequence from start to end: ${labels.joinToString()}. Colors match the session share chart."
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val current = summary
+        val events = current?.timeline.orEmpty()
+        if (events.isEmpty()) {
+            canvas.drawText("No analyzed sound sequence", 0f, height * 0.72f, textPaint)
+            return
+        }
+        val radius = height / 2f
+        canvas.drawRoundRect(0f, 0f, width.toFloat(), height.toFloat(), radius, radius, backgroundPaint)
+        val topLabels = current?.entries.orEmpty().take(SOUND_SESSION_COLORS.size)
+            .mapIndexed { index, entry -> entry.label to SOUND_SESSION_COLORS[index] }.toMap()
+        val columns = minOf(events.size, width.coerceAtLeast(1))
+        for (column in 0 until columns) {
+            val eventIndex = (((column.toLong() + 1L) * events.size.toLong()) / columns.toLong() - 1L)
+                .toInt().coerceIn(0, events.lastIndex)
+            val label = events[eventIndex]
+            segmentPaint.color = if (label.startsWith("Unclear")) SOUND_SESSION_OTHER_COLOR
+            else topLabels[label] ?: Color.rgb(68, 78, 91)
+            val left = width.toFloat() * (column.toFloat() / columns.toFloat())
+            val right = width.toFloat() * ((column + 1).toFloat() / columns.toFloat())
+            canvas.drawRect(left, 1f * density, right + 0.5f, height - 1f * density, segmentPaint)
+        }
+    }
+}
+
 private class PianoKeyboardView(
     context: Context,
     private val onKeyChange: (midiNote: Int, pressed: Boolean) -> Unit
 ) : View(context) {
     private var safeEdgeInsetPx = 0f
+    private var transpose = 0
     private val whitePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(245, 245, 240); style = Paint.Style.FILL }
     private val blackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(25, 29, 36); style = Paint.Style.FILL }
     private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(70, 78, 90); strokeWidth = 1.5f; style = Paint.Style.STROKE }
@@ -4566,6 +6990,11 @@ private class PianoKeyboardView(
 
     fun setSafeEdgeInset(insetPx: Float) {
         safeEdgeInsetPx = insetPx.coerceAtLeast(0f)
+        invalidate()
+    }
+
+    fun setTranspose(semitones: Int) {
+        transpose = semitones
         invalidate()
     }
 
@@ -4584,7 +7013,7 @@ private class PianoKeyboardView(
             canvas.drawRect(left, top, right, bottom, if (note in activeNotes) pressedPaint else whitePaint)
             canvas.drawRect(left, top, right, bottom, linePaint)
             val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.DKGRAY; textSize = (height * 0.075f).coerceIn(10f, 24f); textAlign = Paint.Align.CENTER }
-            canvas.drawText(noteName(note), (left + right) / 2f, bottom - height * 0.04f, labelPaint)
+            canvas.drawText(noteName(note + transpose), (left + right) / 2f, bottom - height * 0.04f, labelPaint)
         }
         val blackWidth = whiteWidth * 0.58f
         val blackHeight = height * 0.60f
@@ -4803,19 +7232,6 @@ class SpectrumView @JvmOverloads constructor(
 
     private val frequencyLabelTicks = setOf(40, 60, 100, 200, 500, 1000, 2000, 4000, 10000, 20000)
 
-    // Each band is assigned a relative width, independent of its Hz span.
-    // This creates the intentionally non-linear, custom-spaced X axis.
-    private val customAxisBreaks = doubleArrayOf(
-        0.0, 40.0, 60.0, 100.0, 200.0, 500.0,
-        1000.0, 2000.0, 4000.0, 10000.0, 20000.0, 40000.0
-    )
-    private val customAxisWeights = doubleArrayOf(
-        1.0, 1.0, 1.5, 1.75, 2.25, 1.75, 1.75, 1.75, 2.0, 1.75, 1.75
-    )
-    private val customAxisCumulative = DoubleArray(customAxisBreaks.size).also { cumulative ->
-        for (i in customAxisWeights.indices) cumulative[i + 1] = cumulative[i] + customAxisWeights[i]
-    }
-
     private val spectrumPath = Path()
     private val peakHoldPath = Path()
     private val handler = Handler(Looper.getMainLooper())
@@ -4857,8 +7273,18 @@ class SpectrumView @JvmOverloads constructor(
     @Volatile
     private var resetGeneration = 0
     private val touchSlop = android.view.ViewConfiguration.get(context).scaledTouchSlop
+    private var soundIdPortraitLayoutActive = false
+
+    fun setSoundIdPortraitLayoutActive(active: Boolean) {
+        if (soundIdPortraitLayoutActive == active) return
+        soundIdPortraitLayoutActive = active
+        invalidate()
+    }
 
     private fun plotLeftInset(): Float {
+        // In portrait Sound ID mode, use the full screen width for the plot.
+        // The landscape inset exists to keep the graph clear of the front camera.
+        if (soundIdPortraitLayoutActive) return 0f
         val density = resources.displayMetrics.density
         val cameraSafeInsetScreen = if (android.os.Build.VERSION.SDK_INT >= 28) {
             rootWindowInsets?.displayCutout?.safeInsetLeft ?: 0
@@ -4868,8 +7294,12 @@ class SpectrumView @JvmOverloads constructor(
         val viewLocation = IntArray(2)
         getLocationOnScreen(viewLocation)
         val cameraSafeInset = (cameraSafeInsetScreen - viewLocation[0]).coerceAtLeast(0)
-        // Keep a conservative landscape camera margin even when Android reports no cutout inset.
-        return max(54f * density, cameraSafeInset + 10f * density)
+        // Keep the graph close to the cutout while leaving a small visual safety gap.
+        return if (cameraSafeInset > 0) {
+            cameraSafeInset + 4f * density
+        } else {
+            18f * density
+        }
     }
 
     fun getResetGeneration(): Int = resetGeneration
@@ -4921,9 +7351,14 @@ class SpectrumView @JvmOverloads constructor(
     private var highResolutionFftEnabled = false
 
     fun getRecommendedFftSize(): Int {
-        val fullSpan = ln(maxFrequencyBound / minFrequencyBound)
-        val visibleSpan = ln(visibleMaxFrequency / visibleMinFrequency)
-        val zoomFactor = fullSpan / visibleSpan.coerceAtLeast(1e-9)
+        val zoomFactor = if (linearFrequencyAxis) {
+            (maxFrequencyBound - minFrequencyBound) /
+                (visibleMaxFrequency - visibleMinFrequency).coerceAtLeast(1.0)
+        } else {
+            val fullSpan = ln(maxFrequencyBound / minFrequencyBound)
+            val visibleSpan = logAxisPosition(visibleMaxFrequency) - logAxisPosition(visibleMinFrequency)
+            fullSpan / visibleSpan.coerceAtLeast(1e-9)
+        }
 
         if (!highResolutionFftEnabled && zoomFactor >= 1.6) {
             highResolutionFftEnabled = true
@@ -5044,7 +7479,7 @@ class SpectrumView @JvmOverloads constructor(
                     // sensitivity so short drags make small, predictable dB-range changes.
                     val totalDyDp = (event.y - yScaleStartY) / resources.displayMetrics.density
                     val newRange = (yScaleStartRange * kotlin.math.exp(totalDyDp.toDouble() * 0.0018))
-                        .roundToInt().coerceIn(20, 160)
+                        .roundToInt().coerceIn(20, 240)
                     // Keep the starting midpoint fixed so zooming does not shift the graph.
                     var newFloor = kotlin.math.round(yScaleStartCenter.toDouble() - newRange / 2.0).toInt()
                     var newCeiling = newFloor + newRange
@@ -5263,10 +7698,8 @@ class SpectrumView @JvmOverloads constructor(
         peakHoldEnabled = !peakHoldEnabled
         if (peakHoldEnabled) {
             peakHoldMagnitudes = copySpectrumUpTo20kHz(magnitudes, sourceSampleRate, sourceFftSize)
-            Toast.makeText(context, "Peak Hold enabled", Toast.LENGTH_SHORT).show()
         } else {
             peakHoldMagnitudes = DoubleArray(0)
-            Toast.makeText(context, "Peak Hold cleared", Toast.LENGTH_SHORT).show()
         }
         invalidate()
         notifyControlState()
@@ -5383,62 +7816,28 @@ class SpectrumView @JvmOverloads constructor(
         notifyFrequencyRange()
     }
 
-    private fun customAxisPosition(frequency: Double): Double {
-        if (frequency < customAxisBreaks.first()) {
-            val firstSpan = customAxisBreaks[1] - customAxisBreaks[0]
-            return (frequency - customAxisBreaks[0]) / firstSpan * customAxisWeights[0]
-        }
-        if (frequency > customAxisBreaks.last()) {
-            val last = customAxisBreaks.lastIndex
-            val lastSpan = customAxisBreaks[last] - customAxisBreaks[last - 1]
-            return customAxisCumulative.last() +
-                    (frequency - customAxisBreaks.last()) / lastSpan * customAxisWeights.last()
-        }
-        val f = frequency
-        for (i in customAxisWeights.indices) {
-            val start = customAxisBreaks[i]
-            val end = customAxisBreaks[i + 1]
-            if (f <= end) {
-                val part = ((f - start) / (end - start)).coerceIn(0.0, 1.0)
-                return customAxisCumulative[i] + part * customAxisWeights[i]
-            }
-        }
-        return customAxisCumulative.last()
-    }
+    /** Exact log spacing for physical frequencies, with a linear empty-grid extension below 20 Hz. */
+    private fun logAxisPosition(frequency: Double): Double =
+        if (frequency >= minFrequencyBound) ln(frequency / minFrequencyBound)
+        else frequency / minFrequencyBound - 1.0
 
-    private fun frequencyAtCustomAxisPosition(position: Double): Double {
-        if (position < 0.0) {
-            return customAxisBreaks[0] + position / customAxisWeights[0] *
-                    (customAxisBreaks[1] - customAxisBreaks[0])
-        }
-        if (position > customAxisCumulative.last()) {
-            val last = customAxisBreaks.lastIndex
-            return customAxisBreaks.last() + (position - customAxisCumulative.last()) /
-                    customAxisWeights.last() * (customAxisBreaks[last] - customAxisBreaks[last - 1])
-        }
-        val p = position
-        for (i in customAxisWeights.indices) {
-            if (p <= customAxisCumulative[i + 1]) {
-                val part = ((p - customAxisCumulative[i]) / customAxisWeights[i]).coerceIn(0.0, 1.0)
-                return customAxisBreaks[i] + part * (customAxisBreaks[i + 1] - customAxisBreaks[i])
-            }
-        }
-        return customAxisBreaks.last()
-    }
+    private fun frequencyAtLogAxisPosition(position: Double): Double =
+        if (position >= 0.0) minFrequencyBound * exp(position.coerceAtMost(700.0))
+        else minFrequencyBound * (position + 1.0)
 
-    // The default axis uses custom band widths; the optional linear mode remains available.
+    // LOG uses equal spacing per frequency ratio; LIN uses equal spacing per Hz.
     private fun frequencyRatio(frequency: Double, minFreq: Double, maxFreq: Double): Double {
         if (linearFrequencyAxis) return (frequency - minFreq) / (maxFreq - minFreq)
-        val low = customAxisPosition(minFreq)
-        val high = customAxisPosition(maxFreq)
-        return (customAxisPosition(frequency) - low) / (high - low).coerceAtLeast(1e-12)
+        val low = logAxisPosition(minFreq)
+        val high = logAxisPosition(maxFreq)
+        return (logAxisPosition(frequency) - low) / (high - low).coerceAtLeast(1e-12)
     }
 
     private fun frequencyAtRatio(ratio: Double, minFreq: Double, maxFreq: Double): Double {
         if (linearFrequencyAxis) return minFreq + ratio * (maxFreq - minFreq)
-        val low = customAxisPosition(minFreq)
-        val high = customAxisPosition(maxFreq)
-        return frequencyAtCustomAxisPosition(low + ratio.coerceIn(0.0, 1.0) * (high - low))
+        val low = logAxisPosition(minFreq)
+        val high = logAxisPosition(maxFreq)
+        return frequencyAtLogAxisPosition(low + ratio.coerceIn(0.0, 1.0) * (high - low))
             .coerceIn(minFreq, maxFreq)
     }
 
@@ -5452,24 +7851,18 @@ class SpectrumView @JvmOverloads constructor(
         val oldMin = visibleMinFrequency
         val oldMax = visibleMaxFrequency
         val anchorFrequency = frequencyAtRatio(focusRatio, oldMin, oldMax)
-        val oldSpan = if (linearFrequencyAxis) oldMax - oldMin else customAxisPosition(oldMax) - customAxisPosition(oldMin)
+        val oldMinAxis = if (linearFrequencyAxis) oldMin else logAxisPosition(oldMin)
+        val oldMaxAxis = if (linearFrequencyAxis) oldMax else logAxisPosition(oldMax)
+        val oldSpan = (oldMaxAxis - oldMinAxis).coerceAtLeast(1e-12)
         val minSpan = if (linearFrequencyAxis) 10.0 else minLogSpan
-        val maxSpan = if (linearFrequencyAxis) maxFrequencyBound - minFrequencyBound else customAxisCumulative.last()
+        val maxSpan = if (linearFrequencyAxis) maxFrequencyBound - minFrequencyBound else maxLogSpan
         val newSpan = (oldSpan / scaleFactor.toDouble()).coerceIn(minSpan, maxSpan)
-        var newMin: Double
-        var newMax: Double
-        if (linearFrequencyAxis) {
-            // Keep the frequency below the pinch midpoint at that same screen position.
-            newMin = anchorFrequency - focusRatio * newSpan
-            newMax = newMin + newSpan
-        } else {
-            val anchorPosition = customAxisPosition(anchorFrequency)
-            val lowPosition = anchorPosition - focusRatio * newSpan
-            newMin = frequencyAtCustomAxisPosition(lowPosition)
-            newMax = frequencyAtCustomAxisPosition(lowPosition + newSpan)
-        }
-        visibleMinFrequency = newMin
-        visibleMaxFrequency = newMax
+        // Keep the frequency under the pinch midpoint at the same screen position.
+        val anchorAxisPosition = if (linearFrequencyAxis) anchorFrequency else logAxisPosition(anchorFrequency)
+        val newMinAxis = anchorAxisPosition - focusRatio * newSpan
+        val newMaxAxis = newMinAxis + newSpan
+        visibleMinFrequency = if (linearFrequencyAxis) newMinAxis else frequencyAtLogAxisPosition(newMinAxis)
+        visibleMaxFrequency = if (linearFrequencyAxis) newMaxAxis else frequencyAtLogAxisPosition(newMaxAxis)
         notifyFrequencyRange()
         invalidate()
     }
@@ -5482,25 +7875,25 @@ class SpectrumView @JvmOverloads constructor(
         }
         // Horizontal dragging pans the frequency range; vertical dragging pans the
         // visible dB window without changing its height (dB span).
-        val plotWidth = (width - plotLeftInset() - dbAxisMarginWidth - 2f).coerceAtLeast(1f)
-        val fraction = -dx / plotWidth
+        val plotWidth = (width.toFloat() - plotLeftInset() - dbAxisMarginWidth - 2f).coerceAtLeast(1f)
+        val fraction = (-dx / plotWidth).toDouble()
         val frequencySpan = if (linearFrequencyAxis) visibleMaxFrequency - visibleMinFrequency
-        else customAxisPosition(visibleMaxFrequency) - customAxisPosition(visibleMinFrequency)
+        else logAxisPosition(visibleMaxFrequency) - logAxisPosition(visibleMinFrequency)
         val frequencyShift = fraction * frequencySpan
         if (linearFrequencyAxis) {
             visibleMinFrequency += frequencyShift
             visibleMaxFrequency += frequencyShift
         } else {
-            visibleMinFrequency = frequencyAtCustomAxisPosition(customAxisPosition(visibleMinFrequency) + frequencyShift)
-            visibleMaxFrequency = frequencyAtCustomAxisPosition(customAxisPosition(visibleMaxFrequency) + frequencyShift)
+            visibleMinFrequency = frequencyAtLogAxisPosition(logAxisPosition(visibleMinFrequency) + frequencyShift)
+            visibleMaxFrequency = frequencyAtLogAxisPosition(logAxisPosition(visibleMaxFrequency) + frequencyShift)
         }
 
         // Keep the current dB range size fixed while moving it vertically.
         // The default/reset floor remains -130 dB, but panning can move the
         // visible window below that value so a zoomed trace can be repositioned.
-        val plotHeight = (height - 80f).coerceAtLeast(1f)
+        val plotHeight = (height.toFloat() - 80f).coerceAtLeast(1f)
         val dbSpan = (dbCeiling - dbFloor).coerceAtLeast(20)
-        val dbShift = (dy / plotHeight * dbSpan).roundToInt()
+        val dbShift = (dy / plotHeight * dbSpan.toFloat()).roundToInt()
         if (dbShift != 0) {
             val newFloor = dbFloor + dbShift
             dbFloor = newFloor
@@ -5639,26 +8032,81 @@ class SpectrumView @JvmOverloads constructor(
             return left + (right - left) * ratio.toFloat()
         }
 
-        val axisStart = if (linearFrequencyAxis) minFreq else customAxisPosition(minFreq)
-        val axisEnd = if (linearFrequencyAxis) maxFreq else customAxisPosition(maxFreq)
-        val axisPeriod = if (linearFrequencyAxis) maxFrequencyBound else customAxisCumulative.last()
-        val firstGridCycle = kotlin.math.floor(axisStart / axisPeriod).toInt() - 1
-        val lastGridCycle = kotlin.math.ceil(axisEnd / axisPeriod).toInt() + 1
-        for (cycle in firstGridCycle..lastGridCycle) {
-            for (frequency in gridFrequencies) {
-                val basePosition = if (linearFrequencyAxis) frequency.toDouble() else customAxisPosition(frequency.toDouble())
-                val position = basePosition + cycle * axisPeriod
-                if (position < axisStart || position > axisEnd) continue
-                val x = left + (right - left) * ((position - axisStart) / (axisEnd - axisStart)).toFloat()
-                canvas.drawLine(x, top, x, bottom, gridPaint)
-                if (cycle != 0 || frequency <= 0 || frequency !in frequencyLabelTicks) continue
-                val label = when {
-                    frequency == 20000 -> "20k"
-                    frequency >= 1000 -> "${frequency / 1000}k"
-                    else -> frequency.toString()
+        if (linearFrequencyAxis) {
+            val axisStart = minFreq
+            val axisEnd = maxFreq
+            val axisPeriod = maxFrequencyBound
+            val firstGridCycle = kotlin.math.floor(axisStart / axisPeriod).toInt() - 1
+            val lastGridCycle = kotlin.math.ceil(axisEnd / axisPeriod).toInt() + 1
+            for (cycle in firstGridCycle..lastGridCycle) {
+                for (frequency in gridFrequencies) {
+                    val position = frequency + cycle * axisPeriod
+                    if (position < axisStart || position > axisEnd) continue
+                    val x = left + (right - left) * ((position - axisStart) / (axisEnd - axisStart)).toFloat()
+                    canvas.drawLine(x, top, x, bottom, gridPaint)
+                    if (cycle != 0 || frequency <= 0 || frequency !in frequencyLabelTicks) continue
+                    val label = when {
+                        frequency == 20000 -> "20k"
+                        frequency >= 1000 -> "${frequency / 1000}k"
+                        else -> frequency.toString()
+                    }
+                    val labelX = max(left, x - textPaint.measureText(label) / 2f)
+                    canvas.drawText(label, labelX, bottom + 30f, textPaint)
                 }
-                val labelX = max(left, x - textPaint.measureText(label) / 2f)
-                canvas.drawText(label, labelX, bottom + 30f, textPaint)
+            }
+        } else {
+            val axisStart = logAxisPosition(minFreq)
+            val axisEnd = logAxisPosition(maxFreq)
+            val axisSpan = (axisEnd - axisStart).coerceAtLeast(1e-12)
+            fun drawLogGridLine(position: Double, label: String? = null) {
+                if (position < axisStart || position > axisEnd) return
+                val x = left + (right - left) * ((position - axisStart) / axisSpan).toFloat()
+                canvas.drawLine(x, top, x, bottom, gridPaint)
+                if (label != null) {
+                    val labelX = (x - textPaint.measureText(label) / 2f)
+                        .coerceIn(left, max(left, right - textPaint.measureText(label)))
+                    canvas.drawText(label, labelX, bottom + 30f, textPaint)
+                }
+            }
+
+            // Keep the empty, sub-20 Hz/negative-frequency grid pannable without
+            // inventing frequency labels in a region where the microphone has no data.
+            if (axisStart < 0.0) {
+                val negativeEnd = min(axisEnd, 0.0)
+                val targetLines = ((right - left) / (32f * resources.displayMetrics.density))
+                    .roundToInt().coerceAtLeast(1)
+                val step = max(1.0, ceil((negativeEnd - axisStart) / targetLines.toDouble()))
+                var position = ceil(axisStart / step) * step
+                var drawn = 0
+                while (position <= negativeEnd && drawn < targetLines + 2) {
+                    drawLogGridLine(position)
+                    position += step
+                    drawn++
+                }
+            }
+
+            // Standard logarithmic decade lines (1–9 × 10ⁿ); label the 1, 2 and 5 lines.
+            val positiveMin = max(minFrequencyBound, minFreq)
+            val positiveMax = max(minFrequencyBound, maxFreq)
+            val firstDecade = (floor(log10(positiveMin)) - 1.0).toInt().coerceIn(-300, 300)
+            val lastDecade = (ceil(log10(positiveMax)) + 1.0).toInt().coerceIn(-300, 300)
+            for (decade in firstDecade..lastDecade) {
+                val base = 10.0.pow(decade)
+                for (multiplier in 1..9) {
+                    val frequency = multiplier.toDouble() * base
+                    if (frequency < minFrequencyBound || frequency < minFreq || frequency > maxFreq) continue
+                    val label = if (multiplier == 1 || multiplier == 2 || multiplier == 5) {
+                        when {
+                            frequency >= 1000.0 -> {
+                                val kilo = frequency / 1000.0
+                                if (kilo == kilo.roundToInt().toDouble()) "${kilo.roundToInt()}k"
+                                else String.format(java.util.Locale.US, "%.1fk", kilo)
+                            }
+                            else -> frequency.roundToInt().toString()
+                        }
+                    } else null
+                    drawLogGridLine(logAxisPosition(frequency), label)
+                }
             }
         }
 
@@ -5704,16 +8152,17 @@ class SpectrumView @JvmOverloads constructor(
             canvas.drawText("TIME", w - 7f * resources.displayMetrics.density, max(10f, top - 26f), dbAxisUnitPaint)
         } else {
             val axisX = right
-            var dbTick = kotlin.math.floor(dbCeiling / 10.0).toInt() * 10
+            val dbTickStep = if (dbCeiling - dbFloor > 160) 20 else 10
+            var dbTick = kotlin.math.floor(dbCeiling / dbTickStep.toDouble()).toInt() * dbTickStep
             canvas.drawLine(axisX, top, axisX, bottom, dbAxisPaint)
             while (dbTick >= dbFloor) {
                 val y = yForDb(dbTick.toDouble())
                 canvas.drawLine(left, y, right, y, gridPaint)
                 canvas.drawLine(axisX - 4f, y, axisX + 3f, y, dbAxisPaint)
                 canvas.drawText(dbTick.toString(), w - 7f * resources.displayMetrics.density, y + 8f, dbAxisTextPaint)
-                dbTick -= 10
+                dbTick -= dbTickStep
             }
-            canvas.drawText("dB", w - 7f * resources.displayMetrics.density, top - 26f, dbAxisUnitPaint)
+            canvas.drawText("dBFS", w - 7f * resources.displayMetrics.density, top - 26f, dbAxisUnitPaint)
         }
 
         val data = magnitudes
@@ -5747,7 +8196,7 @@ class SpectrumView @JvmOverloads constructor(
                 } else {
                     String.format(java.util.Locale.US, "%.1f Hz", selectedHz)
                 }
-                val label = "$frequencyLabel   ${String.format(java.util.Locale.US, "%.1f", levelDb)} dB   ${String.format(java.util.Locale.US, "%.1f", secondsAgo)} s"
+                val label = "$frequencyLabel   ${String.format(java.util.Locale.US, "%.1f", levelDb)} dBFS   ${String.format(java.util.Locale.US, "%.1f", secondsAgo)} s"
                 val horizontalPadding = 10f
                 val verticalPadding = 7f
                 val labelWidth = cursorTextPaint.measureText(label)
@@ -5789,7 +8238,7 @@ class SpectrumView @JvmOverloads constructor(
             } else {
                 String.format(java.util.Locale.US, "%.1f Hz", peak.frequency)
             }
-            val label = "$frequencyLabel  ${String.format(java.util.Locale.US, "%.1f", peak.db)} dB"
+            val label = frequencyLabel
             val labelWidth = peakTextPaint.measureText(label)
             val labelX = (peakX - labelWidth / 2f).coerceIn(left, max(left, right - labelWidth))
             var labelY = max(top + 18f, peakY - 13f - index * 2f)
@@ -5830,7 +8279,7 @@ class SpectrumView @JvmOverloads constructor(
             } else {
                 String.format(java.util.Locale.US, "%.1f Hz", cursorHz)
             }
-            val label = "$frequencyLabel   ${String.format(java.util.Locale.US, "%.1f", levelDb)} dB"
+            val label = "$frequencyLabel   ${String.format(java.util.Locale.US, "%.1f", levelDb)} dBFS"
             val horizontalPadding = 10f
             val verticalPadding = 7f
             val labelWidth = cursorTextPaint.measureText(label)
