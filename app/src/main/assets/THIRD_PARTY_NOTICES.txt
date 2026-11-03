@@ -8,3 +8,10 @@ AudioSet ontology
 - Use: class hierarchy lookups to prefer a sufficiently supported specific label over a broad parent label. Audio examples are not included.
 
 The ontology is included unchanged. Its `child_ids` relationships are matched against the YAMNet class map.
+
+EfficientAT mn04_as
+- Source: Florian Schmid, https://github.com/fschmid56/EfficientAT
+- File: efficientat_mn04_as.tflite (converted from the official mn04_as AudioSet checkpoint)
+- License: MIT; see EFFICIENTAT_LICENSE.txt
+- Use: optional second offline audio classifier. Its 527 AudioSet class labels are provided in efficientat_class_map.csv.
+- The mel filter-bank values used by the Android frontend are provided in efficientat_mel_basis.f32.
