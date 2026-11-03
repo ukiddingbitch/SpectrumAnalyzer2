@@ -46,6 +46,7 @@ import android.graphics.drawable.GradientDrawable
 import android.content.Context
 import android.util.AttributeSet
 import android.widget.Button
+import android.widget.ImageButton
 import androidx.appcompat.widget.AppCompatButton
 import android.widget.EditText
 import android.text.InputFilter
@@ -70,13 +71,175 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.pow
+import kotlin.math.tan
 
-@android.annotation.TargetApi(26)
+internal class PcmBlock(val samples: ShortArray, val count: Int)
+
+/** Thread-safe latest PCM window shared by the audio worker and the UI oscilloscope. */
+private class TonePcmFrame(sampleCount: Int) {
+    private val lock = Any()
+    private val samples = ShortArray(sampleCount.coerceAtLeast(1))
+    private var writeIndex = 0
+    private var availableSamples = 0
+
+    fun publish(source: ShortArray, frameCount: Int) {
+        val sourceCount = frameCount.coerceIn(0, source.size)
+        val copyCount = minOf(sourceCount, samples.size)
+        if (copyCount <= 0) return
+        val sourceStart = sourceCount - copyCount
+        synchronized(lock) {
+            for (index in 0 until copyCount) {
+                samples[writeIndex] = source[sourceStart + index]
+                writeIndex = (writeIndex + 1) % samples.size
+            }
+            availableSamples = (availableSamples + copyCount).coerceAtMost(samples.size)
+        }
+    }
+
+    fun copyLatestTo(destination: ShortArray, sampleCount: Int): Boolean = synchronized(lock) {
+        val count = sampleCount.coerceIn(1, minOf(destination.size, samples.size))
+        if (availableSamples < count) return@synchronized false
+        val startIndex = (writeIndex - count + samples.size) % samples.size
+        val firstCount = minOf(count, samples.size - startIndex)
+        samples.copyInto(destination, 0, startIndex, startIndex + firstCount)
+        val secondCount = count - firstCount
+        if (secondCount > 0) samples.copyInto(destination, firstCount, 0, secondCount)
+        true
+    }
+
+    fun clear() {
+        synchronized(lock) {
+            samples.fill(0)
+            writeIndex = 0
+            availableSamples = 0
+        }
+    }
+}
+
+/** Streaming windowed-sinc converter used only when the device cannot open 48 kHz capture. */
+internal class StreamingPcmResampler(sourceRate: Int, private val outputRate: Int) {
+    private val inputRate = sourceRate
+    private val halfTaps = 31
+    private val ring = ShortArray(32768)
+    private var totalInputSamples = 0L
+    private var nextOutputSample = 0L
+    private val phaseCount: Int
+    private val phaseCoefficients: Array<DoubleArray>
+
+    init {
+        require(sourceRate > 0 && outputRate > 0)
+        var left = this.inputRate
+        var right = outputRate
+        while (right != 0) {
+            val remainder = left % right
+            left = right
+            right = remainder
+        }
+        phaseCount = (outputRate / left.coerceAtLeast(1)).coerceAtMost(1024).coerceAtLeast(1)
+        val cutoff = minOf(1.0, outputRate.toDouble() / this.inputRate)
+        phaseCoefficients = Array(phaseCount) { phase ->
+            val fraction = phase.toDouble() / phaseCount
+            val coefficients = DoubleArray(halfTaps * 2 + 1)
+            var sum = 0.0
+            for (tap in coefficients.indices) {
+                val distance = tap - halfTaps - fraction
+                val windowPosition = distance / (halfTaps + 1.0)
+                val window = if (abs(windowPosition) > 1.0) 0.0 else
+                    0.42 + 0.5 * cos(PI * windowPosition) + 0.08 * cos(2.0 * PI * windowPosition)
+                val argument = distance * cutoff
+                val sinc = if (abs(argument) < 1e-12) 1.0 else sin(PI * argument) / (PI * argument)
+                val coefficient = cutoff * sinc * window
+                coefficients[tap] = coefficient
+                sum += coefficient
+            }
+            if (abs(sum) > 1e-12) {
+                for (tap in coefficients.indices) coefficients[tap] /= sum
+            }
+            coefficients
+        }
+    }
+
+    fun process(input: ShortArray, count: Int): PcmBlock {
+        val safeCount = count.coerceIn(0, input.size)
+        if (safeCount == 0) return PcmBlock(ShortArray(0), 0)
+        if (this.inputRate == outputRate) return PcmBlock(input.copyOf(safeCount), safeCount)
+        require(safeCount < ring.size - halfTaps) { "Audio input block is too large for the resampler." }
+        for (index in 0 until safeCount) {
+            ring[((totalInputSamples + index) % ring.size).toInt()] = input[index]
+        }
+        totalInputSamples += safeCount
+
+        val estimate = ceil((safeCount + halfTaps * 2.0) * outputRate / this.inputRate).toInt() + 4
+        val output = ShortArray(estimate.coerceAtLeast(1))
+        var outputCount = 0
+        while (outputCount < output.size) {
+            val sourcePosition = nextOutputSample.toDouble() * this.inputRate / outputRate
+            val center = floor(sourcePosition).toLong()
+            if (center + halfTaps >= totalInputSamples) break
+            val fraction = sourcePosition - center
+            val phase = (fraction * phaseCount).toInt().coerceIn(0, phaseCount - 1)
+            val coefficients = phaseCoefficients[phase]
+            var value = 0.0
+            for (tap in coefficients.indices) {
+                val sourceIndex = (center + tap - halfTaps).coerceAtLeast(0L)
+                val sample = ring[(sourceIndex % ring.size).toInt()].toDouble()
+                value += sample * coefficients[tap]
+            }
+            output[outputCount++] = value.roundToInt()
+                .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+            nextOutputSample++
+        }
+        // Callers honor count, so unused capacity can stay in this array and we
+        // avoid a second allocation on the real-time capture thread.
+        return PcmBlock(output, outputCount)
+    }
+}
+
+internal fun countCompleteAudioWindows(sampleCount: Int, windowSize: Int, hopSize: Int): Int {
+    if (sampleCount < windowSize || windowSize <= 0 || hopSize <= 0) return 0
+    return 1 + (sampleCount - windowSize) / hopSize
+}
+
+/** Portion of this overlapping audio window not already represented by an earlier result. */
+internal fun newlyCoveredAudioSamples(
+    frameEndSample: Long,
+    windowSize: Int,
+    previouslyCoveredEndSample: Long
+): Long {
+    if (frameEndSample <= 0L || windowSize <= 0) return 0L
+    val frameStartSample = (frameEndSample - windowSize).coerceAtLeast(0L)
+    val firstUncoveredSample = maxOf(frameStartSample, previouslyCoveredEndSample.coerceAtLeast(0L))
+    return (frameEndSample - firstUncoveredSample).coerceAtLeast(0L)
+}
+
+internal fun spectrogramBinRange(
+    firstFrequency: Double,
+    lastFrequency: Double,
+    sampleRate: Int,
+    fftSize: Int,
+    maximumFrequency: Double
+): IntRange? {
+    if (sampleRate <= 0 || fftSize <= 0 || maximumFrequency < 0.0) return null
+    val low = maxOf(0.0, minOf(firstFrequency, lastFrequency))
+    val high = minOf(maximumFrequency, maxOf(firstFrequency, lastFrequency))
+    if (high < low) return null
+    val binWidth = sampleRate.toDouble() / fftSize
+    val firstBin = ceil(low / binWidth).toInt().coerceAtLeast(0)
+    val lastBin = floor(high / binWidth).toInt().coerceAtMost(fftSize / 2 - 1)
+    if (firstBin <= lastBin) return firstBin..lastBin
+    val centerFrequency = (low + high) * 0.5
+    if (centerFrequency > maximumFrequency) return null
+    val nearest = (centerFrequency / binWidth).roundToInt().coerceIn(0, fftSize / 2 - 1)
+    return nearest..nearest
+}
+
 private class AnalyzerIconButton(
     context: Context,
     icon: Icon
 ) : AppCompatButton(context) {
-    enum class Icon { PLAY, STOP, MIC, RESET, TONE, PRESETS, SWEEP, KEYS, SOUND, AXIS, LIN, LOG, IMPORT, EXPORT, FULL_SCALE_OPEN, FULL_SCALE_CLOSE, SPECTRUM, SPECTROGRAM }
+    enum class Icon { PLAY, STOP, MIC, RESET, TONE, PRESETS, SWEEP, KEYS, SOUND, AXIS, LIN, LOG, IMPORT, EXPORT, FULL_SCALE_OPEN, FULL_SCALE_CLOSE, SPECTRUM, SPECTROGRAM, SPL_RESPONSE, SPL_HOLD, SPL_MIN_MAX, DTMF, VOLUME, VOLUME_MUTED, OUTPUT_LEFT, OUTPUT_RIGHT, OUTPUT_STEREO }
+
+    constructor(context: Context) : this(context, Icon.PLAY)
 
     var icon: Icon = icon
         set(value) {
@@ -101,6 +264,15 @@ private class AnalyzerIconButton(
                 Icon.FULL_SCALE_CLOSE -> "Return from full-screen keyboard"
                 Icon.SPECTRUM -> "Show spectrum"
                 Icon.SPECTROGRAM -> "Show spectrogram"
+                Icon.SPL_RESPONSE -> "Switch SPL response time"
+                Icon.SPL_HOLD -> "Hold SPL reading"
+                Icon.SPL_MIN_MAX -> "Show minimum and maximum SPL"
+                Icon.VOLUME -> "Tone generator volume"
+                Icon.VOLUME_MUTED -> "Piano muted; tap to restore volume"
+                Icon.OUTPUT_LEFT -> "Left audio output"
+                Icon.OUTPUT_RIGHT -> "Right audio output"
+                Icon.OUTPUT_STEREO -> "Stereo audio output"
+                Icon.DTMF -> "DTMF keypad mode"
             }
         }
 
@@ -112,6 +284,12 @@ private class AnalyzerIconButton(
 
     var roundedPlayStopGlyphs = false
 
+    var usePlayStopImages = false
+        set(value) {
+            field = value
+            invalidate()
+        }
+
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.BLACK
         style = Paint.Style.FILL
@@ -121,13 +299,6 @@ private class AnalyzerIconButton(
         style = Paint.Style.STROKE
         strokeWidth = resources.displayMetrics.density * 1.5f
     }
-    private val resetPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        style = Paint.Style.STROKE
-        strokeWidth = resources.displayMetrics.density * 2f
-        strokeJoin = Paint.Join.ROUND
-        strokeCap = Paint.Cap.ROUND
-    }
     private val symbolPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         style = Paint.Style.STROKE
@@ -135,6 +306,11 @@ private class AnalyzerIconButton(
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
     }
+    private var playButtonBitmap: android.graphics.Bitmap? = null
+    private var stopButtonBitmap: android.graphics.Bitmap? = null
+    private var customIconBitmap: android.graphics.Bitmap? = null
+    private val playStopBitmapPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val playStopBitmapBounds = android.graphics.RectF()
 
     init {
         text = ""
@@ -160,11 +336,58 @@ private class AnalyzerIconButton(
             Icon.FULL_SCALE_CLOSE -> "Return from full-screen keyboard"
             Icon.SPECTRUM -> "Show spectrum"
             Icon.SPECTROGRAM -> "Show spectrogram"
+            Icon.SPL_RESPONSE -> "Switch SPL response time"
+            Icon.SPL_HOLD -> "Hold SPL reading"
+            Icon.SPL_MIN_MAX -> "Show minimum and maximum SPL"
+            Icon.VOLUME -> "Tone generator volume"
+            Icon.VOLUME_MUTED -> "Piano muted; tap to restore volume"
+            Icon.OUTPUT_LEFT -> "Left audio output"
+            Icon.OUTPUT_RIGHT -> "Right audio output"
+            Icon.OUTPUT_STEREO -> "Stereo audio output"
+            Icon.DTMF -> "DTMF keypad mode"
         }
+    }
+
+    fun setPlayStopImages(play: android.graphics.Bitmap, stop: android.graphics.Bitmap) {
+        playButtonBitmap = play
+        stopButtonBitmap = stop
+        invalidate()
+    }
+
+    fun setCustomIcon(bitmap: android.graphics.Bitmap?) {
+        customIconBitmap = bitmap
+        invalidate()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        if (usePlayStopImages && (icon == Icon.PLAY || icon == Icon.STOP)) {
+            val bitmap = if (icon == Icon.PLAY) playButtonBitmap else stopButtonBitmap
+            if (bitmap != null && width > 0 && height > 0) {
+                playStopBitmapBounds.set(0f, 0f, width.toFloat(), height.toFloat())
+                canvas.drawBitmap(bitmap, null, playStopBitmapBounds, playStopBitmapPaint)
+                return
+            }
+        }
+        customIconBitmap?.let { bitmap ->
+            if (width > 0 && height > 0) {
+                if (icon == Icon.SOUND) {
+                    val scale = minOf(width * 0.88f / bitmap.width, height * 0.82f / bitmap.height)
+                    val iconWidth = bitmap.width * scale
+                    val iconHeight = bitmap.height * scale
+                    val insetX = (width - iconWidth) * 0.5f
+                    val insetY = (height - iconHeight) * 0.5f
+                    playStopBitmapBounds.set(insetX, insetY, insetX + iconWidth, insetY + iconHeight)
+                } else {
+                    val iconSize = minOf(width, height) * 0.84f
+                    val insetX = (width - iconSize) * 0.5f
+                    val insetY = (height - iconSize) * 0.5f
+                    playStopBitmapBounds.set(insetX, insetY, insetX + iconSize, insetY + iconSize)
+                }
+                canvas.drawBitmap(bitmap, null, playStopBitmapBounds, playStopBitmapPaint)
+                return
+            }
+        }
         val cx = width / 2f
         val cy = height / 2f
         // Play and stop use the same compact visual bounds and have no outline.
@@ -230,12 +453,16 @@ private class AnalyzerIconButton(
                 fillPaint.color = Color.BLACK
                 canvas.restore()
             }
-            Icon.TONE, Icon.PRESETS, Icon.SWEEP, Icon.MIC, Icon.SOUND, Icon.SPECTRUM, Icon.SPECTROGRAM, Icon.AXIS, Icon.KEYS, Icon.LIN, Icon.LOG, Icon.IMPORT, Icon.EXPORT, Icon.FULL_SCALE_OPEN, Icon.FULL_SCALE_CLOSE -> {
+            Icon.TONE, Icon.PRESETS, Icon.SWEEP, Icon.MIC, Icon.SOUND, Icon.SPECTRUM, Icon.SPECTROGRAM, Icon.AXIS, Icon.KEYS, Icon.LIN, Icon.LOG, Icon.IMPORT, Icon.EXPORT, Icon.FULL_SCALE_OPEN, Icon.FULL_SCALE_CLOSE, Icon.SPL_RESPONSE, Icon.SPL_HOLD, Icon.SPL_MIN_MAX, Icon.DTMF, Icon.VOLUME, Icon.VOLUME_MUTED, Icon.OUTPUT_LEFT, Icon.OUTPUT_RIGHT, Icon.OUTPUT_STEREO -> {
                 val s = minOf(width, height) * when (icon) {
                     Icon.KEYS -> 0.48f
                     Icon.MIC -> 0.62f
                     Icon.TONE, Icon.SOUND, Icon.SPECTRUM, Icon.SPECTROGRAM -> 0.40f
-                    Icon.PRESETS, Icon.IMPORT, Icon.EXPORT -> 0.48f
+                    Icon.PRESETS, Icon.SWEEP, Icon.IMPORT, Icon.EXPORT -> 0.48f
+                    Icon.SPL_RESPONSE, Icon.SPL_HOLD, Icon.SPL_MIN_MAX -> 0.52f
+                    Icon.DTMF -> 0.68f
+                    Icon.VOLUME, Icon.VOLUME_MUTED -> 0.72f
+                    Icon.OUTPUT_LEFT, Icon.OUTPUT_RIGHT, Icon.OUTPUT_STEREO -> 0.90f
                     else -> 0.34f
                 }
                 val l = cx - s / 2f
@@ -265,6 +492,23 @@ private class AnalyzerIconButton(
                             cubicTo(cx + s * .16f, cy - s * .55f, cx + s * .34f, cy + s * .55f, r, cy)
                         }
                         canvas.drawPath(p, symbolPaint)
+                    }
+                    Icon.VOLUME, Icon.VOLUME_MUTED -> {
+                        val speaker = Path().apply {
+                            moveTo(l + s * 0.08f, cy - s * 0.16f)
+                            lineTo(l + s * 0.30f, cy - s * 0.16f)
+                            lineTo(l + s * 0.55f, cy - s * 0.36f)
+                            lineTo(l + s * 0.55f, cy + s * 0.36f)
+                            lineTo(l + s * 0.30f, cy + s * 0.16f)
+                            lineTo(l + s * 0.08f, cy + s * 0.16f)
+                            close()
+                        }
+                        canvas.drawPath(speaker, fillPaint)
+                        canvas.drawArc(l + s * 0.39f, cy - s * 0.25f, l + s * 0.83f, cy + s * 0.25f, -58f, 116f, false, symbolPaint)
+                        canvas.drawArc(l + s * 0.30f, cy - s * 0.42f, l + s * 1.03f, cy + s * 0.42f, -58f, 116f, false, symbolPaint)
+                        if (icon == Icon.VOLUME_MUTED) {
+                            canvas.drawLine(l + s * 0.38f, cy - s * 0.42f, l + s * 1.02f, cy + s * 0.42f, symbolPaint)
+                        }
                     }
                     Icon.PRESETS -> {
                         for (row in 0..2) {
@@ -361,6 +605,94 @@ private class AnalyzerIconButton(
                         }
                         canvas.drawPath(p, symbolPaint)
                         canvas.restore()
+                    }
+                    Icon.SPL_RESPONSE -> {
+                        canvas.drawCircle(cx, cy, s * 0.34f, symbolPaint)
+                        canvas.drawLine(cx, cy, cx + s * 0.15f, cy - s * 0.18f, symbolPaint)
+                        canvas.drawLine(cx, cy, cx, cy - s * 0.23f, symbolPaint)
+                        canvas.drawCircle(cx, cy, s * 0.035f, fillPaint)
+                    }
+                    Icon.SPL_HOLD -> {
+                        canvas.drawRoundRect(cx - s * 0.22f, cy - s * 0.28f, cx - s * 0.07f, cy + s * 0.28f, s * 0.04f, s * 0.04f, fillPaint)
+                        canvas.drawRoundRect(cx + s * 0.07f, cy - s * 0.28f, cx + s * 0.22f, cy + s * 0.28f, s * 0.04f, s * 0.04f, fillPaint)
+                    }
+                    Icon.SPL_MIN_MAX -> {
+                        val trace = Path().apply {
+                            moveTo(l + s * 0.08f, cy + s * 0.10f)
+                            lineTo(l + s * 0.31f, cy + s * 0.10f)
+                            lineTo(l + s * 0.45f, cy - s * 0.24f)
+                            lineTo(l + s * 0.58f, cy + s * 0.22f)
+                            lineTo(l + s * 0.73f, cy - s * 0.02f)
+                            lineTo(r - s * 0.08f, cy - s * 0.02f)
+                        }
+                        canvas.drawPath(trace, symbolPaint)
+                    }
+                    Icon.DTMF -> {
+                        val keyWidth = s * 0.22f
+                        val keyHeight = s * 0.15f
+                        val gapX = s * 0.07f
+                        val gapY = s * 0.06f
+                        val gridWidth = keyWidth * 3f + gapX * 2f
+                        val gridHeight = keyHeight * 4f + gapY * 3f
+                        val startX = cx - gridWidth / 2f
+                        val startY = cy - gridHeight / 2f
+                        for (row in 0..3) {
+                            for (column in 0..2) {
+                                val keyLeft = startX + column * (keyWidth + gapX)
+                                val keyTop = startY + row * (keyHeight + gapY)
+                                canvas.drawRoundRect(
+                                    keyLeft, keyTop, keyLeft + keyWidth, keyTop + keyHeight,
+                                    s * 0.035f, s * 0.035f, symbolPaint
+                                )
+                            }
+                        }
+                    }
+                    Icon.OUTPUT_LEFT, Icon.OUTPUT_RIGHT, Icon.OUTPUT_STEREO -> {
+                        val normalStrokeWidth = symbolPaint.strokeWidth
+                        val normalSymbolColor = symbolPaint.color
+                        val normalFillColor = fillPaint.color
+                        val cabinetStroke = resources.displayMetrics.density * 1.35f
+                        symbolPaint.strokeWidth = cabinetStroke
+                        fun drawSpeakerCabinet(centerX: Float, active: Boolean) {
+                            val channelColor = if (active) Color.WHITE else Color.rgb(105, 121, 139)
+                            val cabinetWidth = s * 0.38f
+                            val cabinetHeight = s * 0.88f
+                            val cabinetLeft = centerX - cabinetWidth / 2f
+                            val cabinetTop = cy - cabinetHeight / 2f
+                            symbolPaint.color = channelColor
+                            fillPaint.color = channelColor
+                            canvas.drawRoundRect(
+                                cabinetLeft,
+                                cabinetTop,
+                                cabinetLeft + cabinetWidth,
+                                cabinetTop + cabinetHeight,
+                                s * 0.045f,
+                                s * 0.045f,
+                                symbolPaint
+                            )
+
+                            val tweeterY = cy - s * 0.20f
+                            val tweeterRadius = s * 0.075f
+                            canvas.drawCircle(centerX, tweeterY, tweeterRadius, symbolPaint)
+                            canvas.drawCircle(centerX, tweeterY, tweeterRadius * 0.34f, fillPaint)
+
+                            val wooferY = cy + s * 0.17f
+                            val wooferRadius = s * 0.145f
+                            canvas.drawCircle(centerX, wooferY, wooferRadius, symbolPaint)
+                            canvas.drawCircle(centerX, wooferY, wooferRadius * 0.66f, symbolPaint)
+                            canvas.drawCircle(centerX, wooferY, wooferRadius * 0.23f, fillPaint)
+                        }
+                        drawSpeakerCabinet(
+                            centerX = cx - s * 0.23f,
+                            active = icon == Icon.OUTPUT_LEFT || icon == Icon.OUTPUT_STEREO
+                        )
+                        drawSpeakerCabinet(
+                            centerX = cx + s * 0.23f,
+                            active = icon == Icon.OUTPUT_RIGHT || icon == Icon.OUTPUT_STEREO
+                        )
+                        symbolPaint.color = normalSymbolColor
+                        symbolPaint.strokeWidth = normalStrokeWidth
+                        fillPaint.color = normalFillColor
                     }
                     Icon.SPECTRUM -> {
                         val p = Path().apply {
@@ -472,8 +804,425 @@ private class ToneWaveformIconView(
     }
 }
 
-@android.annotation.TargetApi(26)
+/** Adjustable-timebase scope: actual generated PCM during playback, modeled signal while stopped. */
+private class ToneSignalPreviewView(
+    context: Context,
+    private val sampleRate: Int,
+    private val pcmFrame: TonePcmFrame
+) : View(context) {
+    private val maxScopeWindowSamples = (sampleRate * 0.200).roundToInt() + 1
+    private val renderPcmSamples = ShortArray(maxScopeWindowSamples)
+    private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(15, 23, 36)
+        style = Paint.Style.FILL
+    }
+    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(49, 66, 83)
+        style = Paint.Style.STROKE
+        strokeWidth = resources.displayMetrics.density
+    }
+    private val baselinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(67, 83, 101)
+        style = Paint.Style.STROKE
+        strokeWidth = resources.displayMetrics.density
+    }
+    private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(34, 48, 65)
+        style = Paint.Style.STROKE
+        strokeWidth = resources.displayMetrics.density * 0.65f
+    }
+    private val signalPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(255, 213, 90)
+        style = Paint.Style.STROKE
+        strokeWidth = resources.displayMetrics.density * 2f
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val signalPath = Path()
+    private val noiseRandom = java.util.Random(1L)
+    private val pinkNoiseState = DoubleArray(7)
+    private val dragTouchSlop = android.view.ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+    private var controlDragActive = false
+    private var controlDragMode = 0 // 0 = undecided/tap, 1 = frequency, 2 = volume
+    private var dragStartX = 0f
+    private var dragStartY = 0f
+
+    var minimumFrequency: Int = 20
+    var maximumFrequency: Int = 20000
+    var frequencyControlEnabled: Boolean = true
+        set(value) {
+            if (field == value) return
+            field = value
+            updateDescription()
+        }
+    var onFrequencyChanged: ((Int) -> Unit)? = null
+    var onVolumeChanged: ((Float) -> Unit)? = null
+
+    var waveform: String = "Sine"
+        set(value) {
+            if (field == value) return
+            field = value
+            updateDescription()
+            invalidate()
+        }
+    var frequency: Int = 440
+        set(value) {
+            val next = value.coerceIn(20, 20000)
+            if (field == next) return
+            field = next
+            updateDescription()
+            invalidate()
+        }
+    var manualTimebaseMs: Int? = null
+        set(value) {
+            if (field == value) return
+            field = value
+            updateDescription()
+            invalidate()
+        }
+    var volume: Float = 0.5f
+        set(value) {
+            val next = value.coerceIn(0f, 1f)
+            if (field == next) return
+            field = next
+            updateDescription()
+            invalidate()
+        }
+    @Volatile var playing: Boolean = false
+        set(value) {
+            if (field == value) return
+            if (value) pcmFrame.clear()
+            field = value
+            updateDescription()
+            invalidate()
+        }
+    var sweepActive: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            updateDescription()
+            invalidate()
+        }
+    var dtmfMode: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            updateDescription()
+            invalidate()
+        }
+    var dtmfLowFrequency: Int = 697
+        set(value) {
+            if (field == value) return
+            field = value
+            updateDescription()
+            invalidate()
+        }
+    var dtmfHighFrequency: Int = 1209
+        set(value) {
+            if (field == value) return
+            field = value
+            updateDescription()
+            invalidate()
+        }
+
+    init {
+        minimumHeight = (48f * resources.displayMetrics.density).roundToInt()
+        contentDescription = "Tone waveform preview"
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+        isClickable = true
+        isFocusable = true
+        updateDescription()
+    }
+
+    private fun updateDescription() {
+        val type = when {
+            dtmfMode -> "DTMF waveform preview, ${dtmfLowFrequency} and ${dtmfHighFrequency} hertz"
+            playing -> "Live oscilloscope"
+            else -> "$waveform waveform preview at $frequency hertz"
+        }
+        val hint = if (frequencyControlEnabled) {
+            "Drag horizontally to change frequency or vertically to change volume."
+        } else {
+            "Drag vertically to change volume."
+        }
+        val timebase = manualTimebaseMs?.let { "$it milliseconds across the display" } ?: when {
+            waveform.equals("White noise", ignoreCase = true) ||
+                waveform.equals("Pink noise", ignoreCase = true) -> "automatic 20 milliseconds"
+            else -> "automatic time scale, about three cycles"
+        }
+        contentDescription = "$type. $hint Oscilloscope timebase: $timebase."
+    }
+
+    private fun currentWindowSampleCount(): Int {
+        val windowSeconds = manualTimebaseMs?.let { it / 1000.0 } ?: when {
+            dtmfMode -> 3.0 / maxOf(dtmfLowFrequency, dtmfHighFrequency).coerceAtLeast(1)
+            waveform.equals("White noise", ignoreCase = true) ||
+                waveform.equals("Pink noise", ignoreCase = true) -> 0.020
+            else -> 3.0 / frequency.coerceAtLeast(1)
+        }
+        return ((windowSeconds * sampleRate).roundToInt() + 1)
+            .coerceIn(8, maxScopeWindowSamples)
+    }
+
+    private fun previewSampleAt(index: Int): Double {
+        val timeSeconds = index.toDouble() / sampleRate.coerceAtLeast(1)
+        val phase = 2.0 * PI * frequency.coerceIn(20, 20000) * timeSeconds
+        val sine = sin(phase)
+        val normalized = when {
+            dtmfMode -> {
+                val low = sin(2.0 * PI * dtmfLowFrequency * timeSeconds)
+                val high = sin(2.0 * PI * dtmfHighFrequency * timeSeconds)
+                (low + high) * 0.5
+            }
+            waveform.equals("Square", ignoreCase = true) -> if (sine >= 0.0) 1.0 else -1.0
+            waveform.equals("Triangle", ignoreCase = true) -> 2.0 / PI * kotlin.math.asin(sine)
+            waveform.equals("Sawtooth", ignoreCase = true) -> 2.0 * (phase / (2.0 * PI) % 1.0) - 1.0
+            waveform.equals("White noise", ignoreCase = true) -> noiseRandom.nextDouble() * 2.0 - 1.0
+            waveform.equals("Pink noise", ignoreCase = true) -> {
+                val white = noiseRandom.nextDouble() * 2.0 - 1.0
+                pinkNoiseState[0] = 0.99886 * pinkNoiseState[0] + white * 0.0555179
+                pinkNoiseState[1] = 0.99332 * pinkNoiseState[1] + white * 0.0750759
+                pinkNoiseState[2] = 0.96900 * pinkNoiseState[2] + white * 0.1538520
+                pinkNoiseState[3] = 0.86650 * pinkNoiseState[3] + white * 0.3104856
+                pinkNoiseState[4] = 0.55000 * pinkNoiseState[4] + white * 0.5329522
+                pinkNoiseState[5] = -0.7616 * pinkNoiseState[5] - white * 0.0168980
+                val pink = pinkNoiseState[0] + pinkNoiseState[1] + pinkNoiseState[2] +
+                    pinkNoiseState[3] + pinkNoiseState[4] + pinkNoiseState[5] +
+                    pinkNoiseState[6] + white * 0.5362
+                pinkNoiseState[6] = white * 0.115926
+                (pink * 0.20).coerceIn(-1.0, 1.0)
+            }
+            else -> sine
+        }
+        return normalized * volume
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (!isEnabled) return false
+        val density = resources.displayMetrics.density
+        val plotTop = 7f * density
+        val plotBottom = height - 6f * density
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (event.y !in plotTop..plotBottom) return false
+                controlDragActive = true
+                controlDragMode = 0
+                dragStartX = event.x
+                dragStartY = event.y
+                parent?.requestDisallowInterceptTouchEvent(true)
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!controlDragActive) return false
+                if (controlDragMode == 0) {
+                    val deltaX = event.x - dragStartX
+                    val deltaY = event.y - dragStartY
+                    if (hypot(deltaX.toDouble(), deltaY.toDouble()) >= dragTouchSlop.toDouble()) {
+                        controlDragMode = if (kotlin.math.abs(deltaX) >= kotlin.math.abs(deltaY)) 1 else 2
+                    }
+                }
+                when (controlDragMode) {
+                    1 -> if (frequencyControlEnabled) updateFrequencyAtTouch(event.x)
+                    2 -> updateVolumeAtTouch(event.y)
+                }
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                if (!controlDragActive) return false
+                if (controlDragMode == 0 && frequencyControlEnabled) updateFrequencyAtTouch(event.x)
+                else if (controlDragMode == 1 && frequencyControlEnabled) updateFrequencyAtTouch(event.x)
+                else if (controlDragMode == 2) updateVolumeAtTouch(event.y)
+                controlDragActive = false
+                controlDragMode = 0
+                performClick()
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                controlDragActive = false
+                controlDragMode = 0
+                return true
+            }
+        }
+        return controlDragActive
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
+    }
+
+    private fun updateFrequencyAtTouch(touchX: Float) {
+        val density = resources.displayMetrics.density
+        val plotLeft = 11f * density
+        val plotRight = width - 11f * density
+        val plotWidth = (plotRight - plotLeft).coerceAtLeast(1f)
+        val clampedTouchX = touchX.coerceIn(plotLeft, plotRight)
+        val ratio = ((clampedTouchX - plotLeft) / plotWidth).toDouble().coerceIn(0.0, 1.0)
+        val low = minimumFrequency.coerceIn(20, 19999)
+        val high = maximumFrequency.coerceIn(low + 1, 20000)
+        val nextFrequency = (low * exp(ratio * ln(high.toDouble() / low)))
+            .roundToInt().coerceIn(low, high)
+        if (nextFrequency != frequency) {
+            frequency = nextFrequency
+            onFrequencyChanged?.invoke(nextFrequency)
+        }
+    }
+
+    private fun updateVolumeAtTouch(touchY: Float) {
+        val density = resources.displayMetrics.density
+        val plotTop = 7f * density
+        val plotBottom = (height - 6f * density).coerceAtLeast(plotTop + 1f)
+        val ratio = ((plotBottom - touchY) / (plotBottom - plotTop)).coerceIn(0f, 1f)
+        if (ratio != volume) {
+            volume = ratio
+            onVolumeChanged?.invoke(ratio)
+        }
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (width <= 0 || height <= 0) return
+
+        val density = resources.displayMetrics.density
+        val inset = 2f * density
+        val radius = 12f * density
+        val left = inset
+        val top = inset
+        val right = width - inset
+        val bottom = height - inset
+        canvas.drawRoundRect(left, top, right, bottom, radius, radius, backgroundPaint)
+        borderPaint.color = when {
+            sweepActive -> Color.rgb(79, 164, 194)
+            playing -> Color.rgb(77, 112, 133)
+            else -> Color.rgb(49, 66, 83)
+        }
+        canvas.drawRoundRect(left, top, right, bottom, radius, radius, borderPaint)
+
+        val plotLeft = left + 9f * density
+        val plotRight = right - 9f * density
+        val plotTop = top + 5f * density
+        val plotBottom = bottom - 4f * density
+        val centerY = (plotTop + plotBottom) * 0.5f
+        val plotWidth = plotRight - plotLeft
+        val plotHeight = plotBottom - plotTop
+        if (plotWidth <= 0f || plotHeight <= 0f) return
+
+        val sampleCount = currentWindowSampleCount()
+        val live = playing && pcmFrame.copyLatestTo(renderPcmSamples, sampleCount)
+        for (division in 0..10) {
+            val x = plotLeft + plotWidth * division / 10f
+            canvas.drawLine(x, plotTop, x, plotBottom, gridPaint)
+        }
+        for (division in 0..4) {
+            val y = plotTop + plotHeight * division / 4f
+            canvas.drawLine(plotLeft, y, plotRight, y, if (division == 2) baselinePaint else gridPaint)
+        }
+
+        val verticalScale = plotHeight * 0.43f
+        if (!live) {
+            noiseRandom.setSeed(1L)
+            pinkNoiseState.fill(0.0)
+        }
+        signalPath.reset()
+        for (sampleIndex in 0 until sampleCount) {
+            // AudioTrack emits 16-bit PCM at this view's sample rate. Scale the
+            // 12,000-count generator range to the plot while retaining volume changes.
+            val normalized = if (live) {
+                renderPcmSamples[sampleIndex].toDouble() / 12000.0
+            } else {
+                previewSampleAt(sampleIndex)
+            }
+            val xRatio = sampleIndex.toFloat() / (sampleCount - 1).coerceAtLeast(1)
+            val x = plotLeft + plotWidth * xRatio
+            val y = centerY - normalized.toFloat() * verticalScale
+            if (sampleIndex == 0) signalPath.moveTo(x, y) else signalPath.lineTo(x, y)
+        }
+        signalPaint.alpha = if (live) 255 else 220
+        canvas.drawPath(signalPath, signalPaint)
+        if (playing && isShown) postInvalidateDelayed(16L)
+    }
+}
+
 class MainActivity : Activity() {
+
+    private data class SplBiquadCoefficients(
+        val b0: Double,
+        val b1: Double,
+        val b2: Double,
+        val a1: Double,
+        val a2: Double
+    )
+
+    private class SplBiquadFilter(private val coefficients: SplBiquadCoefficients) {
+        private var state1 = 0.0
+        private var state2 = 0.0
+
+        fun process(input: Double): Double {
+            val output = coefficients.b0 * input + state1
+            state1 = coefficients.b1 * input - coefficients.a1 * output + state2
+            state2 = coefficients.b2 * input - coefficients.a2 * output
+            return output
+        }
+    }
+
+    /** IEC-style A-weighting derived from the analog poles with a prewarped bilinear transform. */
+    private class SplAWeightingFilter(sampleRate: Int) {
+        private val stages: List<SplBiquadFilter>
+
+        init {
+            val referenceFrequency = 1000.0
+            val bilinearScale = 2.0 * PI * referenceFrequency /
+                    tan(PI * referenceFrequency / sampleRate.coerceAtLeast(1))
+            val poleFrequencies = doubleArrayOf(
+                20.598997, 20.598997,
+                107.65265,
+                737.86223,
+                12194.217, 12194.217
+            )
+            val digitalPoles = poleFrequencies.map { frequency ->
+                val analogPole = 2.0 * PI * frequency
+                (analogPole - bilinearScale) / (analogPole + bilinearScale)
+            }
+            val sections = listOf(
+                SplBiquadCoefficients(1.0, -2.0, 1.0, digitalPoles[0] + digitalPoles[1], digitalPoles[0] * digitalPoles[1]),
+                SplBiquadCoefficients(1.0, -2.0, 1.0, digitalPoles[2] + digitalPoles[3], digitalPoles[2] * digitalPoles[3]),
+                SplBiquadCoefficients(1.0, 2.0, 1.0, digitalPoles[4] + digitalPoles[5], digitalPoles[4] * digitalPoles[5])
+            )
+            val omega = 2.0 * PI * referenceFrequency / sampleRate.coerceAtLeast(1)
+            val responseAtReference = sections.fold(1.0) { product, section ->
+                product * responseMagnitude(section, omega)
+            }.coerceAtLeast(1e-30)
+            val normalization = 1.0 / responseAtReference
+            stages = sections.mapIndexed { index, section ->
+                SplBiquadFilter(
+                    if (index == 0) section.copy(
+                        b0 = section.b0 * normalization,
+                        b1 = section.b1 * normalization,
+                        b2 = section.b2 * normalization
+                    ) else section
+                )
+            }
+        }
+
+        fun process(input: Double): Double {
+            var value = input
+            for (stage in stages) value = stage.process(value)
+            return value
+        }
+
+        private fun responseMagnitude(section: SplBiquadCoefficients, omega: Double): Double {
+            val cos1 = cos(omega)
+            val sin1 = sin(omega)
+            val cos2 = cos(2.0 * omega)
+            val sin2 = sin(2.0 * omega)
+            val numeratorReal = section.b0 + section.b1 * cos1 + section.b2 * cos2
+            val numeratorImaginary = -section.b1 * sin1 - section.b2 * sin2
+            val denominatorReal = 1.0 + section.a1 * cos1 + section.a2 * cos2
+            val denominatorImaginary = -section.a1 * sin1 - section.a2 * sin2
+            return hypot(numeratorReal, numeratorImaginary) /
+                    hypot(denominatorReal, denominatorImaginary).coerceAtLeast(1e-30)
+        }
+    }
 
     private lateinit var spectrumView: SpectrumView
     private lateinit var statusText: TextView
@@ -482,22 +1231,42 @@ class MainActivity : Activity() {
     private var headerPeakFrequencyText: TextView? = null
     private var headerPeakDbText: TextView? = null
     private var headerSplText: TextView? = null
+    // Generic fallback for phones whose audio HAL does not publish microphone sensitivity.
+    // Treats a typical microphone output near -24 dBFS at 94 dB SPL as an estimate only.
+    private val genericSplEstimateOffsetDb = 118.0
     private var splCalibrationOffsetDb: Double? = null
-    private var splManualCalibrationOffsetDb: Double? = null
     private var splSystemCalibrationOffsetDb: Double? = null
     private var splDetailDialog: Dialog? = null
     private var splDetailValueView: TextView? = null
-    private var splDetailInfoView: TextView? = null
     private var splDetailDeltaView: TextView? = null
     private var splScaleMeterView: SplScaleMeterView? = null
+    private var splResponseButton: Button? = null
+    private var splHoldButton: Button? = null
+    private var splMinButton: Button? = null
+    private var splMaxButton: Button? = null
+    private var splTimeWeighting = "FAST"
+    private var splHoldEnabled = false
+    private var splHeldValueDb: Double? = null
+    private var splMinimumTrackingEnabled = false
+    private var splMaximumTrackingEnabled = false
+    private var splDisplayedExtremumMode: String? = null
+    private var splMinimumDb: Double? = null
+    private var splMaximumDb: Double? = null
+    private var splLastResponseValueDb: Double? = null
+    @Volatile private var latestSplFastADbfs = -120.0
+    @Volatile private var latestSplSlowADbfs = -120.0
     private var splHasCurrentSample = false
     private val splRecentReadings = java.util.ArrayDeque<Pair<Long, Double>>()
+    private var splSlowDisplayValueDb: Double? = null
+    private var splSlowDisplayUpdatedAt = 0L
     private var spectrumHeader: android.widget.FrameLayout? = null
-    private var spectrumHeaderCompactHeightPx = 0
     private var rangePickerButton: Button? = null
     private var keyboardControlsRow: LinearLayout? = null
     private var headerTitleText: TextView? = null
     private var splitContainer: LinearLayout? = null
+    private var bottomActionBar: android.widget.FrameLayout? = null
+    private var keyboardModeButtonGroup: LinearLayout? = null
+    private var mainActionsSpacer: View? = null
     private var tonePanel: View? = null
     private var keyboardPanel: View? = null
     private var keyboardToggleButton: Button? = null
@@ -505,12 +1274,14 @@ class MainActivity : Activity() {
     private var fullScaleKeysDialog: Dialog? = null
     private var keyboardSectionView: View? = null
     private var fullScaleKeyboardOpen = false
+    private var fullScaleTransitionAnimator: android.animation.ValueAnimator? = null
     private var portraitGraphControlsRow: LinearLayout? = null
     private var resetDisplayButton: AnalyzerIconButton? = null
     private var spectrogramModeButton: AnalyzerIconButton? = null
     private var soundIdPanel: View? = null
     private var soundModeOpen = false
     private var switchAnalyzerMode: ((String) -> Unit)? = null
+    private var switchKeysToolbarLayout: ((Boolean) -> Unit)? = null
     private var toneModeOpen = false
     private var keyboardModeOpen = false
     private var toneToggleButton: Button? = null
@@ -520,11 +1291,9 @@ class MainActivity : Activity() {
     private var soundIdBestSoundView: TextView? = null
     private var soundIdScoreView: TextView? = null
     private var soundIdAlternativesView: TextView? = null
-    private var soundIdPersonalButton: Button? = null
     private var soundIdDurationView: TextView? = null
     private var soundIdToggleButton: Button? = null
     private var soundIdModeButton: Button? = null
-    private var soundIdDialog: AlertDialog? = null
     private var soundIdLivePanel: LinearLayout? = null
     private var soundIdSummaryPanel: LinearLayout? = null
     private var soundIdSummaryChart: SoundSessionChartView? = null
@@ -569,13 +1338,16 @@ class MainActivity : Activity() {
     @Volatile private var toneFrequency = 440
     private var tonePeakFollowEnabled = false
     private var tonePeakFollowWindowStartedAt = 0L
+    private var tonePeakLastAcceptedAt = 0L
     private var tonePeakBestFrequency = 0.0
     private var tonePeakBestDb = -120.0
+    private var tonePeakDetectionWindowMs = 500L
+    private var tonePeakHoldDurationMs = 5000L
     private var latestAnalyzedPeakFrequency = 0.0
     private var latestAnalyzedPeakDb = -120.0
     private var latestAnalyzedRmsDb = -120.0
     private var tonePeakPresetButton: AnalyzerIconButton? = null
-    private data class PianoSample(
+    private class PianoSample(
         val samples: ShortArray,
         val sampleRate: Int,
         val channels: Int
@@ -648,14 +1420,16 @@ class MainActivity : Activity() {
     @Volatile private var pianoSamplesInitialized = false
     private val pianoLoadedCount = AtomicInteger(0)
     private val pianoLoadFailedCount = AtomicInteger(0)
-    private var pianoVolume = 0.8f
+    private var pianoVolume = 0.5f
+    private var pianoVolumeBeforeMute = 0.5f
     @Volatile private var pianoReverbEnabled = true
-    private var pianoReverbButton: Button? = null
+    private var pianoReverbButton: ImageButton? = null
+    private var fullScalePianoReverbButton: ImageButton? = null
     private var pianoTranspose = 0
     private var pianoVolumeSlider: SeekBar? = null
     private var pianoVolumeLabel: TextView? = null
-    private var pianoOctaveButton: Button? = null
-    private var pianoNoteReadout: TextView? = null
+    private var pianoVolumeIconButton: AnalyzerIconButton? = null
+    private var pianoOctaveButton: ImageButton? = null
     private val pianoAudioShutdownHandler = Handler(Looper.getMainLooper())
     private val pianoAudioShutdownRunnable = Runnable { stopPianoAudioEngine() }
 
@@ -822,62 +1596,134 @@ class MainActivity : Activity() {
 
     private fun updatePianoVolumeControls() {
         val percent = (pianoVolume * 100).roundToInt().coerceIn(0, 100)
-        pianoVolumeLabel?.text = "VOL $percent%"
+        pianoVolumeLabel?.text = "$percent%"
         pianoVolumeSlider?.let { if (it.progress != percent) it.progress = percent }
+        pianoVolumeIconButton?.apply {
+            icon = if (percent == 0) AnalyzerIconButton.Icon.VOLUME_MUTED else AnalyzerIconButton.Icon.VOLUME
+            contentDescription = if (percent == 0) "Piano muted; tap to restore volume" else "Mute piano"
+        }
         synchronized(pianoAudioLock) { pianoVoices.forEach { it.volume = pianoVolume } }
     }
 
-    private fun applyKeyboardVolumeSafeInset() {
-        if (android.os.Build.VERSION.SDK_INT < 28) return
-        val row = keyboardControlsRow ?: return
-        val volumeCell = row.getChildAt(0) ?: return
-        val insets = window.decorView.rootWindowInsets ?: return
-        val cameraInset = insets.displayCutout?.safeInsetLeft ?: 0
-        val rowLocation = IntArray(2)
-        row.getLocationOnScreen(rowLocation)
-        val localInset = (cameraInset - rowLocation[0]).coerceAtLeast(0)
-        val gap = (6f * resources.displayMetrics.density).roundToInt()
-        val targetMargin = if (localInset > 0) localInset + gap else 0
-        val params = volumeCell.layoutParams as? LinearLayout.LayoutParams ?: return
-        if (params.marginStart != targetMargin) {
-            params.marginStart = targetMargin
-            volumeCell.layoutParams = params
+    private fun updatePianoOctaveControls() {
+        val (icon, description) = when (pianoTranspose) {
+            12 -> R.drawable.ic_octave_plus_1_custom to "Piano octave plus one"
+            -12 -> R.drawable.ic_octave_minus_1_custom to "Piano octave minus one"
+            else -> R.drawable.ic_octave_zero_custom to "Piano base octave"
+        }
+        pianoOctaveButton?.let { button ->
+            button.setImageResource(icon)
+            button.contentDescription = description
         }
     }
 
-    private fun showPianoVolumeDialog() {
-        val density = resources.displayMetrics.density
-        fun dp(value: Int) = (value * density).roundToInt()
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(16), dp(20), dp(8))
+    private fun createPianoOctaveButton(): ImageButton = ImageButton(this).apply {
+        scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+        val padding = (1f * resources.displayMetrics.density).roundToInt()
+        setPadding(padding, padding, padding, padding)
+        setMinimumWidth(0)
+        setMinimumHeight(0)
+        backgroundTintList = null
+        imageTintList = null
+        stateListAnimator = null
+        background = GradientDrawable().apply {
+            cornerRadius = 13f * resources.displayMetrics.density
+            setColor(Color.rgb(22, 32, 42))
         }
-        val value = TextView(this).apply {
-            text = "${(pianoVolume * 100).roundToInt()}%"
-            textSize = 18f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
+        updatePianoOctaveControls()
+        setOnClickListener { cyclePianoOctave() }
+    }
+
+    private fun cyclePianoOctave() {
+        pianoTranspose = when (pianoTranspose) {
+            0 -> 12
+            12 -> -12
+            else -> 0
         }
-        val slider = SeekBar(this).apply {
-            max = 100
-            progress = (pianoVolume * 100).roundToInt()
-        }
-        slider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                pianoVolume = progress.coerceIn(0, 100).toFloat() / 100f
-                value.text = "$progress%"
-                updatePianoVolumeControls()
+        updatePianoOctaveControls()
+        (keyboardPanel as? PianoKeyboardView)?.setTranspose(pianoTranspose)
+    }
+
+    /** Returns the cutout-safe horizontal overlap of a view, plus a small visual gap. */
+    private fun cutoutInsetsForView(view: View, gapDp: Float = 4f): Pair<Int, Int> {
+        if (android.os.Build.VERSION.SDK_INT < 28) return 0 to 0
+        val cutout = window.decorView.rootWindowInsets?.displayCutout ?: return 0 to 0
+        val root = window.decorView.rootView
+        if (root.width <= 0 || view.width <= 0) return 0 to 0
+        val rootLocation = IntArray(2)
+        val viewLocation = IntArray(2)
+        root.getLocationOnScreen(rootLocation)
+        view.getLocationOnScreen(viewLocation)
+        val rootLeft = rootLocation[0].toFloat()
+        val rootRight = rootLeft + root.width
+        val rootTop = rootLocation[1].toFloat()
+        val viewLeft = viewLocation[0].toFloat()
+        val viewRight = viewLeft + view.width
+        val viewTop = viewLocation[1].toFloat()
+        val viewBottom = viewTop + view.height
+        var leftOverlap = (rootLeft + cutout.safeInsetLeft - viewLeft).coerceAtLeast(0f)
+        var rightOverlap = (viewRight - (rootRight - cutout.safeInsetRight)).coerceAtLeast(0f)
+        for (bounds in cutout.boundingRects) {
+            val cutoutTop = rootTop + bounds.top
+            val cutoutBottom = rootTop + bounds.bottom
+            if (cutoutBottom <= viewTop || cutoutTop >= viewBottom) continue
+            val cutoutLeft = rootLeft + bounds.left
+            val cutoutRight = rootLeft + bounds.right
+            if (bounds.left <= cutout.safeInsetLeft + 2 && cutoutRight > viewLeft) {
+                leftOverlap = maxOf(leftOverlap, (cutoutRight - viewLeft).coerceAtLeast(0f))
             }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-            override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
-        })
-        content.addView(value, LinearLayout.LayoutParams(-1, dp(30)))
-        content.addView(slider, LinearLayout.LayoutParams(-1, dp(48)))
-        AlertDialog.Builder(this)
-            .setTitle("Piano volume")
-            .setView(content)
-            .setPositiveButton("Done", null)
-            .show()
+            if (bounds.right >= root.width - cutout.safeInsetRight - 2 && cutoutLeft < viewRight) {
+                rightOverlap = maxOf(rightOverlap, (viewRight - cutoutLeft).coerceAtLeast(0f))
+            }
+        }
+        val gap = (gapDp * resources.displayMetrics.density).roundToInt()
+        return (if (leftOverlap > 0f) leftOverlap.roundToInt() + gap else 0) to
+                (if (rightOverlap > 0f) rightOverlap.roundToInt() + gap else 0)
+    }
+
+    private fun applyKeyboardVolumeSafeInset() {
+        val row = keyboardControlsRow ?: return
+        if (row.childCount == 0) return
+        if (row.parent === mainActionRow || row.parent === bottomActionBar) {
+            // The KEYS toolbar itself is inset around display cutouts.
+            // The centered control cluster must not receive a second inset.
+            applyPianoKeyboardSafeInsets()
+            return
+        }
+        val (leftInset, rightInset) = cutoutInsetsForView(row, gapDp = 6f)
+        val volumeCell = row.getChildAt(0)
+        (volumeCell.layoutParams as? LinearLayout.LayoutParams)?.let { params ->
+            if (params.marginStart != leftInset) {
+                params.marginStart = leftInset
+                volumeCell.layoutParams = params
+            }
+        }
+        val lastControl = row.getChildAt(row.childCount - 1)
+        (lastControl.layoutParams as? LinearLayout.LayoutParams)?.let { params ->
+            val baseEndMargin = (3f * resources.displayMetrics.density).roundToInt()
+            val targetMargin = baseEndMargin + rightInset
+            if (params.marginEnd != targetMargin) {
+                params.marginEnd = targetMargin
+                lastControl.layoutParams = params
+            }
+        }
+        applyPianoKeyboardSafeInsets()
+    }
+
+    private fun applyPianoKeyboardSafeInsets() {
+        val pianoView = keyboardPanel as? PianoKeyboardView ?: return
+        if (pianoView.width <= 0) return
+        val (leftInset, rightInset) = cutoutInsetsForView(pianoView, gapDp = 8f)
+        pianoView.setSafeEdgeInsets(leftInset.toFloat(), rightInset.toFloat())
+        val actionBar = bottomActionBar ?: return
+        val actionBarParams = actionBar.layoutParams as? ViewGroup.MarginLayoutParams ?: return
+        // Keep toolbar buttons at the same horizontal positions in Spectrum and KEYS.
+        // Only the piano keys themselves need to avoid a display cutout.
+        if (actionBarParams.marginStart != 0 || actionBarParams.marginEnd != 0) {
+            actionBarParams.marginStart = 0
+            actionBarParams.marginEnd = 0
+            actionBar.layoutParams = actionBarParams
+        }
     }
 
     /** Decode an OGG resource into interleaved PCM16 without blocking the UI thread. */
@@ -972,7 +1818,6 @@ class MainActivity : Activity() {
         val playedNote = midiNote + pianoTranspose
         pianoPressedTargets[midiNote] = playedNote
         pianoHeldNotes.add(playedNote)
-        updatePianoNoteReadout(playedNote)
         startPianoSample(playedNote)
     }
 
@@ -1005,13 +1850,6 @@ class MainActivity : Activity() {
         schedulePianoAudioShutdown()
     }
 
-    private fun updatePianoNoteReadout(midiNote: Int) {
-        val noteName = listOf("C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B")
-            .let { it[Math.floorMod(midiNote, 12)] + (Math.floorDiv(midiNote, 12) - 1) }
-        val frequency = 440.0 * 2.0.pow((midiNote - 69) / 12.0)
-        pianoNoteReadout?.text = String.format(java.util.Locale.US, "%s\n%.1f Hz", noteName, frequency)
-    }
-
     private var toneMinFrequency = 20
     private var toneMaxFrequency = 20000
     @Volatile private var toneVolume = 0.5
@@ -1023,22 +1861,25 @@ class MainActivity : Activity() {
     private var toneDtmfSelectedKey = "1"
     private var toneDtmfModeButton: Button? = null
     private var toneWaveformButton: View? = null
+    @Volatile private var toneSignalPreview: ToneSignalPreviewView? = null
     @Volatile private var toneStopRequested = false
     private var toneTrack: AudioTrack? = null
     private var toneThread: Thread? = null
     private var tonePlayButton: Button? = null
     @Volatile private var toneSweepActive = false
     private var toneSweepStartedAt = 0L
-    private var toneSweepDurationMs = 8000L
+    private var toneSweepDurationMs = 32_000L
     private var toneSweepStartFrequency = 20
     private var toneSweepEndFrequency = 20000
     @Volatile private var toneSweepAscending = true
+    @Volatile private var toneSweepLogarithmic = true
     private val toneSweepHandler = Handler(Looper.getMainLooper())
     private var toneSweepUiUpdate: (() -> Unit)? = null
     private var toneSweepButton: AnalyzerIconButton? = null
     private var toneSweepRangeButton: Button? = null
     private var toneSweepDurationButton: Button? = null
     private var toneSweepDirectionButton: Button? = null
+    private var toneSweepScaleButton: Button? = null
 
     private fun loadCustomToneFrequencies(): List<Int> = getSharedPreferences(
         "tone_generator", Context.MODE_PRIVATE
@@ -1065,43 +1906,36 @@ class MainActivity : Activity() {
         fun dp(value: Int) = (value * density).roundToInt()
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(16), dp(18), dp(16))
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(14, 21, 31))
-                cornerRadius = dp(20).toFloat()
-            }
+            gravity = Gravity.CENTER
+            styleNumericDialogCard(this)
         }
         content.addView(TextView(this).apply {
             text = "Add frequency preset"
-            textSize = 18f
+            textSize = 14f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
-            setTextColor(Color.WHITE)
+            setTextColor(Color.rgb(225, 233, 243))
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(4))
         })
         content.addView(TextView(this).apply {
-            text = "Enter a frequency from $minFrequency to $maxFrequency Hz."
-            textSize = 13f
-            setTextColor(Color.LTGRAY)
-            setPadding(0, dp(6), 0, dp(10))
+            text = "Enter a value from $minFrequency to $maxFrequency Hz."
+            textSize = 11f
+            setTextColor(Color.rgb(150, 166, 184))
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(8))
         })
         val input = EditText(this).apply {
             setText(toneFrequency.toString())
-            textSize = 19f
-            setTextColor(Color.rgb(255, 213, 90))
-            gravity = Gravity.CENTER
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
             filters = arrayOf(InputFilter.LengthFilter(5))
             isSingleLine = true
             isCursorVisible = true
             isFocusableInTouchMode = true
             showSoftInputOnFocus = false
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(15, 23, 36))
-                cornerRadius = dp(12).toFloat()
-                setStroke(dp(1), Color.rgb(67, 91, 119))
-            }
             setSelection(text.length)
+            styleNumericDialogInput(this)
         }
-        content.addView(input, LinearLayout.LayoutParams(-1, dp(48)))
+        content.addView(input, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)))
 
         val keypad = android.widget.GridLayout(this).apply {
             columnCount = 3
@@ -1166,53 +2000,48 @@ class MainActivity : Activity() {
         ).apply {
             gravity = Gravity.CENTER_HORIZONTAL
             topMargin = dp(5)
+            bottomMargin = dp(5)
         })
 
         lateinit var dialog: Dialog
         val actions = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, dp(12), 0, 0)
+            setPadding(0, dp(5), 0, 0)
         }
         val cancel = Button(this).apply {
             text = "Cancel"
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(42, 57, 75))
-                cornerRadius = dp(14).toFloat()
-            }
+            textSize = 11f
             setOnClickListener { dialog.dismiss() }
         }
-        actions.addView(cancel, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(8) })
+        styleNumericDialogButton(cancel)
+        cancel.setTextColor(Color.rgb(255, 213, 90))
+        actions.addView(cancel, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(6) })
         val add = Button(this).apply {
             text = "Add"
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(39, 113, 147))
-                cornerRadius = dp(14).toFloat()
-            }
-            setOnClickListener {
-                val frequency = input.text.toString().trim().toIntOrNull()
-                when {
-                    frequency == null -> input.error = "Enter a frequency in Hz"
-                    frequency !in minFrequency..maxFrequency -> input.error = "Use $minFrequency–$maxFrequency Hz"
-                    frequency in existingFrequencies || frequency in loadCustomToneFrequencies() ->
-                        input.error = "That frequency is already in the presets"
-                    else -> {
-                        saveCustomToneFrequencies(loadCustomToneFrequencies() + frequency)
-                        dialog.dismiss()
-                        onAdded()
-                    }
+            textSize = 11f
+        }
+        add.setOnClickListener {
+            val frequency = input.text.toString().trim().toIntOrNull()
+            when {
+                frequency == null -> input.error = "Enter a frequency in Hz"
+                frequency !in minFrequency..maxFrequency -> input.error = "Use $minFrequency–$maxFrequency Hz"
+                frequency in existingFrequencies || frequency in loadCustomToneFrequencies() ->
+                    input.error = "That frequency is already in the presets"
+                else -> {
+                    saveCustomToneFrequencies(loadCustomToneFrequencies() + frequency)
+                    dialog.dismiss()
+                    onAdded()
                 }
             }
         }
-        actions.addView(add, LinearLayout.LayoutParams(0, dp(44), 1f))
+        styleNumericDialogButton(add)
+        add.setTextColor(Color.rgb(255, 213, 90))
+        actions.addView(add, LinearLayout.LayoutParams(0, dp(42), 1f))
         content.addView(actions)
         dialog = Dialog(this)
-        dialog.setContentView(content)
-        dialog.setCanceledOnTouchOutside(true)
+        setDialogCardContent(dialog, content)
+        requireExplicitDialogAction(dialog)
         dialog.window?.apply {
             setBackgroundDrawableResource(android.R.color.transparent)
             setSoftInputMode(
@@ -1220,7 +2049,7 @@ class MainActivity : Activity() {
                     android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
             )
         }
-        centerDialogOnScreen(dialog, dp(320))
+        centerDialogOnScreen(dialog, dp(260), height = dp(360))
         dialog.show()
         input.requestFocus()
         input.setSelection(input.text.length)
@@ -1281,7 +2110,7 @@ class MainActivity : Activity() {
         content.addView(actions)
         dialog = Dialog(this)
         dialog.setContentView(content)
-        dialog.setCanceledOnTouchOutside(true)
+        requireExplicitDialogAction(dialog)
         centerDialogOnScreen(dialog, dp(320))
         dialog.show()
     }
@@ -1295,19 +2124,17 @@ class MainActivity : Activity() {
 
     private fun setTonePeakFollowEnabled(enabled: Boolean, refreshUi: Boolean = true) {
         tonePeakFollowEnabled = enabled
-        tonePeakFollowWindowStartedAt = if (enabled) SystemClock.elapsedRealtime() else 0L
+        val now = SystemClock.elapsedRealtime()
+        tonePeakFollowWindowStartedAt = if (enabled) now else 0L
+        tonePeakLastAcceptedAt = 0L
         tonePeakBestFrequency = 0.0
         tonePeakBestDb = -120.0
-        if (enabled && isUsableTonePeak(latestAnalyzedPeakFrequency, latestAnalyzedPeakDb, latestAnalyzedRmsDb)) {
-            tonePeakBestFrequency = latestAnalyzedPeakFrequency
-            tonePeakBestDb = latestAnalyzedPeakDb
-            toneFrequency = latestAnalyzedPeakFrequency.roundToInt().coerceIn(20, 20000)
-        }
         tonePeakPresetButton?.backgroundTintList = if (enabled) {
             android.content.res.ColorStateList.valueOf(Color.rgb(29, 105, 145))
         } else null
         tonePeakPresetButton?.contentDescription = if (enabled) {
-            "Peak tracking active; frequency updates every five seconds and holds its last value. Tap to change."
+            val holdDescription = if (tonePeakHoldDurationMs == 0L) "indefinitely" else "for ${tonePeakHoldDurationMs / 1000.0} seconds"
+            "Peak tracking active; scans every ${tonePeakDetectionWindowMs} milliseconds and keeps the last frequency $holdDescription."
         } else "Frequency presets"
         if (refreshUi) toneSweepUiUpdate?.invoke()
     }
@@ -1321,15 +2148,26 @@ class MainActivity : Activity() {
         }
 
         val now = SystemClock.elapsedRealtime()
-        if (now - tonePeakFollowWindowStartedAt < 5000L) return
+        if (now - tonePeakFollowWindowStartedAt < tonePeakDetectionWindowMs) {
+            if (tonePeakBestFrequency <= 0.0 && tonePeakLastAcceptedAt > 0L && tonePeakHoldDurationMs > 0L &&
+                now - tonePeakLastAcceptedAt >= tonePeakHoldDurationMs
+            ) {
+                setTonePeakFollowEnabled(false)
+            }
+            return
+        }
 
         if (tonePeakBestFrequency > 0.0) {
             toneFrequency = tonePeakBestFrequency.roundToInt().coerceIn(20, 20000)
+            tonePeakLastAcceptedAt = now
             toneSweepUiUpdate?.invoke()
+        } else if (tonePeakLastAcceptedAt > 0L && tonePeakHoldDurationMs > 0L &&
+            now - tonePeakLastAcceptedAt >= tonePeakHoldDurationMs
+        ) {
+            setTonePeakFollowEnabled(false)
+            return
         }
 
-        // Keep the selected frequency when the room falls quiet. Only a new valid
-        // peak in the next five-second window can replace it.
         tonePeakFollowWindowStartedAt = now
         tonePeakBestFrequency = 0.0
         tonePeakBestDb = -120.0
@@ -1337,6 +2175,160 @@ class MainActivity : Activity() {
             tonePeakBestFrequency = frequency
             tonePeakBestDb = peakDb
         }
+    }
+
+    private fun showTonePeakSettingsDialog(presetDialog: Dialog) {
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).roundToInt()
+        fun rounded(color: Int, radius: Int) = GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = dp(radius).toFloat()
+        }
+
+        var selectedDetectionMs = tonePeakDetectionWindowMs
+        var selectedHoldMs = tonePeakHoldDurationMs
+        val detectionButtons = mutableListOf<Pair<Long, Button>>()
+        val holdButtons = mutableListOf<Pair<Long, Button>>()
+        lateinit var refreshOptions: () -> Unit
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            styleNumericDialogCard(this)
+        }
+        content.addView(TextView(this).apply {
+            text = "PEAK TRACKING"
+            textSize = 13f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(Color.rgb(225, 233, 243))
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(4))
+        }, LinearLayout.LayoutParams(-1, -2))
+        content.addView(TextView(this).apply {
+            text = "Choose how often PEAK updates and how long it stays."
+            textSize = 11f
+            setTextColor(Color.rgb(166, 182, 199))
+            gravity = Gravity.CENTER
+            setPadding(dp(4), 0, dp(4), dp(9))
+        }, LinearLayout.LayoutParams(-1, -2))
+
+        refreshOptions = {
+            for ((value, button) in detectionButtons) {
+                val selected = value == selectedDetectionMs
+                button.backgroundTintList = android.content.res.ColorStateList.valueOf(
+                    if (selected) Color.rgb(39, 112, 147) else Color.rgb(35, 47, 62)
+                )
+                button.setTextColor(if (selected) Color.WHITE else Color.rgb(188, 201, 215))
+            }
+            for ((value, button) in holdButtons) {
+                val selected = value == selectedHoldMs
+                button.backgroundTintList = android.content.res.ColorStateList.valueOf(
+                    if (selected) Color.rgb(39, 112, 147) else Color.rgb(35, 47, 62)
+                )
+                button.setTextColor(if (selected) Color.WHITE else Color.rgb(188, 201, 215))
+            }
+        }
+
+        fun addChoiceRow(
+            title: String,
+            options: List<Pair<Long, String>>,
+            selectedValue: () -> Long,
+            onSelected: (Long) -> Unit,
+            target: MutableList<Pair<Long, Button>>
+        ) {
+            content.addView(TextView(this).apply {
+                text = title
+                textSize = 10f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setTextColor(Color.rgb(153, 174, 194))
+                setPadding(dp(2), dp(5), dp(2), dp(4))
+            }, LinearLayout.LayoutParams(-1, -2))
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            for ((value, label) in options) {
+                val button = Button(this).apply {
+                    text = label
+                    textSize = if (label == "∞") 18f else 10f
+                    isAllCaps = false
+                    minHeight = dp(36)
+                    minimumHeight = dp(36)
+                    setPadding(dp(1), 0, dp(1), 0)
+                    background = rounded(Color.rgb(35, 47, 62), 10)
+                    stateListAnimator = null
+                    if (label == "∞") setTypeface(typeface, android.graphics.Typeface.BOLD)
+                    contentDescription = if (label == "∞") "$title unlimited" else "$title $label"
+                    setOnClickListener {
+                        onSelected(value)
+                        refreshOptions()
+                    }
+                }
+                target.add(value to button)
+                row.addView(button, LinearLayout.LayoutParams(0, dp(36), 1f).apply {
+                    if (row.childCount > 0) marginStart = dp(3)
+                })
+            }
+            content.addView(row, LinearLayout.LayoutParams(-1, dp(36)))
+            if (selectedValue() !in options.map { it.first }) onSelected(options.first().first)
+        }
+
+        addChoiceRow(
+            "DETECTION WINDOW",
+            listOf(250L to "0.25 s", 500L to "0.5 s", 1000L to "1 s", 2000L to "2 s", 5000L to "5 s"),
+            { selectedDetectionMs },
+            { selectedDetectionMs = it },
+            detectionButtons
+        )
+        addChoiceRow(
+            "KEEP LAST FREQUENCY",
+            listOf(1000L to "1 s", 2000L to "2 s", 5000L to "5 s", 10000L to "10 s", 0L to "∞"),
+            { selectedHoldMs },
+            { selectedHoldMs = it },
+            holdButtons
+        )
+
+        val dialog = Dialog(this)
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val cancel = Button(this).apply {
+            text = "CANCEL"
+            textSize = 11f
+            isAllCaps = false
+            setTextColor(Color.rgb(205, 216, 227))
+            background = rounded(Color.rgb(38, 49, 64), 12)
+            setOnClickListener { dialog.dismiss() }
+        }
+        val apply = Button(this).apply {
+            text = "USE PEAK"
+            textSize = 11f
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = rounded(Color.rgb(39, 113, 147), 12)
+            setOnClickListener {
+                tonePeakDetectionWindowMs = selectedDetectionMs
+                tonePeakHoldDurationMs = selectedHoldMs
+                getSharedPreferences("tone_peak_follow", Context.MODE_PRIVATE).edit()
+                    .putLong("detection_window_ms", tonePeakDetectionWindowMs)
+                    .putLong("hold_duration_ms", tonePeakHoldDurationMs)
+                    .apply()
+                setTonePeakFollowEnabled(true)
+                presetDialog.dismiss()
+                dialog.dismiss()
+            }
+        }
+        actions.addView(cancel, LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginEnd = dp(6) })
+        actions.addView(apply, LinearLayout.LayoutParams(0, dp(40), 1f))
+        content.addView(actions, LinearLayout.LayoutParams(-1, dp(40)).apply { topMargin = dp(9) })
+
+        setDialogCardContent(dialog, content)
+        requireExplicitDialogAction(dialog)
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        refreshOptions()
+        centerDialogOnScreen(dialog, dp(260), height = dp(360))
+        dialog.show()
     }
 
     private val toneSweepRunnable = object : Runnable {
@@ -1348,7 +2340,12 @@ class MainActivity : Activity() {
             val end = if (toneSweepAscending) high else low
             val progress = ((SystemClock.elapsedRealtime() - toneSweepStartedAt).toDouble() / toneSweepDurationMs)
                 .coerceIn(0.0, 1.0)
-            toneFrequency = (start * exp(progress * ln(end.toDouble() / start))).roundToInt().coerceIn(low, high)
+            val sweptFrequency = if (toneSweepLogarithmic) {
+                start * exp(progress * ln(end.toDouble() / start))
+            } else {
+                start + (end - start) * progress
+            }
+            toneFrequency = sweptFrequency.roundToInt().coerceIn(low, high)
             toneSweepUiUpdate?.invoke()
             if (progress >= 1.0) {
                 cancelToneSweep()
@@ -1367,12 +2364,10 @@ class MainActivity : Activity() {
     private var audioThread: Thread? = null
 
     private val sampleRate = 48000
+    private val tonePreviewPcmFrame = TonePcmFrame((sampleRate * 0.200).roundToInt() + 1)
 
     // FFT configuration
     private val fftSize = 8192
-
-    // 75% overlap: process a new FFT every 2048 samples.
-    private val hopSize = fftSize / 4
 
     private val permissionRequest = 1001
 
@@ -1382,10 +2377,14 @@ class MainActivity : Activity() {
         setContentView(R.layout.activity_main)
         hideSystemBars()
 
-        val savedSplOffset = getSharedPreferences("sound_level_calibration", Context.MODE_PRIVATE)
-            .getFloat("offset_db", Float.NaN)
-        splManualCalibrationOffsetDb = savedSplOffset.takeIf { it.isFinite() }?.toDouble()
-        splCalibrationOffsetDb = splManualCalibrationOffsetDb
+        val splPreferences = getSharedPreferences("sound_level_calibration", Context.MODE_PRIVATE)
+        splTimeWeighting = if (splPreferences.getString("time_weighting", "FAST") == "SLOW") "SLOW" else "FAST"
+
+        val peakPreferences = getSharedPreferences("tone_peak_follow", Context.MODE_PRIVATE)
+        tonePeakDetectionWindowMs = peakPreferences.getLong("detection_window_ms", 500L)
+            .takeIf { it in longArrayOf(250L, 500L, 1000L, 2000L, 5000L) } ?: 500L
+        tonePeakHoldDurationMs = peakPreferences.getLong("hold_duration_ms", 5000L)
+            .takeIf { it in longArrayOf(1000L, 2000L, 5000L, 10000L, 0L) } ?: 5000L
 
         spectrumView = findViewById(R.id.spectrumView)
         statusText = findViewById(R.id.statusText)
@@ -1426,14 +2425,14 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER_VERTICAL or Gravity.START
                 layoutParams = ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
-                    dp(42)
+                    dp(44)
                 )
             }
 
             fun configureActionButton(button: Button, primary: Boolean = false) {
                 button.textSize = 14f
-                button.minHeight = dp(38)
-                button.minimumHeight = dp(38)
+                button.minHeight = dp(40)
+                button.minimumHeight = dp(40)
                 button.setPadding(if (button is AnalyzerIconButton) 0 else dp(10), dp(2), if (button is AnalyzerIconButton) 0 else dp(10), dp(2))
                 button.maxLines = 1
                 button.includeFontPadding = false
@@ -1451,12 +2450,12 @@ class MainActivity : Activity() {
                     styleXButton(button, primary = primary)
                 }
                 val buttonWidth = when {
-                    button is AnalyzerIconButton && (button.icon == AnalyzerIconButton.Icon.LIN || button.icon == AnalyzerIconButton.Icon.LOG) -> dp(84)
-                    button is AnalyzerIconButton && (button.icon == AnalyzerIconButton.Icon.TONE || button.icon == AnalyzerIconButton.Icon.SOUND || button.icon == AnalyzerIconButton.Icon.SPECTRUM || button.icon == AnalyzerIconButton.Icon.SPECTROGRAM) -> dp(46)
-                    iconButton -> dp(42)
+                    button is AnalyzerIconButton && (button.icon == AnalyzerIconButton.Icon.LIN || button.icon == AnalyzerIconButton.Icon.LOG) -> dp(48)
+                    button is AnalyzerIconButton && (button.icon == AnalyzerIconButton.Icon.TONE || button.icon == AnalyzerIconButton.Icon.SOUND || button.icon == AnalyzerIconButton.Icon.SPECTRUM || button.icon == AnalyzerIconButton.Icon.SPECTROGRAM) -> dp(48)
+                    iconButton -> dp(48)
                     else -> ViewGroup.LayoutParams.WRAP_CONTENT
                 }
-                actionRow.addView(button, LinearLayout.LayoutParams(buttonWidth, dp(38)).apply {
+                actionRow.addView(button, LinearLayout.LayoutParams(buttonWidth, dp(40)).apply {
                     setMargins(dp(3), dp(2), dp(3), dp(2))
                 })
             }
@@ -1465,8 +2464,9 @@ class MainActivity : Activity() {
             val resetButton = AnalyzerIconButton(this, AnalyzerIconButton.Icon.RESET)
             resetDisplayButton = resetButton
             configureActionButton(resetButton)
+            styleFlatToolbarButton(resetButton)
             resetButton.layoutParams = (resetButton.layoutParams as LinearLayout.LayoutParams).apply {
-                width = dp(39)
+                width = dp(48)
                 setMargins(dp(3), dp(2), dp(3), dp(2))
             }
             resetButton.contentDescription = "Reset display"
@@ -1475,30 +2475,75 @@ class MainActivity : Activity() {
                 spectrumView.resetView(useKeysFrequencyRange = keyboardModeOpen)
             }
 
-            val spectrogramButton = AnalyzerIconButton(this, if (spectrumView.isSpectrogramEnabled()) AnalyzerIconButton.Icon.SPECTRUM else AnalyzerIconButton.Icon.SPECTROGRAM).apply {
+            val spectrogramIconBitmap = android.graphics.BitmapFactory.decodeResource(
+                resources,
+                R.drawable.ic_spectrogram_custom,
+                android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }
+            )
+            val spectrumIconBitmap = android.graphics.BitmapFactory.decodeResource(
+                resources,
+                R.drawable.ic_spectrum_custom,
+                android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }
+            )
+            val spectrogramInitiallyEnabled = spectrumView.isSpectrogramEnabled()
+            val spectrogramButton = AnalyzerIconButton(this, if (spectrogramInitiallyEnabled) AnalyzerIconButton.Icon.SPECTRUM else AnalyzerIconButton.Icon.SPECTROGRAM).apply {
+                setCustomIcon(if (spectrogramInitiallyEnabled) spectrumIconBitmap else spectrogramIconBitmap)
+                contentDescription = if (spectrogramInitiallyEnabled) "Switch to spectrum view" else "Switch to spectrogram view"
                 // Show the mode this button will switch TO, not the current mode.
                 setOnClickListener {
                     leaveFullScaleKeyboard()
                     val enabled = spectrumView.toggleSpectrogram()
-                    icon = if (enabled) AnalyzerIconButton.Icon.SPECTRUM else AnalyzerIconButton.Icon.SPECTROGRAM
+                    if (enabled) {
+                        setCustomIcon(spectrumIconBitmap)
+                        icon = AnalyzerIconButton.Icon.SPECTRUM
+                        contentDescription = "Switch to spectrum view"
+                    } else {
+                        icon = AnalyzerIconButton.Icon.SPECTROGRAM
+                        setCustomIcon(spectrogramIconBitmap)
+                        contentDescription = "Switch to spectrogram view"
+                    }
                 }
             }
             spectrogramModeButton = spectrogramButton
             configureActionButton(spectrogramButton)
+            styleFlatToolbarButton(spectrogramButton)
 
-            val axisButton = AnalyzerIconButton(this, if (spectrumView.isLinearFrequencyAxis()) AnalyzerIconButton.Icon.LOG else AnalyzerIconButton.Icon.LIN).apply {
+            val logIconBitmap = android.graphics.BitmapFactory.decodeResource(
+                resources,
+                R.drawable.ic_lin_custom,
+                android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }
+            )
+            val linIconBitmap = android.graphics.BitmapFactory.decodeResource(
+                resources,
+                R.drawable.ic_log_custom,
+                android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }
+            )
+            val linearAxisInitially = spectrumView.isLinearFrequencyAxis()
+            val axisButton = AnalyzerIconButton(this, if (linearAxisInitially) AnalyzerIconButton.Icon.LOG else AnalyzerIconButton.Icon.LIN).apply {
+                setCustomIcon(if (linearAxisInitially) logIconBitmap else linIconBitmap)
+                contentDescription = if (linearAxisInitially) "Switch to logarithmic frequency scale" else "Switch to linear frequency scale"
                 // Show the axis mode this button will switch TO.
                 setOnClickListener {
                     leaveFullScaleKeyboard()
                     spectrumView.toggleFrequencyAxis()
-                    icon = if (spectrumView.isLinearFrequencyAxis()) AnalyzerIconButton.Icon.LOG else AnalyzerIconButton.Icon.LIN
+                    if (spectrumView.isLinearFrequencyAxis()) {
+                        icon = AnalyzerIconButton.Icon.LOG
+                        setCustomIcon(logIconBitmap)
+                        contentDescription = "Switch to logarithmic frequency scale"
+                    } else {
+                        icon = AnalyzerIconButton.Icon.LIN
+                        setCustomIcon(linIconBitmap)
+                        contentDescription = "Switch to linear frequency scale"
+                    }
                 }
             }
             axisToggleButton = axisButton
             configureActionButton(axisButton)
+            styleFlatToolbarButton(axisButton)
 
             // Flexible spacer pins the graph controls to the far right.
             val controlsSpacer = View(this)
+            mainActionsSpacer = controlsSpacer
             actionRow.addView(controlsSpacer, LinearLayout.LayoutParams(0, 1, 1f))
 
             val keysButton = Button(this).apply {
@@ -1508,7 +2553,8 @@ class MainActivity : Activity() {
             }
             keyboardToggleButton = keysButton
             configureActionButton(keysButton)
-            keysButton.layoutParams = (keysButton.layoutParams as LinearLayout.LayoutParams).apply { width = dp(42) }
+            styleFlatToolbarButton(keysButton)
+            keysButton.layoutParams = (keysButton.layoutParams as LinearLayout.LayoutParams).apply { width = dp(48) }
             keysButton.textSize = 20f
 
             val fullScaleButton = AnalyzerIconButton(this, AnalyzerIconButton.Icon.FULL_SCALE_OPEN).apply {
@@ -1520,16 +2566,29 @@ class MainActivity : Activity() {
             }
             fullScaleKeysButton = fullScaleButton
             configureActionButton(fullScaleButton)
+            styleFlatToolbarButton(fullScaleButton)
 
             val soundIdButton = AnalyzerIconButton(this, AnalyzerIconButton.Icon.SOUND).apply {
                 setOnClickListener { showSoundIdDialog() }
             }
+            soundIdButton.setCustomIcon(android.graphics.BitmapFactory.decodeResource(
+                resources,
+                R.drawable.ic_soundid_custom,
+                android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }
+            ))
             soundIdModeButton = soundIdButton
             configureActionButton(soundIdButton)
+            styleFlatToolbarButton(soundIdButton)
 
             val toneButton = AnalyzerIconButton(this, AnalyzerIconButton.Icon.TONE)
+            toneButton.setCustomIcon(android.graphics.BitmapFactory.decodeResource(
+                resources,
+                R.drawable.ic_tone_generator_original,
+                android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }
+            ))
             toneToggleButton = toneButton
             configureActionButton(toneButton)
+            styleFlatToolbarButton(toneButton)
 
             // Arrange the controls from left to right, with graph actions anchored at the right edge.
             actionRow.removeAllViews()
@@ -1538,19 +2597,16 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(3), 0, dp(3), 0)
-                background = GradientDrawable().apply {
-                    setColor(Color.rgb(17, 25, 36))
-                    cornerRadius = dp(14).toFloat()
-                    setStroke(dp(1), Color.rgb(49, 66, 83))
-                }
+                background = android.graphics.drawable.ColorDrawable(Color.rgb(15, 23, 36))
                 layoutTransition = android.animation.LayoutTransition()
             }
+            keyboardModeButtonGroup = keysGroup
             (keysButton.parent as? ViewGroup)?.removeView(keysButton)
             (fullScaleButton.parent as? ViewGroup)?.removeView(fullScaleButton)
             keysGroup.addView(keysButton)
             keysGroup.addView(fullScaleButton)
-            actionRow.addView(keysGroup, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(42)).apply {
-                setMargins(dp(3), dp(2), dp(3), dp(2))
+            actionRow.addView(keysGroup, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)).apply {
+                setMargins(dp(3), 0, dp(3), 0)
             })
             actionRow.addView(soundIdButton)
             actionRow.addView(controlsSpacer, LinearLayout.LayoutParams(0, 1, 1f))
@@ -1561,12 +2617,14 @@ class MainActivity : Activity() {
             val actionBar = android.widget.FrameLayout(this).apply {
                 clipChildren = false
                 clipToPadding = false
+                setBackgroundColor(Color.rgb(15, 23, 36))
             }
+            bottomActionBar = actionBar
             actionBar.addView(
                 actionRow,
                 android.widget.FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
-                    dp(42)
+                    dp(44)
                 )
             )
             rangePickerButton?.let { rangeButton ->
@@ -1580,7 +2638,7 @@ class MainActivity : Activity() {
                     )
                 )
             }
-            originalParams.height = dp(42)
+            originalParams.height = dp(44)
             startParent.addView(actionBar, startIndex, originalParams)
             startButton.visibility = View.GONE
             installToneGeneratorSplit(toneButton, keysButton)
@@ -1618,13 +2676,25 @@ class MainActivity : Activity() {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
             hideSystemBars()
-            keyboardControlsRow?.post { applyKeyboardVolumeSafeInset() }
+            keyboardControlsRow?.post {
+                applyKeyboardVolumeSafeInset()
+                keyboardPanel?.post { applyPianoKeyboardSafeInsets() }
+            }
         }
     }
     private fun installToneGeneratorSplit(toggleButton: Button, keysButton: Button) {
         val parent = spectrumView.parent as? ViewGroup ?: return
+        fun dp(v: Int): Int = (v * resources.displayMetrics.density).roundToInt()
         val index = parent.indexOfChild(spectrumView)
         val originalParams = spectrumView.layoutParams
+        val originalParentTopPadding = parent.paddingTop
+        val originalParentBottomPadding = parent.paddingBottom
+        val toolbarButtonVerticalInset = dp(2)
+        val tonePanelStepDown = dp(18).toFloat()
+        val graphHeader = spectrumHeader?.takeIf { it.parent === parent }
+        val originalHeaderIndex = graphHeader?.let { parent.indexOfChild(it) } ?: -1
+        val originalHeaderLayoutParams = graphHeader?.layoutParams
+        val graphHeaderHeight = (originalHeaderLayoutParams?.height ?: -1).takeIf { it > 0 } ?: dp(42)
         parent.removeView(spectrumView)
 
         val split = LinearLayout(this).apply {
@@ -1632,28 +2702,59 @@ class MainActivity : Activity() {
             gravity = Gravity.FILL
             setBackgroundColor(Color.rgb(15, 23, 36))
         }
-        spectrumView.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.35f)
-        split.addView(spectrumView)
+        val graphColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.FILL
+            setBackgroundColor(Color.rgb(15, 23, 36))
+        }
+        spectrumView.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        graphColumn.addView(spectrumView)
         val portraitControlsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             visibility = View.GONE
         }
         portraitGraphControlsRow = portraitControlsRow
-        split.addView(
+        // The header stays above the graph in normal mode. Tone mode keeps it
+        // at the same screen position but confines it to the graph column.
+        graphColumn.addView(
             portraitControlsRow,
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 (42f * resources.displayMetrics.density).roundToInt()
             )
         )
+        val toneGraphToolbarRow = android.widget.FrameLayout(this).apply {
+            visibility = View.GONE
+            clipChildren = false
+            clipToPadding = false
+        }
+        val toneModeToolbarItems = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL or Gravity.START
+        }
+        val graphToolbarItems = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL or Gravity.END
+        }
+        toneGraphToolbarRow.addView(toneModeToolbarItems, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.CENTER_VERTICAL or Gravity.START
+        ))
+        toneGraphToolbarRow.addView(graphToolbarItems, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.CENTER_VERTICAL or Gravity.END
+        ))
+        graphColumn.addView(
+            toneGraphToolbarRow,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44))
+        )
+        split.addView(graphColumn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.35f))
         val panel = createToneGeneratorPanel()
         tonePanel = panel
-        // Keep the graph dominant while slightly widening the tone controls.
+        // The panel fills the split height; tone mode hides the shared bottom action bar.
         split.addView(panel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.75f))
         panel.visibility = View.GONE
-
-        fun dp(v: Int): Int = (v * resources.displayMetrics.density).roundToInt()
 
         val keyboardSection = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1668,22 +2769,6 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, dp(4))
         }
         keyboardControlsRow = controls
-        fun controlButton(label: String, action: () -> Unit) = Button(this).apply {
-            text = label
-            textSize = 10f
-            isAllCaps = false
-            minHeight = dp(34)
-            minimumHeight = dp(34)
-            minWidth = 0
-            minimumWidth = 0
-            setPadding(dp(3), 0, dp(3), 0)
-            setTextColor(Color.WHITE)
-            styleXButton(this, primary = false)
-            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
-                marginEnd = dp(3)
-            }
-            setOnClickListener { action() }
-        }
         val volumeCell = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1691,17 +2776,38 @@ class MainActivity : Activity() {
             background = GradientDrawable().apply {
                 setColor(Color.rgb(22, 32, 42))
                 cornerRadius = dp(13).toFloat()
-                setStroke(dp(1).coerceAtLeast(1), Color.rgb(56, 68, 77))
             }
             contentDescription = "Piano volume"
         }
         val volumeLabel = TextView(this).apply {
-            text = "VOL ${(pianoVolume * 100).roundToInt()}%"
+            text = "${(pianoVolume * 100).roundToInt()}%"
             textSize = 10f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
-            setTextColor(Color.WHITE)
+            setTextColor(Color.rgb(225, 233, 243))
             gravity = Gravity.CENTER
             includeFontPadding = false
+        }
+        val volumeIcon = AnalyzerIconButton(
+            this,
+            if (pianoVolume <= 0f) AnalyzerIconButton.Icon.VOLUME_MUTED else AnalyzerIconButton.Icon.VOLUME
+        ).apply {
+            background = null
+            backgroundTintList = null
+            stateListAnimator = null
+            minimumWidth = 0
+            minimumHeight = 0
+            isClickable = true
+            isFocusable = true
+            contentDescription = if (pianoVolume <= 0f) "Piano muted; tap to restore volume" else "Mute piano"
+            setOnClickListener {
+                if (pianoVolume > 0f) {
+                    pianoVolumeBeforeMute = pianoVolume
+                    pianoVolume = 0f
+                } else {
+                    pianoVolume = pianoVolumeBeforeMute.coerceIn(0.01f, 1f)
+                }
+                updatePianoVolumeControls()
+            }
         }
         val volumeSlider = SeekBar(this).apply {
             max = 100
@@ -1711,12 +2817,16 @@ class MainActivity : Activity() {
             thumbTintList = android.content.res.ColorStateList.valueOf(Color.rgb(130, 216, 255))
             progressBackgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(60, 76, 91))
         }
-        volumeCell.addView(volumeLabel, LinearLayout.LayoutParams(dp(58), ViewGroup.LayoutParams.MATCH_PARENT))
+        volumeCell.addView(volumeIcon, LinearLayout.LayoutParams(dp(26), ViewGroup.LayoutParams.MATCH_PARENT))
+        volumeCell.addView(volumeLabel, LinearLayout.LayoutParams(dp(34), ViewGroup.LayoutParams.MATCH_PARENT))
         volumeCell.addView(volumeSlider, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
         volumeSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 if (!fromUser) return
-                pianoVolume = progress.coerceIn(0, 100).toFloat() / 100f
+                val nextVolume = progress.coerceIn(0, 100).toFloat() / 100f
+                if (nextVolume == 0f && pianoVolume > 0f) pianoVolumeBeforeMute = pianoVolume
+                if (nextVolume > 0f) pianoVolumeBeforeMute = nextVolume
+                pianoVolume = nextVolume
                 updatePianoVolumeControls()
             }
             override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
@@ -1724,45 +2834,30 @@ class MainActivity : Activity() {
         })
         pianoVolumeSlider = volumeSlider
         pianoVolumeLabel = volumeLabel
-        val octaveButton = controlButton("OCTAVE 0") {
-            pianoTranspose = when (pianoTranspose) { 0 -> 12; 12 -> -12; else -> 0 }
-            pianoOctaveButton?.text = when (pianoTranspose) { 12 -> "OCTAVE +1"; -12 -> "OCTAVE -1"; else -> "OCTAVE 0" }
-            (keyboardPanel as? PianoKeyboardView)?.setTranspose(pianoTranspose)
-        }
-        val reverbButton = controlButton(if (pianoReverbEnabled) "REVERB ON" else "REVERB OFF") {
-            pianoReverbEnabled = !pianoReverbEnabled
-            pianoReverbButton?.apply {
-                text = if (pianoReverbEnabled) "REVERB ON" else "REVERB OFF"
-                styleXButton(this, primary = pianoReverbEnabled)
-            }
-        }
-        pianoOctaveButton = octaveButton
-        pianoReverbButton = reverbButton
-        styleXButton(reverbButton, primary = pianoReverbEnabled)
-        val noteReadout = TextView(this).apply {
-            text = "--\n-- Hz"
-            textSize = 9f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setTextColor(Color.rgb(255, 213, 90))
+        pianoVolumeIconButton = volumeIcon
+        val octaveCell = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            includeFontPadding = false
-            maxLines = 2
-            minHeight = dp(34)
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(22, 32, 42))
-                cornerRadius = dp(10).toFloat()
-                setStroke(dp(1), Color.rgb(49, 66, 83))
-            }
-            contentDescription = "Last played piano note and frequency"
+            setPadding(0, 0, 0, 0)
+            background = null
+            contentDescription = "Piano octave"
         }
-        pianoNoteReadout = noteReadout
-        controls.addView(volumeCell, LinearLayout.LayoutParams(0, dp(38), 2.3f).apply { marginEnd = dp(3) })
-        controls.addView(octaveButton, LinearLayout.LayoutParams(0, dp(38), 0.9f).apply { marginEnd = dp(3) })
-        controls.addView(reverbButton, LinearLayout.LayoutParams(0, dp(38), 0.9f).apply { marginEnd = dp(3) })
-        controls.addView(noteReadout, LinearLayout.LayoutParams(0, dp(38), 0.9f).apply {
+        val octaveButton = createPianoOctaveButton()
+        pianoOctaveButton = octaveButton
+        updatePianoOctaveControls()
+        octaveCell.addView(octaveButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        val reverbButton = createPianoReverbButton()
+        pianoReverbButton = reverbButton
+        val octaveCellWidth = dp(48)
+        val reverbCellWidth = dp(48)
+        controls.addView(volumeCell, LinearLayout.LayoutParams(0, dp(40), 1f).apply {
             marginEnd = dp(3)
         })
-        keyboardSection.addView(controls, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
+        controls.addView(octaveCell, LinearLayout.LayoutParams(octaveCellWidth, dp(40)).apply {
+            marginEnd = dp(3)
+        })
+        controls.addView(reverbButton, LinearLayout.LayoutParams(reverbCellWidth, dp(40)))
+        keyboardSection.addView(controls, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)))
 
         val keys = PianoKeyboardView(this) { midiNote, pressed ->
             if (pressed) {
@@ -1781,12 +2876,762 @@ class MainActivity : Activity() {
         parent.addView(split, index, originalParams)
         controls.post { applyKeyboardVolumeSafeInset() }
 
+        fun setKeysGroupButtonSize(height: Int, inset: Int) {
+            keyboardModeButtonGroup?.let { group ->
+                for (index in 0 until group.childCount) {
+                    val child = group.getChildAt(index)
+                    val params = child.layoutParams as? ViewGroup.MarginLayoutParams ?: continue
+                    params.height = height
+                    params.topMargin = inset
+                    params.bottomMargin = inset
+                    child.layoutParams = params
+                }
+            }
+        }
+
+        val toolbarWidthAnimators = mutableListOf<android.animation.ValueAnimator>()
+        fun cancelToolbarWidthAnimations() {
+            toolbarWidthAnimators.toList().forEach { it.cancel() }
+            toolbarWidthAnimators.clear()
+        }
+
+        var keysControlsMerged = false
+        fun setKeysModeGraphLayout(enabled: Boolean, animateRows: Boolean = false) {
+            val mergeControls = keyboardModeOpen
+            val fadeKeysControlsIn = animateRows && mergeControls
+            val fadeRangeIn = animateRows && !soundModeOpen && !(mergeControls && fullScaleKeyboardOpen)
+            if (keysControlsMerged == mergeControls) return
+            // Width animators retain the old LayoutParams object. Stop them before
+            // reparenting toolbar controls so they cannot reapply stale row geometry.
+            cancelToolbarWidthAnimations()
+            val actionBar = bottomActionBar ?: return
+            val actionRow = mainActionRow ?: return
+            // Keep the outer action row fixed at its Spectrum height. KEYS controls
+            // remain 40dp tall and centered inside it, so the bottom edge cannot jump.
+            val rowHeight = dp(44)
+            val keysControlHeight = dp(40)
+            actionRow.animate().cancel()
+            controls.animate().cancel()
+            rangePickerButton?.animate()?.cancel()
+            actionRow.alpha = 1f
+            actionRow.translationY = 0f
+            controls.alpha = 1f
+            controls.translationY = 0f
+
+            fun detach(view: View) {
+                (view.parent as? ViewGroup)?.removeView(view)
+            }
+            actionRow.removeAllViews()
+            if (mergeControls) {
+                detach(controls)
+                controls.visibility = View.VISIBLE
+                controls.setPadding(0, 0, 0, 0)
+                (volumeCell.layoutParams as LinearLayout.LayoutParams).apply {
+                    width = dp(200)
+                    height = dp(40)
+                    weight = 0f
+                    marginStart = 0
+                    marginEnd = dp(3)
+                    topMargin = 0
+                    bottomMargin = 0
+                }.also { volumeCell.layoutParams = it }
+                (octaveCell.layoutParams as LinearLayout.LayoutParams).apply {
+                    width = octaveCellWidth
+                    height = dp(40)
+                    weight = 0f
+                    marginStart = 0
+                    marginEnd = dp(3)
+                    topMargin = 0
+                    bottomMargin = 0
+                }.also { octaveCell.layoutParams = it }
+                (reverbButton.layoutParams as LinearLayout.LayoutParams).apply {
+                    width = reverbCellWidth
+                    height = dp(40)
+                    weight = 0f
+                    marginStart = 0
+                    marginEnd = 0
+                    topMargin = 0
+                    bottomMargin = 0
+                }.also { reverbButton.layoutParams = it }
+
+                fun addKeysToolbarItem(view: View, width: Int) {
+                    detach(view)
+                    actionRow.addView(view, LinearLayout.LayoutParams(width, keysControlHeight).apply {
+                        setMargins(dp(3), 0, dp(3), 0)
+                    })
+                }
+                addKeysToolbarItem(toggleButton, dp(48))
+                keyboardModeButtonGroup?.let { group ->
+                    detach(group)
+                    setKeysGroupButtonSize(keysControlHeight, 0)
+                    actionRow.addView(group, LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, keysControlHeight
+                    ).apply { setMargins(dp(3), 0, dp(3), 0) })
+                }
+                soundIdModeButton?.let { addKeysToolbarItem(it, dp(48)) }
+                mainActionsSpacer?.let { spacer ->
+                    detach(spacer)
+                    actionRow.addView(spacer, LinearLayout.LayoutParams(0, 1, 1f))
+                }
+                axisToggleButton?.let { addKeysToolbarItem(it, dp(48)) }
+                spectrogramModeButton?.let { addKeysToolbarItem(it, dp(48)) }
+                resetDisplayButton?.let { addKeysToolbarItem(it, dp(48)) }
+                controls.alpha = if (fadeKeysControlsIn) 0f else 1f
+                actionBar.addView(controls, android.widget.FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, keysControlHeight, Gravity.CENTER
+                ))
+
+                graphHeader?.let { header ->
+                    (header.layoutParams as? ViewGroup.LayoutParams)?.let { params ->
+                        params.height = dp(42)
+                        header.layoutParams = params
+                    }
+                    rangePickerButton?.let { rangeButton ->
+                        rangeButton.alpha = if (fadeRangeIn) 0f else 1f
+                        detach(rangeButton)
+                        rangeButton.visibility = if (fullScaleKeyboardOpen) View.GONE else View.VISIBLE
+                        val width = rangeButton.layoutParams?.width?.takeIf { it > 0 }
+                            ?: ViewGroup.LayoutParams.WRAP_CONTENT
+                        header.addView(rangeButton, android.widget.FrameLayout.LayoutParams(
+                            width, dp(42), Gravity.CENTER
+                        ))
+                    }
+                }
+            } else {
+                detach(controls)
+                controls.visibility = if (animateRows) View.GONE else View.VISIBLE
+                controls.setPadding(0, 0, 0, dp(4))
+                (volumeCell.layoutParams as LinearLayout.LayoutParams).apply {
+                    width = 0
+                    height = dp(40)
+                    weight = 1f
+                    marginStart = 0
+                    marginEnd = dp(3)
+                    topMargin = 0
+                    bottomMargin = 0
+                }.also { volumeCell.layoutParams = it }
+                setKeysGroupButtonSize(dp(40), dp(2))
+                actionRow.addView(toggleButton, LinearLayout.LayoutParams(dp(48), dp(40)).apply {
+                    setMargins(dp(3), dp(2), dp(3), dp(2))
+                })
+                keyboardModeButtonGroup?.let { group ->
+                    actionRow.addView(group, LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)
+                    ).apply { setMargins(dp(3), 0, dp(3), 0) })
+                }
+                soundIdModeButton?.let { button ->
+                    actionRow.addView(button, LinearLayout.LayoutParams(dp(48), dp(40)).apply {
+                        setMargins(dp(3), dp(2), dp(3), dp(2))
+                    })
+                }
+                mainActionsSpacer?.let { spacer ->
+                    actionRow.addView(spacer, LinearLayout.LayoutParams(0, 1, 1f))
+                }
+                axisToggleButton?.let { button ->
+                    actionRow.addView(button, LinearLayout.LayoutParams(dp(48), dp(40)).apply {
+                        setMargins(dp(3), dp(2), dp(3), dp(2))
+                    })
+                }
+                spectrogramModeButton?.let { button ->
+                    actionRow.addView(button, LinearLayout.LayoutParams(dp(48), dp(40)).apply {
+                        setMargins(dp(3), dp(2), dp(3), dp(2))
+                    })
+                }
+                resetDisplayButton?.let { button ->
+                    actionRow.addView(button, LinearLayout.LayoutParams(dp(48), dp(40)).apply {
+                        setMargins(dp(3), dp(2), dp(3), dp(2))
+                    })
+                }
+                keyboardSection.addView(
+                    controls,
+                    0,
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44))
+                )
+                graphHeader?.let { header ->
+                    (header.layoutParams as? ViewGroup.LayoutParams)?.let { params ->
+                        params.height = graphHeaderHeight
+                        header.layoutParams = params
+                    }
+                    rangePickerButton?.let { rangeButton ->
+                        rangeButton.alpha = if (fadeRangeIn) 0f else 1f
+                        detach(rangeButton)
+                        val width = rangeButton.layoutParams?.width?.takeIf { it > 0 }
+                            ?: ViewGroup.LayoutParams.WRAP_CONTENT
+                        actionBar.addView(rangeButton, android.widget.FrameLayout.LayoutParams(
+                            width, dp(38), Gravity.CENTER
+                        ))
+                        rangeButton.visibility = if (soundModeOpen) View.GONE else View.VISIBLE
+                    }
+                }
+            }
+            (actionRow.layoutParams as? android.widget.FrameLayout.LayoutParams)?.let { params ->
+                params.height = rowHeight
+                actionRow.layoutParams = params
+            }
+            detach(actionBar)
+            actionBar.visibility = View.VISIBLE
+            parent.addView(actionBar, parent.childCount, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, rowHeight
+            ))
+            keysControlsMerged = mergeControls
+            split.requestLayout()
+            controls.post {
+                if (fadeKeysControlsIn) {
+                    val fadeInterpolator = android.view.animation.DecelerateInterpolator(1.4f)
+                    controls.animate().cancel()
+                    controls.animate()
+                        .alpha(1f)
+                        .setDuration(240L)
+                        .setInterpolator(fadeInterpolator)
+                        .start()
+                } else {
+                    controls.alpha = 1f
+                }
+                rangePickerButton?.takeIf { it.visibility == View.VISIBLE }?.let { rangeButton ->
+                    if (fadeRangeIn) {
+                        val fadeInterpolator = android.view.animation.DecelerateInterpolator(1.4f)
+                        rangeButton.animate().cancel()
+                        rangeButton.animate()
+                            .alpha(1f)
+                            .setDuration(240L)
+                            .setInterpolator(fadeInterpolator)
+                            .start()
+                    } else {
+                        rangeButton.alpha = 1f
+                    }
+                }
+                controls.translationY = 0f
+                applyKeyboardVolumeSafeInset()
+            }
+        }
+        switchKeysToolbarLayout = { enabled -> setKeysModeGraphLayout(enabled) }
+
+        fun animateToolbarButtonWidths(
+            previousWidths: Map<View, Int>,
+            durationMs: Long = 240L,
+            targetRangeTextSizeSp: Float? = null
+        ) {
+            val buttons = listOfNotNull(
+                axisToggleButton,
+                spectrogramModeButton,
+                resetDisplayButton,
+                rangePickerButton
+            )
+            buttons.forEach { button ->
+                val params = button.layoutParams ?: return@forEach
+                val targetWidth = if (params.width >= 0) {
+                    params.width
+                } else {
+                    val height = params.height.takeIf { it > 0 } ?: dp(40)
+                    button.measure(
+                        View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+                        View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
+                    )
+                    button.measuredWidth
+                }
+                val startWidth = previousWidths[button] ?: return@forEach
+                if (startWidth <= 0 || targetWidth <= 0 || startWidth == targetWidth) return@forEach
+
+                params.width = startWidth
+                button.layoutParams = params
+                val startTextSizePx = if (button === rangePickerButton && targetRangeTextSizeSp != null) {
+                    button.textSize
+                } else {
+                    0f
+                }
+                val targetTextSizePx = targetRangeTextSizeSp?.let { it * resources.displayMetrics.scaledDensity } ?: 0f
+                val animator = android.animation.ValueAnimator.ofInt(startWidth, targetWidth).apply {
+                    duration = durationMs
+                    interpolator = android.view.animation.DecelerateInterpolator(1.5f)
+                    addUpdateListener { update ->
+                        params.width = update.animatedValue as Int
+                        button.layoutParams = params
+                        if (button === rangePickerButton && targetRangeTextSizeSp != null) {
+                            val fraction = update.animatedFraction
+                            button.setTextSize(
+                                android.util.TypedValue.COMPLEX_UNIT_PX,
+                                startTextSizePx + (targetTextSizePx - startTextSizePx) * fraction
+                            )
+                        }
+                    }
+                    addListener(object : android.animation.AnimatorListenerAdapter() {
+                        override fun onAnimationEnd(animation: android.animation.Animator) {
+                            (animation as? android.animation.ValueAnimator)?.let(toolbarWidthAnimators::remove)
+                        }
+
+                        override fun onAnimationCancel(animation: android.animation.Animator) {
+                            (animation as? android.animation.ValueAnimator)?.let(toolbarWidthAnimators::remove)
+                        }
+                    })
+                }
+                toolbarWidthAnimators += animator
+                animator.start()
+            }
+        }
+
+        fun prepareToneExitToolbarResize() {
+            cancelToolbarWidthAnimations()
+            val buttons = listOfNotNull(
+                axisToggleButton,
+                spectrogramModeButton,
+                resetDisplayButton,
+                rangePickerButton
+            )
+            val previousWidths = mutableMapOf<View, Int>()
+            buttons.forEach { button ->
+                previousWidths[button] = button.layoutParams?.width?.takeIf { it > 0 } ?: button.width
+            }
+            fun setTargetWidth(button: View?, width: Int) {
+                button ?: return
+                button.layoutParams?.let { params ->
+                    params.width = width
+                    button.layoutParams = params
+                }
+            }
+            setTargetWidth(axisToggleButton, dp(48))
+            setTargetWidth(spectrogramModeButton, dp(48))
+            setTargetWidth(resetDisplayButton, dp(48))
+
+            val rangeButton = rangePickerButton
+            if (rangeButton != null) {
+                val oldTextSizePx = rangeButton.textSize
+                rangeButton.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f)
+                rangeButton.measure(
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+                    View.MeasureSpec.makeMeasureSpec(dp(40), View.MeasureSpec.EXACTLY)
+                )
+                val targetRangeWidth = rangeButton.measuredWidth
+                rangeButton.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, oldTextSizePx)
+                setTargetWidth(rangeButton, targetRangeWidth)
+            }
+            animateToolbarButtonWidths(previousWidths, durationMs = 320L, targetRangeTextSizeSp = 14f)
+        }
+
+        fun setToneModeGraphLayout(enabled: Boolean) {
+            val actionRow = mainActionRow ?: return
+            val actionBar = bottomActionBar ?: return
+            cancelToolbarWidthAnimations()
+            val toolbarButtons = listOfNotNull(
+                axisToggleButton,
+                spectrogramModeButton,
+                resetDisplayButton,
+                rangePickerButton
+            )
+            val previousWidths = mutableMapOf<View, Int>()
+            toolbarButtons.forEach { button ->
+                previousWidths[button] = button.layoutParams?.width?.takeIf { it > 0 } ?: button.width
+            }
+            fun detach(view: View?) {
+                (view?.parent as? ViewGroup)?.removeView(view)
+            }
+            panel.translationY = if (enabled) tonePanelStepDown else 0f
+            if (enabled) {
+                parent.setPadding(parent.paddingLeft, 0, parent.paddingRight, 0)
+                (panel.layoutParams as? LinearLayout.LayoutParams)?.let { params ->
+                    params.topMargin = originalParentTopPadding
+                    params.bottomMargin = originalParentBottomPadding + toolbarButtonVerticalInset
+                    panel.layoutParams = params
+                }
+                (toneGraphToolbarRow.layoutParams as? LinearLayout.LayoutParams)?.let { params ->
+                    params.bottomMargin = originalParentBottomPadding
+                    toneGraphToolbarRow.layoutParams = params
+                }
+                actionRow.removeAllViews()
+                graphHeader?.let { header ->
+                    detach(header)
+                    // Keep SPL at the same top-left position; peak readout now
+                    // aligns to the right edge of the graph column.
+                    graphColumn.addView(header, 0, LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, graphHeaderHeight
+                    ).apply { topMargin = originalParentTopPadding })
+                }
+                toneModeToolbarItems.removeAllViews()
+                graphToolbarItems.removeAllViews()
+                fun addToolbarItem(
+                    row: LinearLayout,
+                    view: View?,
+                    width: Int,
+                    height: Int = dp(40),
+                    horizontalMargin: Int = dp(3),
+                    verticalMargin: Int = toolbarButtonVerticalInset
+                ) {
+                    if (view == null) return
+                    detach(view)
+                    if (view is AnalyzerIconButton) {
+                        view.minWidth = 0
+                        view.minimumWidth = 0
+                    }
+                    row.addView(view, LinearLayout.LayoutParams(width, height).apply {
+                        setMargins(horizontalMargin, verticalMargin, horizontalMargin, verticalMargin)
+                    })
+                }
+                addToolbarItem(toneModeToolbarItems, toggleButton, dp(48))
+                setKeysGroupButtonSize(dp(40), toolbarButtonVerticalInset)
+                addToolbarItem(
+                    toneModeToolbarItems,
+                    keyboardModeButtonGroup,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    height = dp(44),
+                    horizontalMargin = dp(3),
+                    verticalMargin = 0
+                )
+                addToolbarItem(toneModeToolbarItems, soundIdModeButton, dp(48))
+                // From the outside edge inward: Reset, spectrum/spectrogram, LIN/LOG.
+                addToolbarItem(graphToolbarItems, axisToggleButton, dp(48))
+                addToolbarItem(graphToolbarItems, spectrogramModeButton, dp(48))
+                addToolbarItem(graphToolbarItems, resetDisplayButton, dp(48))
+                rangePickerButton?.let { rangeButton ->
+                    detach(rangeButton)
+                    rangeButton.visibility = View.VISIBLE
+                    rangeButton.textSize = 12f
+                    toneGraphToolbarRow.addView(rangeButton, android.widget.FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, dp(38), Gravity.CENTER
+                    ))
+                }
+                toneGraphToolbarRow.visibility = View.VISIBLE
+                actionBar.visibility = View.GONE
+            } else {
+                (panel.layoutParams as? LinearLayout.LayoutParams)?.let { params ->
+                    params.topMargin = 0
+                    params.bottomMargin = 0
+                    panel.layoutParams = params
+                }
+                (toneGraphToolbarRow.layoutParams as? LinearLayout.LayoutParams)?.let { params ->
+                    params.bottomMargin = 0
+                    toneGraphToolbarRow.layoutParams = params
+                }
+                parent.setPadding(
+                    parent.paddingLeft,
+                    originalParentTopPadding,
+                    parent.paddingRight,
+                    originalParentBottomPadding
+                )
+                toneModeToolbarItems.removeAllViews()
+                graphToolbarItems.removeAllViews()
+                rangePickerButton?.let { detach(it) }
+                toneGraphToolbarRow.visibility = View.GONE
+                setKeysGroupButtonSize(dp(40), dp(2))
+                graphHeader?.let { header ->
+                    detach(header)
+                    val restoreIndex = originalHeaderIndex.coerceIn(0, parent.childCount)
+                    parent.addView(header, restoreIndex, originalHeaderLayoutParams)
+                }
+                actionRow.removeAllViews()
+
+                detach(toggleButton)
+                actionRow.addView(toggleButton, LinearLayout.LayoutParams(dp(48), dp(40)).apply {
+                    setMargins(dp(3), dp(2), dp(3), dp(2))
+                })
+                keyboardModeButtonGroup?.let { group ->
+                    detach(group)
+                    actionRow.addView(group, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)).apply {
+                        setMargins(dp(3), 0, dp(3), 0)
+                    })
+                }
+                soundIdModeButton?.let { button ->
+                    detach(button)
+                    actionRow.addView(button, LinearLayout.LayoutParams(dp(48), dp(40)).apply {
+                        setMargins(dp(3), dp(2), dp(3), dp(2))
+                    })
+                }
+                mainActionsSpacer?.let { spacer ->
+                    detach(spacer)
+                    actionRow.addView(spacer, LinearLayout.LayoutParams(0, 1, 1f))
+                }
+                axisToggleButton?.let { button ->
+                    detach(button)
+                actionRow.addView(button, LinearLayout.LayoutParams(dp(48), dp(40)).apply {
+                        setMargins(dp(3), dp(2), dp(3), dp(2))
+                    })
+                }
+                spectrogramModeButton?.let { button ->
+                    detach(button)
+                    actionRow.addView(button, LinearLayout.LayoutParams(dp(48), dp(40)).apply {
+                        setMargins(dp(3), dp(2), dp(3), dp(2))
+                    })
+                }
+                resetDisplayButton?.let { button ->
+                    detach(button)
+                actionRow.addView(button, LinearLayout.LayoutParams(dp(48), dp(40)).apply {
+                        setMargins(dp(3), dp(2), dp(3), dp(2))
+                    })
+                }
+                rangePickerButton?.let { rangeButton ->
+                    detach(rangeButton)
+                    rangeButton.visibility = View.VISIBLE
+                    rangeButton.textSize = 14f
+                    actionBar.addView(rangeButton, android.widget.FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, dp(38), Gravity.CENTER
+                    ))
+                }
+                actionBar.visibility = View.VISIBLE
+            }
+            split.requestLayout()
+            animateToolbarButtonWidths(previousWidths)
+        }
+
+        var toneEntryAnimator: android.animation.ValueAnimator? = null
+        var keysModeAnimator: android.animation.ValueAnimator? = null
+        var axisModeAnimator: android.animation.ValueAnimator? = null
+        var keysModeExitReady = false
+        var modeTransitionLocked = false
+        var modeTransitionUnlockRunnable: Runnable? = null
+        val transitionControlClickability = mutableMapOf<View, Boolean>()
+        fun releaseModeTransitionLock() {
+            modeTransitionUnlockRunnable?.let(toggleButton::removeCallbacks)
+            modeTransitionUnlockRunnable = null
+            modeTransitionLocked = false
+            transitionControlClickability.forEach { (view, wasClickable) -> view.isClickable = wasClickable }
+            transitionControlClickability.clear()
+        }
+        fun lockModeControlsFor(durationMs: Long) {
+            releaseModeTransitionLock()
+            val transitionControls = listOfNotNull(
+                toggleButton,
+                keysButton,
+                fullScaleKeysButton,
+                soundIdModeButton,
+                axisToggleButton,
+                spectrogramModeButton,
+                resetDisplayButton,
+                rangePickerButton
+            )
+            transitionControls.forEach { control ->
+                transitionControlClickability[control] = control.isClickable
+                control.isClickable = false
+            }
+            modeTransitionLocked = true
+            val unlock = object : Runnable {
+                override fun run() {
+                    if (modeTransitionUnlockRunnable !== this) return
+                    modeTransitionUnlockRunnable = null
+                    modeTransitionLocked = false
+                    transitionControlClickability.forEach { (view, wasClickable) ->
+                        view.isClickable = wasClickable
+                    }
+                    transitionControlClickability.clear()
+                }
+            }
+            modeTransitionUnlockRunnable = unlock
+            toggleButton.postDelayed(unlock, durationMs + 80L)
+        }
+        fun setGraphHeaderHeight(height: Int) {
+            val header = graphHeader ?: return
+            val params = header.layoutParams ?: return
+            if (params.height != height) {
+                params.height = height
+                header.layoutParams = params
+            }
+            rangePickerButton?.takeIf { it.parent === header }?.let { rangeButton ->
+                rangeButton.layoutParams?.let { rangeParams ->
+                    if (rangeParams.height != height) {
+                        rangeParams.height = height
+                        rangeButton.layoutParams = rangeParams
+                    }
+                }
+            }
+        }
         fun showMode(mode: String) {
+            // Ignore taps while controls are being reparented or animated. This
+            // prevents touch targets from landing on LIN/LOG or Spectrum buttons.
+            if (modeTransitionLocked && !keysModeExitReady) return
+            if (keysModeExitReady) releaseModeTransitionLock()
+            cancelToolbarWidthAnimations()
+            // Finish any previous layout transition before starting a new mode change.
+            // This prevents cancelled Fade transitions from leaving a keyboard ghost.
+            android.transition.TransitionManager.endTransitions(parent)
+            axisModeAnimator?.cancel()
+            axisModeAnimator = null
+            toneEntryAnimator?.cancel()
+            toneEntryAnimator = null
+            keysModeAnimator?.cancel()
+            keysModeAnimator = null
+            panel.animate().cancel()
+            mainActionRow?.animate()?.cancel()
+            controls.animate().cancel()
+            rangePickerButton?.animate()?.cancel()
+            keyboardSection.animate().cancel()
+            keyboardSection.alpha = 1f
+            keyboardSection.scaleY = 1f
+            keyboardSection.translationY = 0f
+            keyboardSection.visibility = if (keyboardModeOpen) View.VISIBLE else View.GONE
+
+            if (keyboardModeOpen && mode != "keys" && mode != "tone" && !keysModeExitReady) {
+                fullScaleKeysButton?.visibility = View.GONE
+                if (fullScaleKeyboardOpen) leaveFullScaleKeyboard(animate = false)
+                // Hide the merged volume/octave/reverb controls as soon as KEYS is exited.
+                controls.animate().cancel()
+                controls.visibility = View.GONE
+                keysModeAnimator?.cancel()
+                keysModeAnimator = null
+                setKeysModeGraphLayout(false, animateRows = true)
+                split.orientation = LinearLayout.VERTICAL
+                keyboardSection.visibility = View.VISIBLE
+                val graphParams = graphColumn.layoutParams as LinearLayout.LayoutParams
+                val keysParams = keyboardSection.layoutParams as LinearLayout.LayoutParams
+                graphParams.width = ViewGroup.LayoutParams.MATCH_PARENT
+                graphParams.height = 0
+                graphParams.weight = 1f
+                keysParams.width = ViewGroup.LayoutParams.MATCH_PARENT
+                keysParams.height = 0
+                keysParams.weight = 1f
+                graphColumn.layoutParams = graphParams
+                keyboardSection.layoutParams = keysParams
+                keyboardSection.alpha = 1f
+                keyboardSection.scaleY = 1f
+                keyboardSection.translationY = 0f
+                split.requestLayout()
+                spectrumView.beginKeysFrequencyRangeExitTransition()
+                val exitDbRangeStart = spectrumView.getVisibleDbRangeForTransition()
+                val exitDbRangeTarget = spectrumView.getDbRangeTargetForMode(mode.uppercase(java.util.Locale.ROOT))
+                val exitHeaderHeightStart = graphHeader?.layoutParams?.height ?: graphHeaderHeight
+                lockModeControlsFor(360L)
+                var wasCancelled = false
+                val closingAnimator = android.animation.ValueAnimator.ofFloat(1f, 0f).apply {
+                    duration = 360L
+                    interpolator = android.view.animation.DecelerateInterpolator(1.5f)
+                    addUpdateListener { animator ->
+                        val progress = (animator.animatedValue as Float).coerceIn(0f, 1f)
+                        val transitionProgress = 1f - progress
+                        spectrumView.setKeysFrequencyRangeExitProgress(transitionProgress)
+                        spectrumView.setDbRangeForTransition(exitDbRangeStart, exitDbRangeTarget, transitionProgress)
+                        setGraphHeaderHeight((exitHeaderHeightStart +
+                                (graphHeaderHeight - exitHeaderHeightStart) * transitionProgress).roundToInt())
+                        keysParams.weight = progress
+                        keyboardSection.layoutParams = keysParams
+                        keyboardSection.alpha = progress
+                        keyboardSection.translationY = dp(16).toFloat() * (1f - progress)
+                        split.requestLayout()
+                    }
+                    addListener(object : android.animation.AnimatorListenerAdapter() {
+                        override fun onAnimationCancel(animation: android.animation.Animator) {
+                            wasCancelled = true
+                            releaseModeTransitionLock()
+                            spectrumView.cancelKeysFrequencyRangeExitTransition()
+                            spectrumView.setDbRangeForTransition(exitDbRangeStart, exitDbRangeStart, 1f)
+                            setGraphHeaderHeight(exitHeaderHeightStart)
+                        }
+
+                        override fun onAnimationEnd(animation: android.animation.Animator) {
+                            if (wasCancelled) {
+                                releaseModeTransitionLock()
+                                return
+                            }
+                            releaseModeTransitionLock()
+                            keysModeAnimator = null
+                            keyboardSection.visibility = View.GONE
+                            keyboardSection.alpha = 1f
+                            keyboardSection.translationY = 0f
+                            controls.alpha = 1f
+                            controls.translationY = 0f
+                            keysModeExitReady = true
+                            showMode(mode)
+                            keysModeExitReady = false
+                        }
+                    })
+                }
+                keysModeAnimator = closingAnimator
+                closingAnimator.start()
+                return
+            }
             val wasSoundModeOpen = soundModeOpen
             val wasKeyboardModeOpen = keyboardModeOpen
+            val wasToneModeOpen = toneModeOpen
+            val enteringToneMode = !wasToneModeOpen && mode == "tone"
+            val enteringKeysMode = !wasKeyboardModeOpen && mode == "keys"
+            val closingToneMode = wasToneModeOpen && mode == "none"
+            val leavingKeysMode = wasKeyboardModeOpen && mode != "keys"
+            val transitioningBetweenToneAndKeys =
+                (wasToneModeOpen && mode == "keys") || (wasKeyboardModeOpen && mode == "tone")
+            val transitionLockDuration = when {
+                transitioningBetweenToneAndKeys -> 460L
+                enteringKeysMode -> 360L
+                enteringToneMode || closingToneMode -> 380L
+                leavingKeysMode -> 360L
+                else -> 0L
+            }
+            if (transitionLockDuration > 0L) lockModeControlsFor(transitionLockDuration)
+            val startingTonePanelTranslationY = panel.translationY
+            val axisFrequencyStart = if (enteringKeysMode || transitioningBetweenToneAndKeys) {
+                spectrumView.getVisibleFrequencyRangeForTransition()
+            } else null
+            val axisDbStart = if (enteringKeysMode || transitioningBetweenToneAndKeys) {
+                spectrumView.getVisibleDbRangeForTransition()
+            } else null
+            val axisHeaderHeightStart = graphHeader?.layoutParams?.height ?: graphHeaderHeight
+            var axisFrequencyTarget: Pair<Double, Double>? = null
+            var axisDbTarget: Pair<Int, Int>? = null
+            var axisHeaderHeightTarget = axisHeaderHeightStart
+            if (transitioningBetweenToneAndKeys) {
+                keysModeAnimator?.cancel()
+                keysModeAnimator = null
+                mainActionRow?.let { row ->
+                    row.animate().cancel()
+                    row.alpha = 1f
+                    row.translationY = 0f
+                }
+                controls.animate().cancel()
+                controls.alpha = 1f
+                controls.translationY = 0f
+                val transition = android.transition.TransitionSet().apply {
+                    duration = 460L
+                    interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+                    ordering = android.transition.TransitionSet.ORDERING_TOGETHER
+                    // Animate the graph's actual bounds, not only its clip. The
+                    // canvas then redraws at each intermediate size instead of
+                    // snapping to the final graph size when the clip is removed.
+                    addTransition(android.transition.ChangeBounds().apply { resizeClip = false })
+                    addTransition(android.transition.Fade())
+                }
+                android.transition.TransitionManager.beginDelayedTransition(parent, transition)
+            }
+            if (closingToneMode) prepareToneExitToolbarResize()
+            val leavingKeysForTone = wasKeyboardModeOpen && mode == "tone"
+            val keysGroup = keyboardModeButtonGroup
+            val keysGroupTransition = keysGroup?.layoutTransition
+            if (leavingKeysForTone) {
+                keysGroup?.layoutTransition = null
+                fullScaleKeysButton?.visibility = View.GONE
+            }
             toneModeOpen = mode == "tone"
             keyboardModeOpen = mode == "keys"
             soundModeOpen = mode == "sound"
+            if (enteringToneMode && !transitioningBetweenToneAndKeys) {
+                panel.animate().cancel()
+                panel.alpha = 0f
+                panel.scaleX = 0.96f
+                panel.scaleY = 0.97f
+                panel.translationX = dp(18).toFloat()
+                panel.pivotX = 0f
+            } else if (!toneModeOpen && !closingToneMode) {
+                panel.animate().cancel()
+                panel.alpha = 1f
+                panel.scaleX = 1f
+                panel.scaleY = 1f
+                panel.translationX = 0f
+            }
+            // Collapse Full Scale before moving the group into Tone's toolbar.
+            if (wasKeyboardModeOpen && !keyboardModeOpen) {
+                setKeysModeGraphLayout(false, animateRows = !transitioningBetweenToneAndKeys)
+            }
+            if (wasToneModeOpen != toneModeOpen && !closingToneMode) setToneModeGraphLayout(toneModeOpen)
+            if (enteringKeysMode) {
+                setKeysModeGraphLayout(true, animateRows = !transitioningBetweenToneAndKeys)
+            }
+            if (enteringKeysMode) {
+                axisHeaderHeightTarget = graphHeader?.layoutParams?.height ?: axisHeaderHeightStart
+                if (!transitioningBetweenToneAndKeys) setGraphHeaderHeight(axisHeaderHeightStart)
+            }
+            if (transitioningBetweenToneAndKeys) {
+                panel.animate().cancel()
+                panel.translationY = startingTonePanelTranslationY
+                panel.animate()
+                    .translationY(if (toneModeOpen) tonePanelStepDown else 0f)
+                    .setDuration(460L)
+                    .setInterpolator(android.view.animation.AccelerateDecelerateInterpolator())
+                    .start()
+            }
+            if (leavingKeysForTone) keysGroup?.layoutTransition = keysGroupTransition
             if (keyboardModeOpen) {
                 pianoAudioShutdownHandler.removeCallbacks(pianoAudioShutdownRunnable)
                 initializePianoSamples()
@@ -1800,13 +3645,62 @@ class MainActivity : Activity() {
             }
             spectrumView.setSoundIdPortraitLayoutActive(soundModeOpen)
             fullScaleKeyboardOpen = false
-            spectrumView.setKeysFrequencyRangeActive(keyboardModeOpen)
+            val animateModeAxes = enteringKeysMode || transitioningBetweenToneAndKeys
+            spectrumView.setKeysFrequencyRangeActive(keyboardModeOpen, notify = !animateModeAxes)
             spectrumView.setDbRangeMode(when {
                 toneModeOpen -> "TONE"
                 keyboardModeOpen -> "KEYS"
+                  soundModeOpen -> "SOUND"
                 else -> "DEFAULT"
             })
-            panel.visibility = if (toneModeOpen) View.VISIBLE else View.GONE
+            if (animateModeAxes) {
+                axisFrequencyTarget = spectrumView.getVisibleFrequencyRangeForTransition()
+                axisDbTarget = spectrumView.getVisibleDbRangeForTransition()
+                val frequencyStart = axisFrequencyStart
+                val frequencyTarget = axisFrequencyTarget
+                if (frequencyStart != null && frequencyTarget != null) {
+                    spectrumView.setFrequencyRangeForTransition(frequencyStart, frequencyTarget, 0f)
+                }
+                val dbStart = axisDbStart
+                val dbTarget = axisDbTarget
+                if (dbStart != null && dbTarget != null) {
+                    spectrumView.setDbRangeForTransition(dbStart, dbTarget, 0f)
+                }
+            }
+            if (transitioningBetweenToneAndKeys) {
+                val frequencyStart = axisFrequencyStart
+                val frequencyTarget = axisFrequencyTarget
+                val dbStart = axisDbStart
+                val dbTarget = axisDbTarget
+                if (frequencyStart != null && frequencyTarget != null && dbStart != null && dbTarget != null) {
+                    var wasCancelled = false
+                    axisModeAnimator = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+                        duration = 460L
+                        interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+                        addUpdateListener { animator ->
+                            val progress = (animator.animatedValue as Float).coerceIn(0f, 1f)
+                            spectrumView.setFrequencyRangeForTransition(frequencyStart, frequencyTarget, progress)
+                            spectrumView.setDbRangeForTransition(dbStart, dbTarget, progress)
+                        }
+                        addListener(object : android.animation.AnimatorListenerAdapter() {
+                            override fun onAnimationCancel(animation: android.animation.Animator) {
+                                wasCancelled = true
+                            }
+
+                            override fun onAnimationEnd(animation: android.animation.Animator) {
+                                if (!wasCancelled) {
+                                    spectrumView.setFrequencyRangeForTransition(frequencyStart, frequencyTarget, 1f)
+                                    spectrumView.setDbRangeForTransition(dbStart, dbTarget, 1f)
+                                    spectrumView.notifyVisibleFrequencyRangeChanged()
+                                }
+                                if (axisModeAnimator === animation) axisModeAnimator = null
+                            }
+                        })
+                        start()
+                    }
+                }
+            }
+            panel.visibility = if (toneModeOpen || closingToneMode) View.VISIBLE else View.GONE
             soundIdPanel?.visibility = if (soundModeOpen) View.VISIBLE else View.GONE
             keyboardSection.visibility = if (keyboardModeOpen) View.VISIBLE else View.GONE
             spectrumView.visibility = View.VISIBLE
@@ -1817,7 +3711,7 @@ class MainActivity : Activity() {
                     (control.parent as? ViewGroup)?.removeView(control)
                     portraitGraphControlsRow?.addView(control)
                 }
-            } else if (!soundModeOpen && wasSoundModeOpen) {
+            } else if (!soundModeOpen && wasSoundModeOpen && !toneModeOpen) {
                 landscapeControls.forEach { control ->
                     (control.parent as? ViewGroup)?.removeView(control)
                     mainActionRow?.addView(control)
@@ -1827,17 +3721,41 @@ class MainActivity : Activity() {
             rangePickerButton?.visibility = if (soundModeOpen) View.GONE else View.VISIBLE
             if (keyboardModeOpen || soundModeOpen) {
                 split.orientation = LinearLayout.VERTICAL
+                graphColumn.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
                 spectrumView.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
                 if (keyboardModeOpen) {
-                    keyboardSection.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+                    keyboardSection.layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        0,
+                        if (enteringKeysMode && !transitioningBetweenToneAndKeys) 0f else 1f
+                    )
+                    if (enteringKeysMode && !transitioningBetweenToneAndKeys) {
+                        keyboardSection.alpha = 0f
+                        keyboardSection.scaleY = 0.98f
+                        keyboardSection.translationY = dp(16).toFloat()
+                    }
                 }
                 if (soundModeOpen) {
                     soundIdPanel?.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
                 }
             } else {
                 split.orientation = LinearLayout.HORIZONTAL
-                spectrumView.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.35f)
-                panel.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.75f)
+                graphColumn.layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    if (enteringToneMode && !transitioningBetweenToneAndKeys) 2.10f else 1.35f
+                )
+                spectrumView.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+                val tonePanelParams = LinearLayout.LayoutParams(
+                    0,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    if (enteringToneMode && !transitioningBetweenToneAndKeys) 0f else 0.75f
+                )
+                if (toneModeOpen || closingToneMode) {
+                    tonePanelParams.topMargin = originalParentTopPadding
+                    tonePanelParams.bottomMargin = originalParentBottomPadding + toolbarButtonVerticalInset
+                }
+                panel.layoutParams = tonePanelParams
                 keyboardSection.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
                 soundIdPanel?.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.75f)
             }
@@ -1848,18 +3766,17 @@ class MainActivity : Activity() {
                     child.visibility = if (!soundModeOpen || child === soundIdModeButton) View.VISIBLE else View.GONE
                 }
             }
+            if (keysControlsMerged) {
+                controls.visibility = if (soundModeOpen) View.GONE else View.VISIBLE
+            }
             toggleButton.text = ""
             toggleButton.contentDescription = "Tone generator"
-            toggleButton.backgroundTintList = android.content.res.ColorStateList.valueOf(
-                if (toneModeOpen) Color.rgb(29, 105, 145) else Color.rgb(22, 32, 42)
-            )
-            keysButton.backgroundTintList = android.content.res.ColorStateList.valueOf(
-                if (keyboardModeOpen) Color.rgb(29, 105, 145) else Color.rgb(22, 32, 42)
-            )
-            soundIdModeButton?.backgroundTintList = android.content.res.ColorStateList.valueOf(
-                if (soundModeOpen) Color.rgb(29, 105, 145) else Color.rgb(22, 32, 42)
-            )
-            fullScaleKeysButton?.visibility = if (keyboardModeOpen) View.VISIBLE else View.GONE
+            styleFlatToolbarButton(toggleButton)
+            styleFlatToolbarButton(keysButton)
+            soundIdModeButton?.let(::styleFlatToolbarButton)
+            if (!leavingKeysForTone) {
+                fullScaleKeysButton?.visibility = if (keyboardModeOpen) View.VISIBLE else View.GONE
+            }
             if (!toneModeOpen && !keyboardModeOpen) {
                 stopTone()
                 resetTonePlayButton()
@@ -1868,17 +3785,155 @@ class MainActivity : Activity() {
                 resetTonePlayButton()
             }
             split.requestLayout()
+            if (enteringKeysMode && !transitioningBetweenToneAndKeys) {
+                val graphParams = graphColumn.layoutParams as LinearLayout.LayoutParams
+                val keysParams = keyboardSection.layoutParams as LinearLayout.LayoutParams
+                val frequencyStart = axisFrequencyStart
+                val frequencyTarget = axisFrequencyTarget
+                val dbStart = axisDbStart
+                val dbTarget = axisDbTarget
+                keysModeAnimator = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+                    duration = 360L
+                    interpolator = android.view.animation.DecelerateInterpolator(1.5f)
+                    addUpdateListener { animator ->
+                        val progress = (animator.animatedValue as Float).coerceIn(0f, 1f)
+                        graphParams.weight = 1f
+                        keysParams.weight = progress
+                        if (frequencyStart != null && frequencyTarget != null) {
+                            spectrumView.setFrequencyRangeForTransition(frequencyStart, frequencyTarget, progress)
+                        }
+                        if (dbStart != null && dbTarget != null) {
+                            spectrumView.setDbRangeForTransition(dbStart, dbTarget, progress)
+                        }
+                        setGraphHeaderHeight((axisHeaderHeightStart +
+                                (axisHeaderHeightTarget - axisHeaderHeightStart) * progress).roundToInt())
+                        graphColumn.layoutParams = graphParams
+                        keyboardSection.layoutParams = keysParams
+                        keyboardSection.alpha = progress
+                        keyboardSection.scaleY = 0.98f + 0.02f * progress
+                        keyboardSection.translationY = dp(16).toFloat() * (1f - progress)
+                        split.requestLayout()
+                    }
+                    addListener(object : android.animation.AnimatorListenerAdapter() {
+                        override fun onAnimationCancel(animation: android.animation.Animator) {
+                            if (frequencyStart != null && frequencyTarget != null) {
+                                spectrumView.setFrequencyRangeForTransition(frequencyStart, frequencyTarget, 1f)
+                            }
+                            if (dbStart != null && dbTarget != null) {
+                                spectrumView.setDbRangeForTransition(dbStart, dbTarget, 1f)
+                            }
+                            setGraphHeaderHeight(axisHeaderHeightTarget)
+                            releaseModeTransitionLock()
+                        }
+
+                        override fun onAnimationEnd(animation: android.animation.Animator) {
+                            if (keysModeAnimator === animation) keysModeAnimator = null
+                            if (frequencyStart != null && frequencyTarget != null) {
+                                spectrumView.setFrequencyRangeForTransition(frequencyStart, frequencyTarget, 1f)
+                                spectrumView.notifyVisibleFrequencyRangeChanged()
+                            }
+                            if (dbStart != null && dbTarget != null) {
+                                spectrumView.setDbRangeForTransition(dbStart, dbTarget, 1f)
+                            }
+                            setGraphHeaderHeight(axisHeaderHeightTarget)
+                            keyboardSection.alpha = 1f
+                            keyboardSection.scaleY = 1f
+                            keyboardSection.translationY = 0f
+                            releaseModeTransitionLock()
+                        }
+                    })
+                    start()
+                }
+            }
+            if (enteringToneMode && !transitioningBetweenToneAndKeys) {
+                val graphParams = graphColumn.layoutParams as LinearLayout.LayoutParams
+                val panelParams = panel.layoutParams as LinearLayout.LayoutParams
+                toneEntryAnimator = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+                    duration = 380L
+                    interpolator = android.view.animation.OvershootInterpolator(0.45f)
+                    addUpdateListener { animator ->
+                        val progress = animator.animatedValue as Float
+                        graphParams.weight = 2.10f + (1.35f - 2.10f) * progress
+                        panelParams.weight = 0.75f * progress
+                        graphColumn.layoutParams = graphParams
+                        panel.layoutParams = panelParams
+                        panel.alpha = progress.coerceIn(0f, 1f)
+                        panel.scaleX = 0.96f + 0.04f * progress
+                        panel.scaleY = 0.97f + 0.03f * progress
+                        panel.translationX = dp(18).toFloat() * (1f - progress)
+                    }
+                    addListener(object : android.animation.AnimatorListenerAdapter() {
+                        override fun onAnimationCancel(animation: android.animation.Animator) {
+                            releaseModeTransitionLock()
+                        }
+
+                        override fun onAnimationEnd(animation: android.animation.Animator) {
+                            releaseModeTransitionLock()
+                        }
+                    })
+                    start()
+                }
+            } else if (closingToneMode) {
+                val graphParams = graphColumn.layoutParams as LinearLayout.LayoutParams
+                val panelParams = panel.layoutParams as LinearLayout.LayoutParams
+                toneEntryAnimator = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+                    duration = 380L
+                    interpolator = android.view.animation.OvershootInterpolator(0.45f)
+                    addUpdateListener { animator ->
+                        val progress = animator.animatedValue as Float
+                        val layoutProgress = progress.coerceIn(0f, 1f)
+                        graphParams.weight = 1.35f + 0.75f * layoutProgress
+                        panelParams.weight = 0.75f * (1f - layoutProgress)
+                        graphColumn.layoutParams = graphParams
+                        panel.layoutParams = panelParams
+                        panel.alpha = (1f - progress).coerceIn(0f, 1f)
+                        panel.scaleX = 1f - 0.04f * progress
+                        panel.scaleY = 1f - 0.03f * progress
+                        panel.translationX = dp(18).toFloat() * progress
+                    }
+                    addListener(object : android.animation.AnimatorListenerAdapter() {
+                        private var wasCancelled = false
+
+                        override fun onAnimationCancel(animation: android.animation.Animator) {
+                            wasCancelled = true
+                            releaseModeTransitionLock()
+                        }
+
+                        override fun onAnimationEnd(animation: android.animation.Animator) {
+                            if (wasCancelled || toneModeOpen) {
+                                releaseModeTransitionLock()
+                                return
+                            }
+                            toneEntryAnimator = null
+                            panel.visibility = View.GONE
+                            panel.alpha = 1f
+                            panel.scaleX = 1f
+                            panel.scaleY = 1f
+                            panel.translationX = 0f
+                            graphParams.weight = 1.35f
+                            panelParams.weight = 0.75f
+                            graphColumn.layoutParams = graphParams
+                            panel.layoutParams = panelParams
+                            setToneModeGraphLayout(false)
+                            split.requestLayout()
+                            releaseModeTransitionLock()
+                        }
+                    })
+                    start()
+                }
+            }
             spectrumView.invalidate()
             if (keyboardModeOpen) keyboardControlsRow?.post { applyKeyboardVolumeSafeInset() }
+            keyboardPanel?.post { applyPianoKeyboardSafeInsets() }
         }
         switchAnalyzerMode = ::showMode
         toggleButton.setOnClickListener {
-            leaveFullScaleKeyboard()
+            leaveFullScaleKeyboard(animate = false)
             showMode(if (toneModeOpen) "none" else "tone")
         }
         keysButton.setOnClickListener {
             if (fullScaleKeyboardOpen) {
-                leaveFullScaleKeyboard()
+                leaveFullScaleKeyboard(animate = false)
                 showMode("none")
                 return@setOnClickListener
             }
@@ -1906,6 +3961,9 @@ class MainActivity : Activity() {
             textSize = 18f
             setTextColor(Color.rgb(255, 213, 90))
             gravity = Gravity.CENTER
+            maxLines = 1
+            isSingleLine = true
+            ellipsize = android.text.TextUtils.TruncateAt.END
             setPadding(dp(6), dp(5), dp(6), dp(5))
             contentDescription = "Select tone frequency"
             background = GradientDrawable().apply {
@@ -1921,7 +3979,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         val presetsButton = AnalyzerIconButton(this, AnalyzerIconButton.Icon.PRESETS).apply {
-            contentDescription = "Frequency presets"
+            contentDescription = "Frequency presets and PEAK tracking settings"
             background = GradientDrawable().apply {
                 setColor(Color.rgb(22, 32, 45))
                 cornerRadius = dp(11).toFloat()
@@ -1930,11 +3988,12 @@ class MainActivity : Activity() {
             stateListAnimator = null
         }
         tonePeakPresetButton = presetsButton
-        header.addView(presetsButton, LinearLayout.LayoutParams(dp(44), dp(42)).apply {
-            marginEnd = dp(6)
+        header.addView(presetsButton, LinearLayout.LayoutParams(dp(38), dp(40)).apply {
+            marginEnd = dp(3)
         })
-        header.addView(valueLabel, LinearLayout.LayoutParams(dp(112), dp(42)).apply {
-            marginEnd = dp(6)
+        val valueLabelParams = LinearLayout.LayoutParams(dp(96), dp(40))
+        header.addView(valueLabel, valueLabelParams.apply {
+            marginEnd = dp(3)
         })
         val selectedWaveformIcon = ToneWaveformIconView(this, toneWaveform, Color.rgb(255, 213, 90))
         val waveCell = android.widget.FrameLayout(this).apply {
@@ -1945,21 +4004,20 @@ class MainActivity : Activity() {
             }
             isClickable = true
             isFocusable = true
-            contentDescription = "$toneWaveform signal. Tap to choose signal type."
-            addView(selectedWaveformIcon, android.widget.FrameLayout.LayoutParams(dp(56), dp(38), Gravity.CENTER))
+            contentDescription = "$toneWaveform selected. Tap to choose a waveform or noise type."
+            addView(selectedWaveformIcon, android.widget.FrameLayout.LayoutParams(dp(44), dp(34), Gravity.CENTER))
         }
         toneWaveformButton = waveCell
-        header.addView(waveCell, LinearLayout.LayoutParams(dp(64), dp(42)).apply { marginEnd = dp(6) })
+        header.addView(waveCell, LinearLayout.LayoutParams(dp(50), dp(40)).apply { marginEnd = dp(3) })
         val playButton = AnalyzerIconButton(this, AnalyzerIconButton.Icon.PLAY).apply {
-            playStopIconScale = 0.72f
-            roundedPlayStopGlyphs = true
+            usePlayStopImages = true
+            setPlayStopImages(
+                decodePlayStopBitmap(R.drawable.ic_tone_play),
+                decodePlayStopBitmap(R.drawable.ic_tone_stop)
+            )
             contentDescription = "Play selected tone"
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(29, 125, 65))
-                cornerRadius = dp(16).toFloat()
-                setStroke(dp(1), Color.rgb(67, 91, 86))
-            }
-            backgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(29, 125, 65))
+            background = android.graphics.drawable.ColorDrawable(Color.TRANSPARENT)
+            backgroundTintList = null
             setTextColor(Color.WHITE)
             stateListAnimator = null
             setOnClickListener {
@@ -1974,7 +4032,7 @@ class MainActivity : Activity() {
             }
         }
         tonePlayButton = playButton
-        header.addView(playButton, LinearLayout.LayoutParams(dp(44), dp(42)))
+        header.addView(playButton, LinearLayout.LayoutParams(dp(42), dp(42)))
         panel.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         waveCell.setOnClickListener {
@@ -1990,14 +4048,6 @@ class MainActivity : Activity() {
                     setStroke(dp(1), Color.rgb(49, 66, 83))
                 }
             }
-            pickerContent.addView(TextView(this).apply {
-                text = "SIGNAL"
-                textSize = 13f
-                setTextColor(Color.rgb(225, 233, 243))
-                setTypeface(typeface, android.graphics.Typeface.BOLD)
-                gravity = Gravity.CENTER
-                setPadding(0, 0, 0, dp(8))
-            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             for (rowValues in waveforms.toList().chunked(2)) {
                 val row = LinearLayout(this).apply {
                     orientation = LinearLayout.HORIZONTAL
@@ -2013,23 +4063,36 @@ class MainActivity : Activity() {
                         isClickable = true
                         isFocusable = true
                         contentDescription = if (waveform.endsWith("noise", ignoreCase = true)) "$waveform signal" else "$waveform waveform"
-                        addView(ToneWaveformIconView(this@MainActivity, waveform), android.widget.FrameLayout.LayoutParams(dp(58), dp(34), Gravity.CENTER))
+                        addView(ToneWaveformIconView(this@MainActivity, waveform), android.widget.FrameLayout.LayoutParams(dp(50), dp(28), Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(2) })
+                        addView(TextView(this@MainActivity).apply {
+                            text = waveform
+                            textSize = 11f
+                            setTextColor(Color.rgb(225, 233, 243))
+                            setTypeface(typeface, android.graphics.Typeface.BOLD)
+                            gravity = Gravity.CENTER
+                            maxLines = 1
+                            ellipsize = android.text.TextUtils.TruncateAt.END
+                        }, android.widget.FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(16), Gravity.BOTTOM).apply {
+                            leftMargin = dp(2)
+                            rightMargin = dp(2)
+                            bottomMargin = dp(1)
+                        })
                         setOnClickListener {
                             setTonePeakFollowEnabled(false, refreshUi = false)
                             toneWaveform = waveform
                             selectedWaveformIcon.waveform = waveform
-                            waveCell.contentDescription = "$waveform signal. Tap to choose signal type."
+                            waveCell.contentDescription = "$waveform selected. Tap to choose a waveform or noise type."
                             toneSweepUiUpdate?.invoke()
                             setTonePlayButtonPlaying(tonePlaying)
                             picker.dismiss()
                         }
                     }
-                    row.addView(option, LinearLayout.LayoutParams(dp(72), dp(48)).apply {
+                    row.addView(option, LinearLayout.LayoutParams(dp(72), dp(56)).apply {
                         if (columnIndex > 0) marginStart = dp(4)
                         if (columnIndex == 0) marginEnd = dp(4)
                     })
                 }
-                pickerContent.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply {
+                pickerContent.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(56)).apply {
                     if (pickerContent.childCount > 1) topMargin = dp(5)
                 })
             }
@@ -2039,21 +4102,17 @@ class MainActivity : Activity() {
             picker.show()
         }
 
-        // Keep the sliders and actions centered directly beneath the selector row.
+        // Keep tone and sweep controls grouped below the selector row.
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(dp(2), dp(1), dp(2), 0)
+            clipChildren = false
+            clipToPadding = false
         }
-        panel.addView(controls, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        // Fill the available panel height so the output row can stay at the bottom.
+        panel.addView(controls, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
-        val slider = SeekBar(this).apply {
-            max = 1000
-            progress = ((kotlin.math.ln(toneFrequency / toneMinFrequency.toDouble()) / kotlin.math.ln(toneMaxFrequency / toneMinFrequency.toDouble())) * max).roundToInt().coerceIn(0, max)
-        }
-        controls.addView(slider, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            setMargins(dp(2), dp(5), dp(2), 0)
-        })
         fun utilityIcon(icon: AnalyzerIconButton.Icon, description: String) = AnalyzerIconButton(this, icon).apply {
             contentDescription = description
             background = GradientDrawable().apply {
@@ -2082,14 +4141,6 @@ class MainActivity : Activity() {
                     setStroke(dp(1), Color.rgb(49, 66, 83))
                 }
             }
-            presetContent.addView(TextView(this@MainActivity).apply {
-                text = "FREQUENCY PRESETS"
-                textSize = 13f
-                setTextColor(Color.rgb(225, 233, 243))
-                setTypeface(typeface, android.graphics.Typeface.BOLD)
-                gravity = Gravity.CENTER
-                setPadding(0, 0, 0, dp(8))
-            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             val presetGrid = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
             }
@@ -2110,14 +4161,15 @@ class MainActivity : Activity() {
                         minHeight = dp(42)
                         minimumHeight = dp(42)
                         contentDescription = when {
-                            frequency == null -> "Follow the strongest detected frequency, updating every five seconds and holding the last value."
+                              frequency == null -> "Choose PEAK detection speed and how long to keep the last frequency."
                             isCustom -> "Set tone frequency to $frequency hertz. Long-press to delete this custom preset."
                             else -> "Set tone frequency to $frequency hertz"
                         }
                         setOnClickListener {
                             cancelToneSweep()
                             if (frequency == null) {
-                                setTonePeakFollowEnabled(true)
+                                  showTonePeakSettingsDialog(presetDialog)
+                                  return@setOnClickListener
                             } else {
                                 setTonePeakFollowEnabled(false, refreshUi = false)
                                 toneFrequency = frequency
@@ -2189,13 +4241,15 @@ class MainActivity : Activity() {
             presetContent.addView(closeButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)).apply {
                 topMargin = dp(7)
             })
-            presetDialog.setContentView(presetContent)
+            setDialogCardContent(presetDialog, presetContent)
+            requireExplicitDialogAction(presetDialog)
             presetDialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
-            centerDialogOnScreen(presetDialog, dp(260))
+            centerDialogOnScreen(presetDialog, dp(260), height = dp(360))
             presetDialog.show()
         }
         val sweepButton = utilityIcon(AnalyzerIconButton.Icon.SWEEP, "Play frequency sweep")
         toneSweepButton = sweepButton
+        applyToneSweepButtonStyle(active = false)
         sweepButton.setOnClickListener {
             if (toneSweepActive) {
                 cancelToneSweep()
@@ -2209,13 +4263,15 @@ class MainActivity : Activity() {
                 if (tonePlaying) {
                     toneSweepStartedAt = SystemClock.elapsedRealtime()
                     toneSweepActive = true
+                    toneSweepUiUpdate?.invoke()
                     toneSweepRangeButton?.isEnabled = false
                     toneSweepDurationButton?.isEnabled = false
                     toneSweepDirectionButton?.isEnabled = false
+                    toneSweepScaleButton?.isEnabled = false
                     toneDtmfModeButton?.isEnabled = false
                     toneWaveformButton?.isEnabled = false
                     sweepButton.contentDescription = "Stop frequency sweep"
-                    sweepButton.backgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(29, 105, 145))
+                    applyToneSweepButtonStyle(active = true)
                     setTonePlayButtonPlaying(true)
                     toneSweepHandler.post(toneSweepRunnable)
                 }
@@ -2223,17 +4279,20 @@ class MainActivity : Activity() {
         }
         fun formatSweepFrequency(frequency: Int): String = when {
             frequency >= 1000 && frequency % 1000 == 0 -> "${frequency / 1000} kHz"
-            frequency >= 1000 -> String.format(java.util.Locale.US, "%.1f kHz", frequency / 1000.0)
+            frequency >= 1000 -> {
+                val roundedKHz = String.format(java.util.Locale.US, "%.1f", frequency / 1000.0)
+                "${roundedKHz.removeSuffix(".0")} kHz"
+            }
             else -> "$frequency Hz"
         }
         fun styleSweepSettingButton(button: Button) {
             button.isAllCaps = false
-            button.textSize = 11f
+            button.textSize = 12f
             button.minWidth = 0
             button.minimumWidth = 0
             button.minHeight = dp(36)
             button.minimumHeight = dp(36)
-            button.setPadding(dp(5), 0, dp(5), 0)
+            button.setPadding(dp(4), 0, dp(4), 0)
             button.setTextColor(Color.rgb(225, 233, 243))
             button.background = GradientDrawable().apply {
                 setColor(Color.rgb(15, 23, 36))
@@ -2245,23 +4304,27 @@ class MainActivity : Activity() {
         val sweepSettingsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(15, 23, 36))
+                cornerRadius = dp(11).toFloat()
+                setStroke(dp(1), Color.rgb(49, 66, 83))
+            }
         }
         val sweepRangeButton = Button(this).apply {
-            text = "${formatSweepFrequency(toneSweepStartFrequency)} → ${formatSweepFrequency(toneSweepEndFrequency)}"
+            text = "${formatSweepFrequency(toneSweepStartFrequency)}→${formatSweepFrequency(toneSweepEndFrequency)}"
             contentDescription = "Frequency sweep from $toneSweepStartFrequency to $toneSweepEndFrequency Hz. Tap to change."
             maxLines = 1
+            isSingleLine = true
             ellipsize = android.text.TextUtils.TruncateAt.END
         }
         styleSweepSettingButton(sweepRangeButton)
-        val widestSweepRangeText = "${formatSweepFrequency(19999)} → ${formatSweepFrequency(20000)}"
-        val sweepRangeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            textSize = 11f * resources.displayMetrics.scaledDensity
-            typeface = sweepRangeButton.typeface
-        }
-        val sweepRangeMinimumWidth = (sweepRangeTextPaint.measureText(widestSweepRangeText) + dp(16)).roundToInt()
-        sweepRangeButton.minWidth = sweepRangeMinimumWidth
-        sweepRangeButton.minimumWidth = sweepRangeMinimumWidth
-        sweepRangeButton.setPadding(dp(8), 0, dp(8), 0)
+        sweepRangeButton.setTextColor(Color.rgb(255, 213, 90))
+        sweepRangeButton.minWidth = 0
+        sweepRangeButton.minimumWidth = 0
+        sweepRangeButton.setPadding(dp(2), 0, dp(2), 0)
+        sweepRangeButton.setAutoSizeTextTypeUniformWithConfiguration(
+            9, 12, 1, android.util.TypedValue.COMPLEX_UNIT_SP
+        )
         toneSweepRangeButton = sweepRangeButton
         val sweepDirectionButton = Button(this).apply {
             text = if (toneSweepAscending) "↗" else "↙"
@@ -2285,31 +4348,18 @@ class MainActivity : Activity() {
             val rangeDialog = Dialog(this)
             val content = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER_HORIZONTAL
-                setPadding(dp(14), dp(10), dp(14), dp(10))
-                background = GradientDrawable().apply {
-                    setColor(Color.rgb(24, 31, 42))
-                    cornerRadius = dp(22).toFloat()
-                    setStroke(dp(1), Color.rgb(49, 66, 83))
-                }
+                gravity = Gravity.CENTER
+                styleNumericDialogCard(this)
             }
             fun sweepFrequencyInput(initial: Int): EditText = EditText(this).apply {
                 setText(initial.toString())
-                textSize = 20f
-                setTextColor(Color.rgb(255, 213, 90))
-                gravity = Gravity.CENTER
                 inputType = InputType.TYPE_CLASS_NUMBER
                 filters = arrayOf(InputFilter.LengthFilter(5))
                 isSingleLine = true
                 showSoftInputOnFocus = false
                 isFocusableInTouchMode = true
                 isCursorVisible = true
-                background = GradientDrawable().apply {
-                    setColor(Color.rgb(15, 23, 36))
-                    cornerRadius = dp(12).toFloat()
-                    setStroke(dp(1), Color.rgb(67, 91, 119))
-                }
-                setPadding(dp(6), dp(2), dp(6), dp(2))
+                styleNumericDialogInput(this)
             }
             val sweepStartInput = sweepFrequencyInput(toneSweepStartFrequency)
             val sweepEndInput = sweepFrequencyInput(toneSweepEndFrequency)
@@ -2319,24 +4369,20 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
             }
-            fields.addView(sweepStartInput, LinearLayout.LayoutParams(0, dp(46), 1f))
+            fields.addView(sweepStartInput, LinearLayout.LayoutParams(0, dp(48), 1f))
             fields.addView(TextView(this).apply {
                 text = "→"
                 textSize = 18f
                 gravity = Gravity.CENTER
                 setTextColor(Color.rgb(255, 213, 90))
-            }, LinearLayout.LayoutParams(dp(30), dp(46)))
-            fields.addView(sweepEndInput, LinearLayout.LayoutParams(0, dp(46), 1f))
-            content.addView(fields, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)))
+            }, LinearLayout.LayoutParams(dp(30), dp(48)))
+            fields.addView(sweepEndInput, LinearLayout.LayoutParams(0, dp(48), 1f))
+            content.addView(fields, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)))
 
             var activeInput = sweepStartInput
             fun updateInputFocus(input: EditText, hasFocus: Boolean) {
                 if (hasFocus) activeInput = input
-                input.background = GradientDrawable().apply {
-                    setColor(Color.rgb(15, 23, 36))
-                    cornerRadius = dp(12).toFloat()
-                    setStroke(dp(1), if (hasFocus) Color.rgb(255, 213, 90) else Color.rgb(67, 91, 119))
-                }
+                styleNumericDialogInput(input, focused = hasFocus)
             }
             sweepStartInput.setOnFocusChangeListener { _, hasFocus -> updateInputFocus(sweepStartInput, hasFocus) }
             sweepEndInput.setOnFocusChangeListener { _, hasFocus -> updateInputFocus(sweepEndInput, hasFocus) }
@@ -2397,7 +4443,7 @@ class MainActivity : Activity() {
             }
             content.addView(keypad, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 gravity = Gravity.CENTER_HORIZONTAL
-                topMargin = dp(4)
+                topMargin = dp(5)
                 bottomMargin = dp(5)
             })
 
@@ -2423,7 +4469,7 @@ class MainActivity : Activity() {
                         else -> {
                             toneSweepStartFrequency = startHz
                             toneSweepEndFrequency = endHz
-                            sweepRangeButton.text = "${formatSweepFrequency(startHz)} → ${formatSweepFrequency(endHz)}"
+                            sweepRangeButton.text = "${formatSweepFrequency(startHz)}→${formatSweepFrequency(endHz)}"
                             sweepRangeButton.contentDescription = "Frequency sweep from $startHz to $endHz Hz. Tap to change."
                             rangeDialog.dismiss()
                         }
@@ -2433,15 +4479,16 @@ class MainActivity : Activity() {
             for (button in listOf(cancelButton, applyButton)) {
                 styleNumericDialogButton(button)
                 button.setTextColor(Color.rgb(255, 213, 90))
-                actions.addView(button, LinearLayout.LayoutParams(0, dp(40), 1f).apply {
+                actions.addView(button, LinearLayout.LayoutParams(0, dp(42), 1f).apply {
                     setMargins(dp(3), 0, dp(3), 0)
                 })
             }
             content.addView(actions, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)))
-            rangeDialog.setContentView(content)
+            setDialogCardContent(rangeDialog, content)
+            requireExplicitDialogAction(rangeDialog)
             rangeDialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+            centerDialogOnScreen(rangeDialog, dp(260), height = dp(360))
             rangeDialog.show()
-            centerDialogOnScreen(rangeDialog, dp(320))
             sweepStartInput.requestFocus()
             sweepStartInput.setSelection(sweepStartInput.text.length)
         }
@@ -2463,65 +4510,190 @@ class MainActivity : Activity() {
                 sweepDurationButton.contentDescription = "Sweep duration, $seconds seconds. Tap to change."
             }
         }
+        val sweepScaleButton = Button(this).apply {
+            text = if (toneSweepLogarithmic) "LOG" else "LIN"
+            contentDescription = if (toneSweepLogarithmic) {
+                "Logarithmic sweep spacing. Tap to switch to linear spacing."
+            } else {
+                "Linear sweep spacing. Tap to switch to logarithmic spacing."
+            }
+        }
+        styleSweepSettingButton(sweepScaleButton)
+        sweepScaleButton.textSize = 11f
+        sweepScaleButton.setTextColor(Color.rgb(255, 213, 90))
+        toneSweepScaleButton = sweepScaleButton
+        sweepScaleButton.setOnClickListener {
+            if (!toneSweepActive) {
+                toneSweepLogarithmic = !toneSweepLogarithmic
+                sweepScaleButton.text = if (toneSweepLogarithmic) "LOG" else "LIN"
+                sweepScaleButton.contentDescription = if (toneSweepLogarithmic) {
+                    "Logarithmic sweep spacing. Tap to switch to linear spacing."
+                } else {
+                    "Linear sweep spacing. Tap to switch to logarithmic spacing."
+                }
+            }
+        }
         val sweepRangeGroup = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
         sweepRangeGroup.addView(sweepRangeButton, LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginEnd = dp(4) })
-        sweepRangeGroup.addView(sweepDirectionButton, LinearLayout.LayoutParams(dp(40), dp(36)))
-        sweepSettingsRow.addView(sweepButton, LinearLayout.LayoutParams(dp(44), dp(36)).apply { marginEnd = dp(6) })
-        sweepSettingsRow.addView(sweepRangeGroup, LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginEnd = dp(6) })
-        sweepSettingsRow.addView(sweepDurationButton, LinearLayout.LayoutParams(dp(62), dp(36)))
+        sweepRangeGroup.addView(sweepDirectionButton, LinearLayout.LayoutParams(dp(32), dp(36)))
+        sweepSettingsRow.addView(sweepButton, LinearLayout.LayoutParams(dp(38), dp(36)).apply { marginEnd = dp(4) })
+        sweepSettingsRow.addView(sweepRangeGroup, LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginEnd = dp(4) })
+        sweepSettingsRow.addView(sweepScaleButton, LinearLayout.LayoutParams(dp(42), dp(36)).apply { marginEnd = dp(4) })
+        sweepSettingsRow.addView(sweepDurationButton, LinearLayout.LayoutParams(dp(46), dp(36)))
         controls.addView(sweepSettingsRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(36)).apply {
-            topMargin = dp(3)
-            bottomMargin = dp(2)
+            topMargin = dp(1)
+            bottomMargin = dp(1)
         })
+        val signalPreview = ToneSignalPreviewView(this, sampleRate, tonePreviewPcmFrame).apply {
+            waveform = toneWaveform
+            frequency = toneFrequency
+            volume = toneVolume.toFloat()
+            playing = tonePlaying
+            sweepActive = toneSweepActive
+        }
+        toneSignalPreview = signalPreview
+        // Keep the oscilloscope full width; the timebase selector sits centered beneath it.
+        controls.addView(signalPreview, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.25f).apply {
+            setMargins(dp(2), dp(2), dp(2), dp(2))
+        })
+        signalPreview.onVolumeChanged = { selectedVolume ->
+            toneVolume = selectedVolume.toDouble()
+        }
 
-        val volumeHeader = LinearLayout(this).apply {
+        var selectedScopeTimebaseMs: Int? = signalPreview.manualTimebaseMs
+        val scopeTimebaseButton = Button(this).apply {
+            text = selectedScopeTimebaseMs?.let { "$it ms" } ?: "AUTO · 3 cyc"
+            textSize = 11f
+            isAllCaps = false
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = dp(28)
+            minimumHeight = dp(28)
+            setPadding(dp(8), 0, dp(8), 0)
+            setTextColor(Color.rgb(225, 233, 243))
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(15, 23, 36))
+                cornerRadius = dp(9).toFloat()
+                setStroke(dp(1), Color.rgb(67, 91, 119))
+            }
+            stateListAnimator = null
+            contentDescription = "Automatic oscilloscope time scale, about three cycles. Tap to change."
+        }
+        fun refreshScopeTimebaseLabel() {
+            val manualTimebase = selectedScopeTimebaseMs
+            val label = when {
+                manualTimebase != null -> "$manualTimebase ms"
+                signalPreview.dtmfMode -> "AUTO · 3 cyc"
+                isNoiseTone() -> "AUTO · 20 ms"
+                else -> "AUTO · 3 cyc"
+            }
+            if (scopeTimebaseButton.text.toString() != label) scopeTimebaseButton.text = label
+            scopeTimebaseButton.contentDescription = when {
+                manualTimebase != null -> "Oscilloscope shows $manualTimebase milliseconds across the display. Tap to change."
+                signalPreview.dtmfMode -> "Automatic oscilloscope time scale, about three cycles of the higher DTMF tone. Tap to change."
+                isNoiseTone() -> "Automatic oscilloscope time scale, 20 milliseconds across the display. Tap to change."
+                else -> "Automatic oscilloscope time scale, about three tone cycles. Tap to change."
+            }
+        }
+        refreshScopeTimebaseLabel()
+        val scopeTimebaseRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, dp(1), 0, 0)
         }
-        volumeHeader.addView(TextView(this).apply {
-            text = "Volume"
-            textSize = 11f
-            setTextColor(Color.rgb(150, 166, 184))
-            gravity = Gravity.CENTER
+        scopeTimebaseRow.addView(scopeTimebaseButton, LinearLayout.LayoutParams(dp(102), dp(28)))
+        controls.addView(scopeTimebaseRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(30)).apply {
+            topMargin = dp(1)
         })
-        val volumeLabel = TextView(this).apply {
-            text = "${(toneVolume * 100).roundToInt()}%"
-            textSize = 12f
-            setTextColor(Color.rgb(225, 233, 243))
-            gravity = Gravity.CENTER
-            setPadding(dp(5), 0, 0, 0)
-        }
-        volumeHeader.addView(volumeLabel)
-        controls.addView(volumeHeader)
-        val volumeSlider = SeekBar(this).apply { max = 100; progress = (toneVolume * 100).roundToInt() }
-        controls.addView(volumeSlider, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(0, 0, 0, 0) })
-        volumeSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                toneVolume = progress / 100.0
-                volumeLabel.text = "$progress%"
+        scopeTimebaseButton.setOnClickListener {
+            val dialog = android.app.Dialog(this)
+            val content = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                styleNumericDialogCard(this)
             }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
-        })
+            content.addView(TextView(this).apply {
+                text = "Oscilloscope time scale"
+                textSize = 15f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setTextColor(Color.rgb(225, 233, 243))
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, dp(9))
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            val timebaseGrid = android.widget.GridLayout(this).apply {
+                columnCount = 3
+                rowCount = 3
+                useDefaultMargins = false
+            }
+            val timebaseOptions = listOf<Int?>(null, 1, 2, 5, 10, 20, 50, 100, 200)
+            timebaseOptions.forEachIndexed { index, milliseconds ->
+                val label = milliseconds?.let { "$it ms" } ?: "AUTO"
+                val optionButton = Button(this).apply {
+                    text = label
+                    textSize = 12f
+                    isAllCaps = false
+                    minWidth = 0
+                    minimumWidth = 0
+                    minHeight = dp(38)
+                    minimumHeight = dp(38)
+                    setPadding(dp(3), 0, dp(3), 0)
+                    setTextColor(Color.rgb(225, 233, 243))
+                    stateListAnimator = null
+                    setOnClickListener {
+                        selectedScopeTimebaseMs = milliseconds
+                        signalPreview.manualTimebaseMs = milliseconds
+                        refreshScopeTimebaseLabel()
+                        dialog.dismiss()
+                    }
+                }
+                styleNumericDialogButton(optionButton)
+                if (milliseconds == selectedScopeTimebaseMs) {
+                    optionButton.background = GradientDrawable().apply {
+                        setColor(Color.rgb(29, 105, 145))
+                        cornerRadius = dp(12).toFloat()
+                        setStroke(dp(1), Color.rgb(93, 173, 213))
+                    }
+                }
+                timebaseGrid.addView(optionButton, android.widget.GridLayout.LayoutParams().apply {
+                    width = dp(72)
+                    height = dp(38)
+                    setMargins(dp(3), dp(3), dp(3), dp(3))
+                    rowSpec = android.widget.GridLayout.spec(index / 3)
+                    columnSpec = android.widget.GridLayout.spec(index % 3)
+                })
+            }
+            content.addView(timebaseGrid, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            })
+            val closeButton = Button(this).apply {
+                text = "CLOSE"
+                textSize = 11f
+                setTextColor(Color.rgb(225, 233, 243))
+                setOnClickListener { dialog.dismiss() }
+            }
+            styleNumericDialogButton(closeButton)
+            content.addView(closeButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(38)).apply {
+                topMargin = dp(7)
+            })
+            dialog.setContentView(content)
+            requireExplicitDialogAction(dialog)
+            dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+            centerDialogOnScreen(dialog, dp(280))
+            dialog.show()
+        }
 
         var dtmfModeEnabled = false
-        val dtmfModeButton = Button(this).apply {
-            text = "DTMF"
-            contentDescription = "Open DTMF two-tone keypad"
-            textSize = 11f
-            minHeight = dp(36)
-            minimumHeight = dp(36)
-            setPadding(dp(6), 0, dp(6), 0)
-            styleXButton(this, primary = false)
+        val dtmfModeButton = AnalyzerIconButton(this, AnalyzerIconButton.Icon.DTMF).apply {
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = dp(38)
+            minimumHeight = dp(38)
+            setPadding(0, 0, 0, 0)
+            stateListAnimator = null
         }
         toneDtmfModeButton = dtmfModeButton
-        controls.addView(dtmfModeButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(36)).apply {
-            topMargin = dp(3)
-        })
 
         val outputChannelPreferences = getSharedPreferences("tone_generator", Context.MODE_PRIVATE)
         toneOutputChannel = outputChannelPreferences.getString("output_channel", "Stereo")
@@ -2529,8 +4701,25 @@ class MainActivity : Activity() {
         val outputChannelRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
+            setPadding(dp(8), 0, dp(8), 0)
         }
-        val outputChannelButtons = linkedMapOf<String, Button>()
+        val outputChannelButtons = linkedMapOf<String, AnalyzerIconButton>()
+        fun refreshDtmfModeButton() {
+            dtmfModeButton.background = GradientDrawable().apply {
+                setColor(if (dtmfModeEnabled) Color.rgb(39, 113, 147) else Color.rgb(22, 32, 45))
+                cornerRadius = dp(10).toFloat()
+                setStroke(dp(1), if (dtmfModeEnabled) Color.rgb(93, 173, 213) else Color.rgb(56, 73, 91))
+            }
+            dtmfModeButton.contentDescription = if (dtmfModeEnabled) {
+                "Return to single tone controls"
+            } else {
+                "Open DTMF two-tone keypad"
+            }
+        }
+        refreshDtmfModeButton()
+        outputChannelRow.addView(dtmfModeButton, LinearLayout.LayoutParams(0, dp(38), 1f).apply {
+            marginEnd = dp(4)
+        })
         fun refreshOutputChannelButtons() {
             outputChannelButtons.forEach { (channel, button) ->
                 val selected = channel == toneOutputChannel
@@ -2542,15 +4731,17 @@ class MainActivity : Activity() {
                 button.contentDescription = if (selected) "$channel audio output selected" else "Select $channel audio output"
             }
         }
-        listOf("Left", "Right", "Stereo").forEachIndexed { index, channel ->
-            val channelButton = Button(this).apply {
-                text = channel.uppercase(java.util.Locale.ROOT)
-                textSize = 10f
-                isAllCaps = false
-                minHeight = dp(32)
-                minimumHeight = dp(32)
-                setPadding(dp(3), 0, dp(3), 0)
-                setTextColor(Color.WHITE)
+        listOf(
+            "Left" to AnalyzerIconButton.Icon.OUTPUT_LEFT,
+            "Right" to AnalyzerIconButton.Icon.OUTPUT_RIGHT,
+            "Stereo" to AnalyzerIconButton.Icon.OUTPUT_STEREO
+        ).forEachIndexed { index, (channel, channelIcon) ->
+            val channelButton = AnalyzerIconButton(this, channelIcon).apply {
+                minWidth = 0
+                minimumWidth = 0
+                minHeight = dp(38)
+                minimumHeight = dp(38)
+                setPadding(0, 0, 0, 0)
                 stateListAnimator = null
                 setOnClickListener {
                     toneOutputChannel = channel
@@ -2559,28 +4750,19 @@ class MainActivity : Activity() {
                 }
             }
             outputChannelButtons[channel] = channelButton
-            outputChannelRow.addView(channelButton, LinearLayout.LayoutParams(0, dp(32), 1f).apply {
+            outputChannelRow.addView(channelButton, LinearLayout.LayoutParams(0, dp(38), 1f).apply {
                 if (index > 0) marginStart = dp(4)
             })
         }
         refreshOutputChannelButtons()
-        controls.addView(outputChannelRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(32)).apply {
-            topMargin = dp(3)
-        })
-
-        val dtmfInfo = TextView(this).apply {
-            textSize = 12f
-            setTextColor(Color.rgb(225, 233, 243))
-            gravity = Gravity.CENTER
-            visibility = View.GONE
-            contentDescription = "Selected DTMF symbol and its two frequencies"
-        }
-        controls.addView(dtmfInfo, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(22)))
 
         val dtmfGrid = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             visibility = View.GONE
+            setPadding(0, dp(2), 0, dp(2))
+            clipChildren = false
+            clipToPadding = false
         }
         val dtmfKeyButtons = linkedMapOf<String, Button>()
         val dtmfLowFrequencies = intArrayOf(697, 770, 852, 941)
@@ -2591,6 +4773,15 @@ class MainActivity : Activity() {
             arrayOf("7", "8", "9"),
             arrayOf("*", "0", "#")
         )
+        fun updateDtmfFrequencyCell() {
+            valueLabel.text = "DTMF ${toneDtmfSelectedKey} · ${toneDtmfLowFrequency}+${toneDtmfHighFrequency} Hz"
+            valueLabel.textSize = 12f
+            valueLabel.contentDescription = "DTMF ${toneDtmfSelectedKey}, ${toneDtmfLowFrequency} and ${toneDtmfHighFrequency} hertz"
+            signalPreview.dtmfLowFrequency = toneDtmfLowFrequency
+            signalPreview.dtmfHighFrequency = toneDtmfHighFrequency
+            signalPreview.dtmfMode = dtmfModeEnabled
+            refreshScopeTimebaseLabel()
+        }
         var refreshDtmfKeySelection: () -> Unit = {}
         dtmfKeys.forEachIndexed { rowIndex, rowKeys ->
             val row = LinearLayout(this).apply {
@@ -2600,12 +4791,12 @@ class MainActivity : Activity() {
             rowKeys.forEachIndexed { columnIndex, key ->
                 val keyButton = Button(this).apply {
                     text = key
-                    textSize = 15f
+                    textSize = 16f
                     isAllCaps = false
                     minWidth = 0
                     minimumWidth = 0
-                    minHeight = dp(36)
-                    minimumHeight = dp(36)
+                    minHeight = dp(28)
+                    minimumHeight = dp(28)
                     setPadding(0, 0, 0, 0)
                     setTextColor(Color.WHITE)
                     stateListAnimator = null
@@ -2619,18 +4810,17 @@ class MainActivity : Activity() {
                         toneDtmfLowFrequency = dtmfLowFrequencies[rowIndex]
                         toneDtmfHighFrequency = dtmfHighFrequencies[columnIndex]
                         toneDtmfActive = dtmfModeEnabled
-                        dtmfInfo.text = "$key  ·  ${toneDtmfLowFrequency} + ${toneDtmfHighFrequency} Hz"
-                        valueLabel.text = "DTMF $key"
+                        updateDtmfFrequencyCell()
                         refreshDtmfKeySelection()
                     }
                 }
                 keyButton.contentDescription = "DTMF $key: ${dtmfLowFrequencies[rowIndex]} and ${dtmfHighFrequencies[columnIndex]} hertz"
                 dtmfKeyButtons[key] = keyButton
-                row.addView(keyButton, LinearLayout.LayoutParams(0, dp(38), 1f).apply {
+                row.addView(keyButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
                     setMargins(dp(3), dp(1), dp(3), dp(1))
                 })
             }
-            dtmfGrid.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
+            dtmfGrid.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(36)))
         }
         refreshDtmfKeySelection = {
             dtmfKeyButtons.forEach { (key, button) ->
@@ -2642,9 +4832,14 @@ class MainActivity : Activity() {
                 }
             }
         }
-        dtmfInfo.text = "1  ·  697 + 1209 Hz"
         refreshDtmfKeySelection()
         controls.addView(dtmfGrid, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        // Keep DTMF and output channel buttons at the bottom of the whole panel,
+        // outside the DTMF keypad area.
+        controls.addView(outputChannelRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)).apply {
+            topMargin = dp(6)
+            bottomMargin = dp(2)
+        })
 
         fun updateDtmfMode(enabled: Boolean) {
             if (enabled == dtmfModeEnabled) return
@@ -2653,48 +4848,66 @@ class MainActivity : Activity() {
             if (tonePlaying) stopTone()
             dtmfModeEnabled = enabled
             toneDtmfActive = enabled
-            valueLabel.text = if (enabled) "DTMF ${toneDtmfSelectedKey}" else "$toneFrequency Hz"
-            valueLabel.textSize = if (enabled) 13f else 18f
+            valueLabelParams.width = if (enabled) dp(180) else dp(96)
+            if (enabled) updateDtmfFrequencyCell() else {
+                valueLabel.text = "$toneFrequency Hz"
+                valueLabel.textSize = 18f
+                valueLabel.contentDescription = if (tonePeakFollowEnabled) {
+                    "Peak hold: $toneFrequency hertz. The strongest detected tonal peak refreshes every five seconds and remains selected if it disappears."
+                } else "Select tone frequency"
+            }
+            valueLabel.requestLayout()
             valueLabel.isClickable = !enabled
             valueLabel.isEnabled = true
-            valueLabel.contentDescription = if (enabled) "Selected DTMF key $toneDtmfSelectedKey" else "Select tone frequency"
             presetsButton.visibility = if (enabled) View.GONE else View.VISIBLE
             waveCell.visibility = if (enabled) View.GONE else View.VISIBLE
-            slider.visibility = if (enabled) View.GONE else View.VISIBLE
             sweepSettingsRow.visibility = if (enabled) View.GONE else View.VISIBLE
-            dtmfInfo.visibility = if (enabled) View.VISIBLE else View.GONE
             dtmfGrid.visibility = if (enabled) View.VISIBLE else View.GONE
-            dtmfModeButton.text = if (enabled) "SINGLE TONE" else "DTMF"
-            dtmfModeButton.contentDescription = if (enabled) "Return to single tone controls" else "Open DTMF two-tone keypad"
-            styleXButton(dtmfModeButton, primary = enabled)
+            refreshDtmfModeButton()
             resetTonePlayButton()
-            if (!enabled) toneSweepUiUpdate?.invoke()
+            toneSweepUiUpdate?.invoke()
         }
         dtmfModeButton.setOnClickListener { updateDtmfMode(!dtmfModeEnabled) }
 
-        fun updateToneSliderFromFrequency() {
+        fun updateToneControlsFromScope() {
+            signalPreview.waveform = toneWaveform
+            signalPreview.frequency = toneFrequency
+            signalPreview.volume = toneVolume.toFloat()
+            signalPreview.playing = tonePlaying
+            signalPreview.sweepActive = toneSweepActive
+            signalPreview.dtmfMode = dtmfModeEnabled
+            signalPreview.dtmfLowFrequency = toneDtmfLowFrequency
+            signalPreview.dtmfHighFrequency = toneDtmfHighFrequency
+            refreshScopeTimebaseLabel()
+            val low = toneMinFrequency.coerceIn(20, 19999)
+            val high = toneMaxFrequency.coerceIn(low + 1, 20000)
+            signalPreview.minimumFrequency = low
+            signalPreview.maximumFrequency = high
             val noiseSelected = isNoiseTone()
             val selectedToneControlsEnabled = !noiseSelected && !toneSweepActive && !dtmfModeEnabled
+            signalPreview.frequencyControlEnabled = selectedToneControlsEnabled
+            // The scope remains touchable in every mode so vertical drags can adjust volume.
+            signalPreview.isEnabled = true
             if (dtmfModeEnabled) {
                 valueLabel.isEnabled = true
-                slider.isEnabled = false
                 presetsButton.isEnabled = false
                 sweepButton.isEnabled = false
                 toneWaveformButton?.isEnabled = false
                 toneSweepRangeButton?.isEnabled = false
                 toneSweepDurationButton?.isEnabled = false
                 toneSweepDirectionButton?.isEnabled = false
+                toneSweepScaleButton?.isEnabled = false
                 toneDtmfModeButton?.isEnabled = !toneSweepActive
                 return
             }
             valueLabel.isEnabled = !noiseSelected
-            slider.isEnabled = !noiseSelected
             presetsButton.isEnabled = !noiseSelected
             sweepButton.isEnabled = !noiseSelected
             toneWaveformButton?.isEnabled = !toneSweepActive
             toneSweepRangeButton?.isEnabled = selectedToneControlsEnabled
             toneSweepDurationButton?.isEnabled = selectedToneControlsEnabled
             toneSweepDirectionButton?.isEnabled = selectedToneControlsEnabled
+            toneSweepScaleButton?.isEnabled = selectedToneControlsEnabled
             toneDtmfModeButton?.isEnabled = !toneSweepActive
             if (noiseSelected) {
                 valueLabel.text = if (toneWaveform == "White noise") "WHITE" else "PINK"
@@ -2703,10 +4916,7 @@ class MainActivity : Activity() {
                 if (!tonePlaying) tonePlayButton?.contentDescription = "Play ${toneWaveform.lowercase()}"
                 return
             }
-            val low = toneMinFrequency.coerceAtLeast(20)
-            val high = toneMaxFrequency.coerceAtMost(20000).coerceAtLeast(low + 1)
             toneFrequency = toneFrequency.coerceIn(low, high)
-            slider.progress = ((kotlin.math.ln(toneFrequency / low.toDouble()) / kotlin.math.ln(high / low.toDouble())) * slider.max).roundToInt().coerceIn(0, slider.max)
             valueLabel.text = "$toneFrequency Hz"
             valueLabel.textSize = 18f
             valueLabel.contentDescription = if (tonePeakFollowEnabled) {
@@ -2714,8 +4924,13 @@ class MainActivity : Activity() {
             } else "Select tone frequency"
             if (!tonePlaying) tonePlayButton?.contentDescription = "Play selected tone"
         }
-        toneSweepUiUpdate = ::updateToneSliderFromFrequency
-        updateToneSliderFromFrequency()
+        toneSweepUiUpdate = ::updateToneControlsFromScope
+        signalPreview.onFrequencyChanged = { selectedFrequency ->
+            setTonePeakFollowEnabled(false, refreshUi = false)
+            toneFrequency = selectedFrequency
+            updateToneControlsFromScope()
+        }
+        updateToneControlsFromScope()
         valueLabel.setOnClickListener {
             // Use the same custom numeric keypad as the Spectrum Analyzer.
             // Confirming a value only updates the frequency; it never starts playback.
@@ -2723,27 +4938,10 @@ class MainActivity : Activity() {
             val content = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
-                setPadding(dp(12), dp(10), dp(12), dp(10))
-                background = GradientDrawable().apply {
-                    setColor(Color.rgb(24, 31, 42))
-                    cornerRadius = dp(22).toFloat()
-                    setStroke(dp(1), Color.rgb(49, 66, 83))
-                }
+                styleNumericDialogCard(this)
             }
-            content.addView(TextView(this).apply {
-                text = "Frequency (Hz)"
-                textSize = 14f
-                setTextColor(Color.rgb(225, 233, 243))
-                gravity = Gravity.CENTER
-                setPadding(0, 0, 0, dp(6))
-            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-
             val display = EditText(this).apply {
                 setText(toneFrequency.toString())
-                textSize = 22f
-                setTextColor(Color.rgb(255, 213, 90))
-                gravity = Gravity.CENTER
-                setPadding(dp(8), dp(4), dp(8), dp(8))
                 minWidth = dp(160)
                 inputType = android.text.InputType.TYPE_CLASS_NUMBER
                 isSingleLine = true
@@ -2751,13 +4949,9 @@ class MainActivity : Activity() {
                 isFocusableInTouchMode = true
                 isCursorVisible = true
                 setSelection(text.length)
-                background = GradientDrawable().apply {
-                    setColor(Color.rgb(15, 23, 36))
-                    cornerRadius = dp(14).toFloat()
-                    setStroke(dp(1), Color.rgb(67, 91, 119))
-                }
+                styleNumericDialogInput(this)
             }
-            content.addView(display, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            content.addView(display, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)))
 
             val keypad = android.widget.GridLayout(this).apply {
                 columnCount = 3
@@ -2816,20 +5010,29 @@ class MainActivity : Activity() {
             key("CLR") { display.setText(""); display.setSelection(0) }
             content.addView(keypad, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 gravity = Gravity.CENTER_HORIZONTAL
+                topMargin = dp(5)
+                bottomMargin = dp(5)
             })
 
             val actions = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER
+                setPadding(0, dp(2), 0, dp(6))
             }
             val cancelButton = Button(this).apply {
                 text = "CANCEL"
                 textSize = 11f
+                minHeight = dp(36)
+                minimumHeight = dp(36)
+                includeFontPadding = false
                 setOnClickListener { dialog.dismiss() }
             }
             val doneButton = Button(this).apply {
                 text = "DONE"
                 textSize = 11f
+                minHeight = dp(36)
+                minimumHeight = dp(36)
+                includeFontPadding = false
                 setOnClickListener {
                     val frequency = display.text.toString().toIntOrNull()
                     if (frequency == null || frequency !in 20..20000) {
@@ -2837,7 +5040,7 @@ class MainActivity : Activity() {
                     } else {
                         setTonePeakFollowEnabled(false, refreshUi = false)
                         toneFrequency = frequency
-                        updateToneSliderFromFrequency()
+                        updateToneControlsFromScope()
                         dialog.dismiss()
                     }
                 }
@@ -2845,41 +5048,46 @@ class MainActivity : Activity() {
             for (button in listOf(cancelButton, doneButton)) {
                 styleNumericDialogButton(button)
                 button.setTextColor(Color.rgb(255, 213, 90))
-                actions.addView(button, LinearLayout.LayoutParams(0, dp(42), 1f).apply {
-                    setMargins(dp(3), dp(5), dp(3), 0)
+                actions.addView(button, LinearLayout.LayoutParams(0, dp(38), 1f).apply {
+                    setMargins(dp(3), dp(2), dp(3), 0)
                 })
             }
-            content.addView(actions, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            dialog.setContentView(content)
+            content.addView(actions, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)).apply {
+                topMargin = dp(2)
+                bottomMargin = dp(2)
+            })
+            setDialogCardContent(dialog, content)
+            requireExplicitDialogAction(dialog)
             dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
-            centerDialogOnScreen(dialog, dp(220))
+            centerDialogOnScreen(dialog, dp(260), height = dp(360))
             dialog.show()
             display.requestFocus()
             display.setSelection(display.text.length)
         }
-        slider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (fromUser) {
-                    setTonePeakFollowEnabled(false, refreshUi = false)
-                    val low = toneMinFrequency.coerceAtLeast(20)
-                    val high = toneMaxFrequency.coerceAtMost(20000).coerceAtLeast(low + 1)
-                    toneFrequency = (low * kotlin.math.exp(progress.toDouble() / slider.max * kotlin.math.ln(high.toDouble() / low))).roundToInt().coerceIn(low, high)
-                }
-                valueLabel.text = "$toneFrequency Hz"
-                if (!tonePeakFollowEnabled) valueLabel.contentDescription = "Select tone frequency"
-            }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
-        })
         return panel
     }
 
-    private fun centerDialogOnScreen(dialog: Dialog, width: Int, horizontalOffsetDp: Int = -19) {
+    private fun setDialogCardContent(dialog: Dialog, card: View) {
+        dialog.setContentView(
+            card,
+            ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        )
+    }
+
+    private fun centerDialogOnScreen(
+        dialog: Dialog,
+        width: Int,
+        horizontalOffsetDp: Int = -19,
+        height: Int = ViewGroup.LayoutParams.WRAP_CONTENT
+    ) {
         val window = dialog.window ?: return
         val horizontalOffset = (horizontalOffsetDp * resources.displayMetrics.density).roundToInt()
+        val maxHeight = (resources.displayMetrics.heightPixels -
+                (24f * resources.displayMetrics.density).roundToInt()).coerceAtLeast(1)
+        val targetHeight = if (height > 0) minOf(height, maxHeight) else ViewGroup.LayoutParams.WRAP_CONTENT
         fun applyCenter() {
             window.setGravity(Gravity.CENTER)
-            window.setLayout(width, ViewGroup.LayoutParams.WRAP_CONTENT)
+            window.setLayout(width, targetHeight)
             window.attributes = window.attributes.apply {
                 gravity = Gravity.CENTER
                 x = horizontalOffset
@@ -2944,7 +5152,25 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun decodePlayStopBitmap(resourceId: Int): android.graphics.Bitmap {
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeResource(resources, resourceId, bounds)
+        val targetPixels = (50f * resources.displayMetrics.density).roundToInt().coerceAtLeast(96)
+        val longestSide = maxOf(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
+        var sampleSize = 1
+        while (longestSide / (sampleSize * 2) >= targetPixels) sampleSize *= 2
+        val options = android.graphics.BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+        }
+        return checkNotNull(android.graphics.BitmapFactory.decodeResource(resources, resourceId, options)) {
+            "Could not load tone transport icon."
+        }
+    }
+
     private fun setTonePlayButtonPlaying(playing: Boolean) {
+        toneSignalPreview?.playing = playing
+        toneSignalPreview?.sweepActive = toneSweepActive
         val button = tonePlayButton as? AnalyzerIconButton ?: return
         button.icon = if (playing) AnalyzerIconButton.Icon.STOP else AnalyzerIconButton.Icon.PLAY
         button.contentDescription = when {
@@ -2955,9 +5181,11 @@ class MainActivity : Activity() {
             isNoiseTone() -> "Play ${toneWaveform.lowercase()}"
             else -> "Play selected tone"
         }
-        button.backgroundTintList = android.content.res.ColorStateList.valueOf(
-            if (playing) Color.rgb(150, 40, 45) else Color.rgb(29, 125, 65)
-        )
+        if (!button.usePlayStopImages) {
+            button.backgroundTintList = android.content.res.ColorStateList.valueOf(
+                if (playing) Color.rgb(150, 40, 45) else Color.rgb(29, 125, 65)
+            )
+        }
     }
 
     private fun resetTonePlayButton() {
@@ -2984,6 +5212,7 @@ class MainActivity : Activity() {
             toneThread = Thread {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
                 val buffer = ShortArray(2048)
+                val previewSamples = ShortArray(buffer.size / 2)
                 var phase = 0.0
                 var secondPhase = 0.0
                 var noiseState = System.nanoTime().toInt().let { if (it == 0) 1 else it }
@@ -3042,6 +5271,7 @@ class MainActivity : Activity() {
                             fadeRemaining--
                         }
                         val sample = (normalized.coerceIn(-1.0, 1.0) * 12000.0 * volume * envelope).toInt().toShort()
+                        previewSamples[frameIndex] = sample
                         val leftIndex = frameIndex * 2
                         val rightIndex = leftIndex + 1
                         when (outputChannel) {
@@ -3063,7 +5293,14 @@ class MainActivity : Activity() {
                         secondPhase += secondStep
                         if (secondPhase >= 2.0 * PI) secondPhase -= 2.0 * PI
                     }
-                    try { track.write(buffer, 0, buffer.size) } catch (_: Exception) { break }
+                    try {
+                        val writtenShorts = track.write(buffer, 0, buffer.size)
+                        if (writtenShorts > 0) {
+                            tonePreviewPcmFrame.publish(previewSamples, writtenShorts / 2)
+                        }
+                    } catch (_: Exception) {
+                        break
+                    }
                     if (toneStopRequested && fadeRemaining <= 0) break
                 }
                 try { track.pause(); track.flush(); track.stop() } catch (_: Exception) {}
@@ -3093,14 +5330,29 @@ class MainActivity : Activity() {
         // The audio thread performs a short fade-out before releasing AudioTrack.
     }
 
+    private fun applyToneSweepButtonStyle(active: Boolean) {
+        toneSignalPreview?.sweepActive = active
+        val button = toneSweepButton ?: return
+        val density = resources.displayMetrics.density
+        button.backgroundTintList = null
+        button.background = GradientDrawable().apply {
+            setColor(if (active) Color.rgb(29, 105, 145) else Color.rgb(22, 32, 45))
+            cornerRadius = 11f * density
+            setStroke(
+                (2f * density).roundToInt(),
+                if (active) Color.rgb(137, 207, 238) else Color.rgb(103, 128, 153)
+            )
+        }
+    }
     private fun cancelToneSweep() {
         toneSweepActive = false
         toneSweepHandler.removeCallbacks(toneSweepRunnable)
         toneSweepButton?.contentDescription = "Play frequency sweep"
-        toneSweepButton?.backgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(22, 32, 45))
+        applyToneSweepButtonStyle(active = false)
         toneSweepRangeButton?.isEnabled = true
         toneSweepDurationButton?.isEnabled = true
         toneSweepDirectionButton?.isEnabled = true
+        toneSweepScaleButton?.isEnabled = true
         toneDtmfModeButton?.isEnabled = true
         toneWaveformButton?.isEnabled = true
         toneSweepUiUpdate?.invoke()
@@ -3121,15 +5373,106 @@ class MainActivity : Activity() {
         button.stateListAnimator = null
     }
 
+    private fun createPianoReverbButton(): ImageButton = ImageButton(this).apply {
+        val density = resources.displayMetrics.density
+        scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+        setPadding((6f * density).roundToInt(), (6f * density).roundToInt(), (6f * density).roundToInt(), (6f * density).roundToInt())
+        setMinimumWidth(0)
+        setMinimumHeight(0)
+        backgroundTintList = null
+        imageTintList = null
+        stateListAnimator = null
+        updatePianoReverbButtonAppearance(this)
+        setOnClickListener {
+            pianoReverbEnabled = !pianoReverbEnabled
+            updatePianoReverbButtons()
+        }
+    }
+
+    private fun updatePianoReverbButtons() {
+        pianoReverbButton?.let(::updatePianoReverbButtonAppearance)
+        fullScalePianoReverbButton?.let(::updatePianoReverbButtonAppearance)
+    }
+
+    private fun updatePianoReverbButtonAppearance(button: ImageButton) {
+        button.setImageResource(
+            if (pianoReverbEnabled) R.drawable.ic_reverb_on_custom
+            else R.drawable.ic_reverb_off_custom
+        )
+        button.contentDescription = if (pianoReverbEnabled) {
+            "Reverb on; tap to turn off"
+        } else {
+            "Reverb off; tap to turn on"
+        }
+        button.background = GradientDrawable().apply {
+            cornerRadius = 13f * resources.displayMetrics.density
+            setColor(if (pianoReverbEnabled) Color.rgb(29, 155, 240) else Color.rgb(22, 32, 42))
+        }
+    }
+
+    private fun styleFlatToolbarButton(button: Button) {
+        button.background = android.graphics.drawable.RippleDrawable(
+            android.content.res.ColorStateList.valueOf(Color.rgb(38, 54, 70)),
+            android.graphics.drawable.ColorDrawable(Color.rgb(15, 23, 36)),
+            null
+        )
+        button.backgroundTintList = null
+        button.stateListAnimator = null
+    }
+
     private fun styleNumericDialogButton(button: Button) {
         val density = resources.displayMetrics.density
         button.background = GradientDrawable().apply {
             setColor(Color.rgb(49, 63, 81))
-            cornerRadius = 10f * density
+            cornerRadius = 12f * density
             setStroke((density).roundToInt().coerceAtLeast(1), Color.rgb(72, 91, 111))
         }
         button.backgroundTintList = null
         button.stateListAnimator = null
+    }
+
+    private fun styleNumericDialogCard(card: LinearLayout) {
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).roundToInt()
+        card.setPadding(dp(12), dp(10), dp(12), dp(10))
+        card.background = GradientDrawable().apply {
+            setColor(Color.rgb(24, 31, 42))
+            cornerRadius = dp(22).toFloat()
+            setStroke(dp(1), Color.rgb(49, 66, 83))
+        }
+    }
+
+    private fun styleNumericDialogInput(
+        input: EditText,
+        textSizeSp: Float = 20f,
+        focused: Boolean = false,
+        verticalPaddingDp: Int = 2
+    ) {
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).roundToInt()
+        input.textSize = textSizeSp
+        input.setTextColor(Color.rgb(255, 213, 90))
+        input.gravity = Gravity.CENTER
+        input.setPadding(dp(8), dp(verticalPaddingDp), dp(8), dp(verticalPaddingDp))
+        input.backgroundTintList = null
+        input.background = GradientDrawable().apply {
+            setColor(Color.rgb(15, 23, 36))
+            cornerRadius = dp(12).toFloat()
+            setStroke(dp(if (focused) 2 else 1), if (focused) Color.rgb(255, 213, 90) else Color.rgb(67, 91, 119))
+        }
+    }
+
+    private fun requireExplicitDialogAction(dialog: Dialog) {
+        dialog.setCancelable(false)
+        dialog.setCanceledOnTouchOutside(false)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun installedAppVersionName(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName
+            ?.takeIf { it.isNotBlank() } ?: "Unknown"
+    } catch (_: Exception) {
+        "Unknown"
     }
 
     private fun configureSpectrumHeader() {
@@ -3158,13 +5501,13 @@ class MainActivity : Activity() {
             dp(26),
             (22f * resources.configuration.fontScale * resources.displayMetrics.density).roundToInt()
         )
-        spectrumHeaderCompactHeightPx = headerHeight
         parent.removeView(title)
         headerTitleText = null
         title.visibility = View.GONE
 
         val header = android.widget.FrameLayout(this).apply {
             setPadding(0, 0, 0, 0)
+            setBackgroundColor(Color.rgb(15, 23, 36))
         }
         spectrumHeader = header
         // The title is intentionally removed; the peak readout remains in this header.
@@ -3172,10 +5515,7 @@ class MainActivity : Activity() {
         fun frequencyInput(initialValue: String, description: String): EditText = EditText(this).apply {
             setText(initialValue)
             contentDescription = description
-            textSize = 13f
-            setTextColor(Color.rgb(255, 213, 90))
             setHintTextColor(Color.rgb(150, 160, 175))
-            gravity = Gravity.CENTER
             inputType = InputType.TYPE_CLASS_NUMBER
             filters = arrayOf(InputFilter.LengthFilter(5))
             setSingleLine(true)
@@ -3183,12 +5523,7 @@ class MainActivity : Activity() {
             isFocusableInTouchMode = true
             isCursorVisible = true
             showSoftInputOnFocus = false
-            setPadding(dp(8), 0, dp(8), 0)
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(17, 25, 36))
-                cornerRadius = dp(12).toFloat()
-                setStroke(dp(1), Color.rgb(90, 105, 124))
-            }
+            styleNumericDialogInput(this, textSizeSp = 13f, verticalPaddingDp = 0)
         }
 
         val minFrequencyInput = frequencyInput("20", "Minimum frequency in Hz")
@@ -3200,11 +5535,7 @@ class MainActivity : Activity() {
         fun selectRangeInput(input: EditText) {
             selectedRangeInput = input
             listOf(minFrequencyInput, maxFrequencyInput).forEach { field ->
-                field.background = GradientDrawable().apply {
-                    setColor(Color.rgb(17, 25, 36))
-                    cornerRadius = dp(12).toFloat()
-                    setStroke(dp(if (field === input) 2 else 1), if (field === input) Color.rgb(255, 213, 90) else Color.rgb(90, 105, 124))
-                }
+                styleNumericDialogInput(field, textSizeSp = 13f, focused = field === input, verticalPaddingDp = 0)
             }
             input.requestFocus()
         }
@@ -3227,12 +5558,7 @@ class MainActivity : Activity() {
         val rangeContent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(24, 31, 42))
-                cornerRadius = dp(22).toFloat()
-                setStroke(dp(1), Color.rgb(49, 66, 83))
-            }
+            styleNumericDialogCard(this)
         }
 
         val rangeFields = LinearLayout(this).apply {
@@ -3253,7 +5579,7 @@ class MainActivity : Activity() {
             textSize = 18f
             setTextColor(Color.rgb(225, 233, 243))
             gravity = Gravity.CENTER
-        }, LinearLayout.LayoutParams(dp(24), dp(60)))
+        }, LinearLayout.LayoutParams(dp(24), dp(48)))
         addRangeField(maxFrequencyInput)
         rangeContent.addView(rangeFields, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         val rangeKeypad = android.widget.GridLayout(this).apply {
@@ -3311,7 +5637,9 @@ class MainActivity : Activity() {
         }
         addRangeKey("0") { appendRangeDigit("0") }
         addRangeKey("CLR") { selectedRangeInput.setText(""); selectedRangeInput.setSelection(0) }
-        rangeContent.addView(rangeKeypad, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(0, dp(4), 0, 0) })
+        rangeContent.addView(rangeKeypad, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            setMargins(0, dp(5), 0, dp(5))
+        })
 
         val rangeActions = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -3323,26 +5651,55 @@ class MainActivity : Activity() {
             textSize = 11f
             setOnClickListener { rangeDialog.dismiss() }
         }
-        val rangeInfoButton = TextView(this).apply {
-            text = "ⓘ"
-            textSize = 19f
-            gravity = Gravity.CENTER
-            setTextColor(Color.rgb(255, 213, 90))
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(49, 63, 81))
-                cornerRadius = dp(10).toFloat()
-                setStroke(dp(1), Color.rgb(72, 91, 111))
-            }
+        val rangeInfoIcon = android.graphics.BitmapFactory.decodeResource(
+            resources,
+            R.drawable.ic_information_white,
+            android.graphics.BitmapFactory.Options().apply { inSampleSize = 8 }
+        )
+        val rangeInfoButton = android.widget.ImageButton(this).apply {
+            setImageBitmap(rangeInfoIcon)
+            scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+            setPadding(dp(7), dp(7), dp(7), dp(7))
+            background = android.graphics.drawable.ColorDrawable(Color.rgb(24, 31, 42))
+            backgroundTintList = null
+            stateListAnimator = null
+            minimumWidth = 0
+            minimumHeight = 0
             contentDescription = "Frequency range information"
             setOnClickListener {
-                val infoDialog = AlertDialog.Builder(this@MainActivity)
-                    .setTitle("Frequency range")
-                    .setMessage("Enter the minimum and maximum frequencies in Hz, from 0 to 20000. The minimum must be lower than the maximum. Press DONE to apply the range. The sampling rate remains 48 kHz; analysis is limited to 20 kHz.")
-                    .setPositiveButton("OK", null)
-                    .create()
-                infoDialog.setOnShowListener {
-                    infoDialog.getButton(AlertDialog.BUTTON_POSITIVE)?.let(::styleNumericDialogButton)
+                val infoDialog = android.app.Dialog(this@MainActivity)
+                val infoCard = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.START
+                    styleNumericDialogCard(this)
+                    setPadding(dp(18), dp(16), dp(18), dp(14))
                 }
+                infoCard.addView(TextView(this@MainActivity).apply {
+                    text = "Enter frequencies in Hz from 0 to 20,000. The minimum must be lower than the maximum. Analysis is limited to 20 kHz with the 48 kHz sampling rate."
+                    textSize = 14f
+                    setTextColor(Color.rgb(210, 220, 232))
+                    gravity = Gravity.START
+                    justificationMode = android.graphics.text.LineBreaker.JUSTIFICATION_MODE_INTER_WORD
+                    setLineSpacing(dp(3).toFloat(), 1f)
+                    includeFontPadding = false
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+                val infoOkButton = Button(this@MainActivity).apply {
+                    text = "OK"
+                    textSize = 13f
+                    setTextColor(Color.rgb(255, 213, 90))
+                    setOnClickListener { infoDialog.dismiss() }
+                }
+                styleNumericDialogButton(infoOkButton)
+                infoCard.addView(infoOkButton, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(42)
+                ).apply { topMargin = dp(16) })
+                setDialogCardContent(infoDialog, infoCard)
+                requireExplicitDialogAction(infoDialog)
+                infoDialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+                val infoDialogWidth = minOf(dp(360), (resources.displayMetrics.widthPixels - dp(32)).coerceAtLeast(dp(220)))
+                centerDialogOnScreen(infoDialog, infoDialogWidth)
                 infoDialog.show()
             }
         }
@@ -3372,13 +5729,16 @@ class MainActivity : Activity() {
         rangeActions.addView(rangeInfoButton, LinearLayout.LayoutParams(dp(42), dp(42)))
         rangeActions.addView(applyRangeButton, LinearLayout.LayoutParams(0, dp(42), 1f))
         rangeContent.addView(rangeActions, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        rangeDialog.setContentView(rangeContent)
+        setDialogCardContent(rangeDialog, rangeContent)
+        requireExplicitDialogAction(rangeDialog)
         rangeDialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
 
         val initialRange = spectrumView.getVisibleFrequencyRangeHz()
         val rangeButton = Button(this).apply {
             text = "(${initialRange.first}–${initialRange.second} Hz)"
             textSize = 14f
+            setSingleLine(true)
+            maxLines = 1
             minHeight = dp(42)
             minimumHeight = dp(42)
             setPadding(dp(14), 0, dp(14), 0)
@@ -3390,12 +5750,13 @@ class MainActivity : Activity() {
                 minFrequencyInput.setText(minHz.toString())
                 maxFrequencyInput.setText(maxHz.toString())
                 selectRangeInput(minFrequencyInput)
-                centerDialogOnScreen(rangeDialog, dp(300))
+                centerDialogOnScreen(rangeDialog, dp(260), height = dp(360))
                 rangeDialog.show()
             }
         }
         rangePickerButton = rangeButton
         styleXButton(rangeButton, primary = false)
+        styleFlatToolbarButton(rangeButton)
         rangeButton.isAllCaps = false
         rangeButton.setTextColor(Color.rgb(255, 213, 90))
         rangeButton.textSize = 14f
@@ -3406,9 +5767,12 @@ class MainActivity : Activity() {
             rangeButton.text = "($minHz–$maxHz Hz)"
             val width = rangeButton.paint.measureText(rangeButton.text.toString()).roundToInt() +
                     rangeButton.paddingLeft + rangeButton.paddingRight + dp(4)
-            val params = rangeButton.layoutParams as android.widget.FrameLayout.LayoutParams
+            val params = rangeButton.layoutParams
             params.width = width
-            params.gravity = Gravity.CENTER
+            when (params) {
+                is android.widget.FrameLayout.LayoutParams -> params.gravity = Gravity.CENTER
+                is LinearLayout.LayoutParams -> params.gravity = Gravity.CENTER_VERTICAL
+            }
             rangeButton.layoutParams = params
         }
         // Keep SPL at the upper-left and peak information at the upper-right of the graph header.
@@ -3445,56 +5809,275 @@ class MainActivity : Activity() {
             contentDescription = "Show enlarged SPL estimate"
             setOnClickListener { showSplDetailDialog() }
         }
+        val appVersionInfoButton = android.widget.ImageButton(this).apply {
+            val infoBitmap = android.graphics.BitmapFactory.decodeResource(
+                resources,
+                R.drawable.ic_information_white,
+                android.graphics.BitmapFactory.Options().apply { inSampleSize = 8 }
+            )
+            setImageBitmap(infoBitmap)
+            scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+            setPadding(dp(2), dp(2), dp(2), dp(2))
+            background = android.graphics.drawable.ColorDrawable(Color.rgb(15, 23, 36))
+            backgroundTintList = null
+            stateListAnimator = null
+            minimumWidth = 0
+            minimumHeight = 0
+            contentDescription = "Application version information"
+            setOnClickListener {
+                val versionDialog = android.app.Dialog(this@MainActivity)
+                val versionCard = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    styleNumericDialogCard(this)
+                    setPadding(dp(20), dp(18), dp(20), dp(16))
+                }
+                versionCard.addView(TextView(this@MainActivity).apply {
+                    text = "Spectrum Analyzer 2"
+                    textSize = 18f
+                    setTypeface(null, android.graphics.Typeface.BOLD)
+                    setTextColor(Color.rgb(255, 213, 90))
+                    gravity = Gravity.CENTER
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+                versionCard.addView(TextView(this@MainActivity).apply {
+                    text = "Version ${installedAppVersionName()}"
+                    textSize = 15f
+                    setTextColor(Color.rgb(210, 220, 232))
+                    gravity = Gravity.CENTER
+                    includeFontPadding = false
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(10) })
+                val versionOkButton = Button(this@MainActivity).apply {
+                    text = "OK"
+                    textSize = 13f
+                    setTextColor(Color.rgb(255, 213, 90))
+                    setOnClickListener { versionDialog.dismiss() }
+                }
+                styleNumericDialogButton(versionOkButton)
+                versionCard.addView(versionOkButton, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(42)
+                ).apply { topMargin = dp(16) })
+                setDialogCardContent(versionDialog, versionCard)
+                requireExplicitDialogAction(versionDialog)
+                versionDialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+                val versionDialogWidth = minOf(
+                    dp(360),
+                    (resources.displayMetrics.widthPixels - dp(32)).coerceAtLeast(dp(220))
+                )
+                centerDialogOnScreen(versionDialog, versionDialogWidth, horizontalOffsetDp = 0)
+                versionDialog.show()
+            }
+        }
         updateSplReadout()
         peakReadout.addView(headerPeakFrequencyText)
         peakReadout.addView(headerPeakDbText, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             marginStart = dp(7)
         })
-        header.addView(headerSplText, android.widget.FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, headerHeight, Gravity.CENTER_VERTICAL or Gravity.START))
-        header.addView(peakReadout, android.widget.FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, headerHeight, Gravity.CENTER_VERTICAL or Gravity.END))
+        val splHeaderGroup = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL or Gravity.START
+        }
+        splHeaderGroup.addView(appVersionInfoButton, LinearLayout.LayoutParams(dp(26), dp(26)).apply {
+            marginEnd = dp(2)
+        })
+        splHeaderGroup.addView(headerSplText, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, headerHeight
+        ))
+        // Anchor the readouts to the top edge. KEYS gives the header extra height
+        // for the centered RANGE button; this keeps SPL and peak text from shifting.
+        header.addView(splHeaderGroup, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, headerHeight, Gravity.TOP or Gravity.START
+        ))
+        header.addView(peakReadout, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, headerHeight, Gravity.TOP or Gravity.END
+        ))
 
         oldParams.height = headerHeight
         parent.addView(header, index, oldParams)
     }
 
+    private fun currentSplLevelDbfs(): Double =
+        if (splTimeWeighting == "SLOW") latestSplSlowADbfs else latestSplFastADbfs
+
+    private fun resetSplSlowDisplayCache() {
+        splSlowDisplayValueDb = null
+        splSlowDisplayUpdatedAt = 0L
+    }
+
+    private fun resetSplCaptureReadings() {
+        splHoldEnabled = false
+        splHeldValueDb = null
+        splMinimumTrackingEnabled = false
+        splMaximumTrackingEnabled = false
+        splDisplayedExtremumMode = null
+        splMinimumDb = null
+        splMaximumDb = null
+    }
+
+    private fun setSplTimeWeighting(weighting: String) {
+        splTimeWeighting = if (weighting == "SLOW") "SLOW" else "FAST"
+        resetSplSlowDisplayCache()
+        resetSplCaptureReadings()
+        getSharedPreferences("sound_level_calibration", Context.MODE_PRIVATE)
+            .edit().putString("time_weighting", splTimeWeighting).apply()
+        updateSplModeButtons()
+        updateSplReadout()
+    }
+
+    private fun updateSplModeButtons() {
+        fun style(button: Button?, selected: Boolean, selectedColor: Int) {
+            button?.apply {
+                background = GradientDrawable().apply {
+                    cornerRadius = 14f * resources.displayMetrics.density
+                    setColor(if (selected) selectedColor else Color.rgb(25, 35, 48))
+                    setStroke(
+                        (1f * resources.displayMetrics.density).roundToInt().coerceAtLeast(1),
+                        if (selected) Color.rgb(110, 193, 210) else Color.rgb(57, 73, 91)
+                    )
+                }
+                setTextColor(if (selected) Color.WHITE else Color.rgb(190, 204, 219))
+            }
+        }
+        style(splResponseButton, true, if (splTimeWeighting == "FAST") Color.rgb(34, 105, 91) else Color.rgb(39, 91, 139))
+        splResponseButton?.contentDescription = if (splTimeWeighting == "FAST") {
+            "SPL response: FAST, 125 milliseconds. Tap to switch to SLOW, 1 second."
+        } else {
+            "SPL response: SLOW, 1 second. Tap to switch to FAST, 125 milliseconds."
+        }
+        style(splHoldButton, splHoldEnabled, Color.rgb(142, 101, 29))
+        style(splMinButton, splMinimumTrackingEnabled, Color.rgb(39, 91, 139))
+        splMinButton?.contentDescription = if (splMinimumTrackingEnabled) {
+            "Minimum tracking active. The displayed SPL updates only when a lower value is measured. Tap to stop."
+        } else {
+            "Track and display the minimum SPL value."
+        }
+        style(splMaxButton, splMaximumTrackingEnabled, Color.rgb(96, 72, 136))
+        splMaxButton?.contentDescription = if (splMaximumTrackingEnabled) {
+            "Maximum tracking active. The displayed SPL updates only when a higher value is measured. Tap to stop."
+        } else {
+            "Track and display the maximum SPL value."
+        }
+    }
+
     private fun updateSplReadout() {
         val offset = splCalibrationOffsetDb
-        val currentSpl = if (offset != null && running && splHasCurrentSample) {
-            (latestAnalyzedRmsDb + offset).takeIf { it.isFinite() }
+        val measuredSpl = if (offset != null && running && splHasCurrentSample) {
+            (currentSplLevelDbfs() + offset).takeIf { it.isFinite() }
         } else {
             null
         }
-        val displayValue = currentSpl?.let {
-            String.format(java.util.Locale.US, "SPL ≈ %.1f dB", it)
-        } ?: "SPL -- dB"
+        val now = SystemClock.elapsedRealtime()
+        val responseSpl = if (splTimeWeighting == "SLOW") {
+            when {
+                measuredSpl == null -> {
+                    resetSplSlowDisplayCache()
+                    null
+                }
+                splSlowDisplayValueDb == null || now - splSlowDisplayUpdatedAt >= 1000L -> {
+                    splSlowDisplayValueDb = measuredSpl
+                    splSlowDisplayUpdatedAt = now
+                    measuredSpl
+                }
+                else -> splSlowDisplayValueDb
+            }
+        } else {
+            resetSplSlowDisplayCache()
+            measuredSpl
+        }
+        splLastResponseValueDb = responseSpl
+        if (splMinimumTrackingEnabled && responseSpl != null) {
+            splMinimumDb = min(splMinimumDb ?: responseSpl, responseSpl)
+        }
+        if (splMaximumTrackingEnabled && responseSpl != null) {
+            splMaximumDb = max(splMaximumDb ?: responseSpl, responseSpl)
+        }
+        val selectedSpl = when (splDisplayedExtremumMode) {
+            "MIN" -> splMinimumDb
+            "MAX" -> splMaximumDb
+            else -> responseSpl
+        }
+        val currentSpl = if (splHoldEnabled) splHeldValueDb else selectedSpl
+        val unit = "dB(A)"
+        val headerDisplayValue = currentSpl?.let {
+            String.format(java.util.Locale.US, "SPL ≈ %.1f %s", it, unit)
+        } ?: "SPL -- $unit"
+        val detailDisplayValue = currentSpl?.let {
+            String.format(java.util.Locale.US, "≈ %.1f %s", it, unit)
+        } ?: "≈ -- $unit"
         var deltaOverOneSecond: Double? = null
-        if (currentSpl != null) {
-            val now = SystemClock.elapsedRealtime()
-            splRecentReadings.addLast(now to currentSpl)
+        if (responseSpl != null) {
+            splRecentReadings.addLast(now to responseSpl)
             while (splRecentReadings.peekFirst()?.first?.let { it < now - 2000L } == true) {
                 splRecentReadings.removeFirst()
             }
             val reference = splRecentReadings.lastOrNull { it.first <= now - 1000L }
-            deltaOverOneSecond = reference?.let { currentSpl - it.second }
+            deltaOverOneSecond = reference?.let { responseSpl - it.second }
         } else {
             splRecentReadings.clear()
         }
-        val detail = when {
-            !running -> "Start audio analysis to see the live SPL estimate."
-            offset == null -> "This phone does not report usable microphone sensitivity. Tap Calibrate to enter a reference meter reading."
-            splManualCalibrationOffsetDb != null -> "Unweighted SPL estimate · using your reference calibration. Phone microphone processing can affect accuracy."
-            else -> "Unweighted SPL estimate · using microphone sensitivity reported by Android. Phone processing can affect accuracy."
-        }
         headerSplText?.apply {
-            text = displayValue
-            contentDescription = "Show enlarged SPL estimate. $detail"
+            text = headerDisplayValue
+            contentDescription = "Show enlarged SPL estimate. Microphone input."
         }
-        splDetailValueView?.text = displayValue
-        splDetailInfoView?.text = detail
+        splDetailValueView?.text = detailDisplayValue
         splDetailDeltaView?.text = deltaOverOneSecond?.let {
             String.format(java.util.Locale.US, "Δ 1 s   %+.1f dB", it)
         } ?: "Δ 1 s   —"
         splScaleMeterView?.setLevel(currentSpl)
+        updateSplModeButtons()
+    }
+
+    private fun toggleSplHold() {
+        if (splHoldEnabled) {
+            splHoldEnabled = false
+            splHeldValueDb = null
+        } else {
+            val value = when (splDisplayedExtremumMode) {
+                "MIN" -> splMinimumDb
+                "MAX" -> splMaximumDb
+                else -> splLastResponseValueDb
+            } ?: return
+            splHoldEnabled = true
+            splHeldValueDb = value
+        }
+        updateSplReadout()
+    }
+
+    private fun toggleSplMinimum() {
+        splHoldEnabled = false
+        splHeldValueDb = null
+        if (splDisplayedExtremumMode == "MIN") {
+            splMinimumTrackingEnabled = false
+            splMinimumDb = null
+            splDisplayedExtremumMode = null
+        } else {
+            splMinimumTrackingEnabled = true
+            splMaximumTrackingEnabled = false
+            splMaximumDb = null
+            splMinimumDb = splLastResponseValueDb
+            splDisplayedExtremumMode = "MIN"
+        }
+        updateSplReadout()
+    }
+
+    private fun toggleSplMaximum() {
+        splHoldEnabled = false
+        splHeldValueDb = null
+        if (splDisplayedExtremumMode == "MAX") {
+            splMaximumTrackingEnabled = false
+            splMaximumDb = null
+            splDisplayedExtremumMode = null
+        } else {
+            splMaximumTrackingEnabled = true
+            splMinimumTrackingEnabled = false
+            splMinimumDb = null
+            splMaximumDb = splLastResponseValueDb
+            splDisplayedExtremumMode = "MAX"
+        }
+        updateSplReadout()
     }
 
     private fun readSystemSplCalibrationOffset(audioRecord: AudioRecord): Double? {
@@ -3577,28 +6160,18 @@ class MainActivity : Activity() {
         }
         val hasAutomaticCalibration = splSystemCalibrationOffsetDb != null
         val content = LinearLayout(this).apply {
-            orientation = if (hasAutomaticCalibration) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+            orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setPadding(
-                dp(if (hasAutomaticCalibration) 18 else 22),
-                dp(if (hasAutomaticCalibration) 16 else 20),
-                dp(if (hasAutomaticCalibration) 18 else 22),
-                dp(if (hasAutomaticCalibration) 16 else 18)
+                dp(if (hasAutomaticCalibration) 12 else 22),
+                dp(if (hasAutomaticCalibration) 10 else 20),
+                dp(if (hasAutomaticCalibration) 12 else 22),
+                dp(if (hasAutomaticCalibration) 10 else 18)
             )
             background = rounded(Color.rgb(14, 21, 31), 22)
         }
-        if (!hasAutomaticCalibration) {
-            content.addView(TextView(this).apply {
-                text = "SOUND PRESSURE LEVEL"
-                textSize = 12f
-                letterSpacing = 0.08f
-                setTypeface(typeface, android.graphics.Typeface.BOLD)
-                setTextColor(Color.rgb(170, 187, 204))
-                gravity = Gravity.CENTER
-            }, LinearLayout.LayoutParams(-1, -2))
-        }
         val value = TextView(this).apply {
-            text = headerSplText?.text ?: "SPL -- dB"
+            text = "≈ -- dB(A)"
             textSize = 34f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setTextColor(Color.rgb(255, 213, 90))
@@ -3606,19 +6179,18 @@ class MainActivity : Activity() {
             includeFontPadding = false
             maxLines = 1
             isSingleLine = true
-            setPadding(0, dp(14), 0, dp(10))
+            setPadding(0, dp(2), 0, 0)
         }
         splDetailValueView = value
         val dialog = Dialog(this)
-        splDetailInfoView = null
         splDetailDeltaView = null
         splScaleMeterView = null
+        val readout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+        }
+        readout.addView(value, LinearLayout.LayoutParams(-1, -2))
         if (hasAutomaticCalibration) {
-            val readout = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-            }
-            readout.addView(value, LinearLayout.LayoutParams(-1, -2))
             val delta = TextView(this).apply {
                 text = "Δ 1 s   —"
                 textSize = 13f
@@ -3626,61 +6198,118 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER
                 includeFontPadding = false
                 maxLines = 1
-                setPadding(0, dp(8), 0, 0)
+                setPadding(0, dp(4), 0, 0)
             }
             splDetailDeltaView = delta
             readout.addView(delta, LinearLayout.LayoutParams(-1, -2))
-            content.addView(readout, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+
+        fun modeRow(first: Button, second: Button): LinearLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            addView(first, LinearLayout.LayoutParams(dp(48), dp(40)).apply { marginEnd = dp(8) })
+            addView(second, LinearLayout.LayoutParams(dp(48), dp(40)))
+        }
+
+        fun extremumRow(minButton: Button, maxButton: Button): LinearLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            addView(minButton, LinearLayout.LayoutParams(dp(72), dp(40)).apply { marginEnd = dp(8) })
+            addView(maxButton, LinearLayout.LayoutParams(dp(72), dp(40)))
+        }
+
+        fun makeModeButton(label: String, description: String, action: () -> Unit) = Button(this).apply {
+            text = label
+            textSize = 13f
+            isAllCaps = false
+            minHeight = dp(40)
+            minimumHeight = dp(40)
+            setPadding(dp(8), 0, dp(8), 0)
+            contentDescription = description
+            background = rounded(Color.rgb(25, 35, 48), 14)
+            stateListAnimator = null
+            setOnClickListener { action() }
+        }
+
+        fun makeIconModeButton(icon: AnalyzerIconButton.Icon, description: String, action: () -> Unit) =
+            AnalyzerIconButton(this, icon).apply {
+                minHeight = dp(40)
+                minimumHeight = dp(40)
+                minWidth = dp(44)
+                minimumWidth = dp(44)
+                setPadding(0, 0, 0, 0)
+                setTextColor(Color.WHITE)
+                contentDescription = description
+                background = rounded(Color.rgb(25, 35, 48), 14)
+                stateListAnimator = null
+                setOnClickListener { action() }
+            }
+
+        val responseButton = makeIconModeButton(
+            AnalyzerIconButton.Icon.SPL_RESPONSE,
+            "Switch SPL response between FAST 125 milliseconds and SLOW 1 second."
+        ) {
+            setSplTimeWeighting(if (splTimeWeighting == "FAST") "SLOW" else "FAST")
+        }
+        val holdButton = makeIconModeButton(AnalyzerIconButton.Icon.SPL_HOLD, "Freeze or resume the displayed SPL reading.") {
+            toggleSplHold()
+        }
+        val minButton = makeModeButton("MIN", "Track the lowest SPL reading.") {
+            toggleSplMinimum()
+        }
+        val maxButton = makeModeButton("MAX", "Track the highest SPL reading.") {
+            toggleSplMaximum()
+        }
+        splResponseButton = responseButton
+        splHoldButton = holdButton
+        splMinButton = minButton
+        splMaxButton = maxButton
+        val leftColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+        }
+        leftColumn.addView(readout, LinearLayout.LayoutParams(-1, -2))
+        leftColumn.addView(modeRow(responseButton, holdButton), LinearLayout.LayoutParams(-1, dp(40)).apply {
+            topMargin = dp(if (hasAutomaticCalibration) 8 else 6)
+        })
+        leftColumn.addView(extremumRow(minButton, maxButton), LinearLayout.LayoutParams(-1, dp(40)).apply {
+            topMargin = dp(4)
+        })
+        if (hasAutomaticCalibration) {
+            val mainRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            mainRow.addView(leftColumn, LinearLayout.LayoutParams(0, dp(236), 1f))
             val meter = SplScaleMeterView(this)
             splScaleMeterView = meter
-            content.addView(meter, LinearLayout.LayoutParams(dp(100), dp(236)))
-        } else {
-            content.addView(value, LinearLayout.LayoutParams(-1, -2))
-            val info = TextView(this).apply {
-                textSize = 13f
-                setTextColor(Color.LTGRAY)
-                gravity = Gravity.CENTER
-            }
-            splDetailInfoView = info
-            content.addView(info, LinearLayout.LayoutParams(-1, -2).apply {
-                bottomMargin = dp(16)
+            mainRow.addView(meter, LinearLayout.LayoutParams(dp(100), dp(236)).apply {
+                marginStart = dp(8)
             })
-            val actions = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER
-            }
-            actions.addView(Button(this).apply {
-                text = "Calibrate"
-                isAllCaps = false
-                setTextColor(Color.WHITE)
-                background = rounded(Color.rgb(42, 57, 75), 14)
-                setOnClickListener { showSplCalibrationDialog() }
-            }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(8) })
-            actions.addView(Button(this).apply {
-                text = "Done"
-                isAllCaps = false
-                setTextColor(Color.WHITE)
-                background = rounded(Color.rgb(39, 113, 147), 14)
-                setOnClickListener { dialog.dismiss() }
-            }, LinearLayout.LayoutParams(0, dp(44), 1f))
-            content.addView(actions)
+            content.addView(mainRow, LinearLayout.LayoutParams(-1, dp(236)))
+        } else {
+            content.addView(leftColumn, LinearLayout.LayoutParams(-1, -2))
         }
+
         dialog.setContentView(content)
         dialog.setCanceledOnTouchOutside(true)
         dialog.setOnDismissListener {
             if (splDetailDialog === dialog) {
                 splDetailDialog = null
                 splDetailValueView = null
-                splDetailInfoView = null
                 splDetailDeltaView = null
                 splScaleMeterView = null
+                splResponseButton = null
+                splHoldButton = null
+                splMinButton = null
+                splMaxButton = null
             }
         }
         splDetailDialog = dialog
         updateSplReadout()
         val compactWidth = if (hasAutomaticCalibration) {
-            val maxValueWidth = value.paint.measureText("SPL ≈ 280.0 dB").roundToInt()
-            (maxValueWidth + dp(18 * 2 + 100 + 8))
+            val maxValueWidth = value.paint.measureText("≈ 280.0 dB(A)").roundToInt()
+            max(maxValueWidth + dp(12 * 2 + 100 + 8), dp(310))
                 .coerceAtMost((resources.displayMetrics.widthPixels - dp(32)).coerceAtLeast(dp(1)))
         } else {
             null
@@ -3688,6 +6317,7 @@ class MainActivity : Activity() {
         val displaySize = android.graphics.Point().also { windowManager.defaultDisplay.getRealSize(it) }
         val displayWidth = displaySize.x.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
         val dialogWidth = compactWidth ?: (displayWidth * 0.82f).roundToInt()
+        updateSplModeButtons()
         dialog.window?.apply {
             setBackgroundDrawableResource(android.R.color.transparent)
             setDimAmount(0.38f)
@@ -3695,85 +6325,6 @@ class MainActivity : Activity() {
         centerDialogOnScreen(dialog, dialogWidth, horizontalOffsetDp = -10)
         dialog.show()
         attachSplDialogDragHandle(dialog, content, displayWidth, displaySize.y)
-    }
-
-    private fun showSplCalibrationDialog() {
-        val density = resources.displayMetrics.density
-        fun dp(value: Int) = (value * density).roundToInt()
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(8), dp(18), dp(4))
-        }
-        content.addView(TextView(this).apply {
-            text = "Place the phone beside a calibrated SPL meter, or use an acoustic calibrator. Keep the reference sound steady and enter its reading below. This gives an unweighted estimate; the phone microphone’s response and processing affect accuracy."
-            textSize = 14f
-            setTextColor(Color.LTGRAY)
-            setPadding(0, 0, 0, dp(10))
-        })
-        content.addView(TextView(this).apply {
-            text = "Reference level (dB SPL)"
-            textSize = 13f
-            setTextColor(Color.WHITE)
-        })
-        val referenceInput = EditText(this).apply {
-            hint = "e.g. 94.0"
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-            setSingleLine(true)
-            textSize = 16f
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
-            setPadding(dp(12), 0, dp(12), 0)
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(30, 41, 55))
-                cornerRadius = dp(12).toFloat()
-            }
-        }
-        content.addView(referenceInput, LinearLayout.LayoutParams(-1, dp(46)).apply {
-            topMargin = dp(6)
-        })
-
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("Calibrate SPL estimate")
-            .setView(content)
-            .setPositiveButton("Calibrate", null)
-            .setNegativeButton("Cancel", null)
-            .setNeutralButton("Auto", null)
-            .create()
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.apply {
-                visibility = if (splManualCalibrationOffsetDb == null) View.GONE else View.VISIBLE
-                setOnClickListener {
-                    splManualCalibrationOffsetDb = null
-                    splCalibrationOffsetDb = splSystemCalibrationOffsetDb
-                    splRecentReadings.clear()
-                    getSharedPreferences("sound_level_calibration", Context.MODE_PRIVATE)
-                        .edit().remove("offset_db").apply()
-                    updateSplReadout()
-                    dialog.dismiss()
-                }
-            }
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
-                val referenceSpl = referenceInput.text.toString().toDoubleOrNull()
-                when {
-                    !running -> referenceInput.error = "Start audio analysis first"
-                    referenceSpl == null || referenceSpl !in 20.0..160.0 ->
-                        referenceInput.error = "Enter a reference from 20 to 160 dB SPL"
-                    !latestAnalyzedRmsDb.isFinite() ->
-                        referenceInput.error = "No microphone level is available yet"
-                    else -> {
-                        val offset = referenceSpl - latestAnalyzedRmsDb
-                        splManualCalibrationOffsetDb = offset
-                        splCalibrationOffsetDb = offset
-                        splRecentReadings.clear()
-                        getSharedPreferences("sound_level_calibration", Context.MODE_PRIVATE)
-                            .edit().putFloat("offset_db", offset.toFloat()).apply()
-                        updateSplReadout()
-                        dialog.dismiss()
-                    }
-                }
-            }
-        }
-        dialog.show()
     }
 
     private fun updateStartButtonAppearance() {
@@ -3812,7 +6363,7 @@ class MainActivity : Activity() {
     }
 
     private fun showSoundIdDialog() {
-        leaveFullScaleKeyboard()
+        leaveFullScaleKeyboard(animate = false)
         if (soundIdPanel != null) {
             switchAnalyzerMode?.invoke(if (soundModeOpen) "none" else "sound")
             return
@@ -3877,6 +6428,11 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, 0)
             setTextColor(Color.WHITE)
             playStopIconScale = 0.48f
+            usePlayStopImages = true
+            setPlayStopImages(
+                decodePlayStopBitmap(R.drawable.ic_tone_play),
+                decodePlayStopBitmap(R.drawable.ic_tone_stop)
+            )
             setOnClickListener {
                 val start = !soundIdActive
                 soundIdActive = start
@@ -4136,7 +6692,7 @@ class MainActivity : Activity() {
         content.addView(done, LinearLayout.LayoutParams(-1, dp(44)))
         val dialog = Dialog(this)
         dialog.setContentView(content)
-        dialog.setCanceledOnTouchOutside(true)
+        requireExplicitDialogAction(dialog)
         done.setOnClickListener { dialog.dismiss() }
         showDialogCenteredOnScreen(dialog)
     }
@@ -4202,7 +6758,7 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(-2, dp(44)))
         content.addView(actions)
         dialog.setContentView(content)
-        dialog.setCanceledOnTouchOutside(true)
+        requireExplicitDialogAction(dialog)
         showDialogCenteredOnScreen(dialog)
     }
 
@@ -4475,7 +7031,7 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(0, dp(44), 1f))
         content.addView(actions)
         dialog.setContentView(content)
-        dialog.setCanceledOnTouchOutside(true)
+        requireExplicitDialogAction(dialog)
         val renameDialogWidth = (resources.displayMetrics.widthPixels - dp(24)).coerceAtLeast(dp(260))
         dialog.window?.apply {
             setBackgroundDrawableResource(android.R.color.transparent)
@@ -4996,11 +7552,11 @@ class MainActivity : Activity() {
         dialog = Dialog(this)
         dialog.setContentView(content)
         dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
-        dialog.setCanceledOnTouchOutside(true)
+        requireExplicitDialogAction(dialog)
         val handler = Handler(Looper.getMainLooper())
         var cancelled = false
         var handingOffToNaming = false
-        var countdownRemaining = 3
+        var countdownEndsAtElapsedRealtime = 0L
         var recordingRemaining = 10
         var recordingStarted = false
         lateinit var captureTimeout: Runnable
@@ -5019,11 +7575,18 @@ class MainActivity : Activity() {
         ticker = object : Runnable {
             override fun run() {
                 if (cancelled || !dialog.isShowing) return
+                val now = SystemClock.elapsedRealtime()
                 when {
-                    countdownRemaining > 0 -> {
-                        countdown.text = "Recording starts in $countdownRemaining…"
-                        countdownRemaining--
-                        handler.postDelayed(this, 1000L)
+                    now < countdownEndsAtElapsedRealtime -> {
+                        val remainingMs = countdownEndsAtElapsedRealtime - now
+                        val remainingHundredths = (remainingMs + 9L) / 10L
+                        countdown.text = String.format(
+                            java.util.Locale.US,
+                            "Starts in %d.%02d s",
+                            remainingHundredths / 100L,
+                            remainingHundredths % 100L
+                        )
+                        handler.postDelayed(this, 10L)
                     }
                     !recordingStarted -> {
                         recordingStarted = true
@@ -5050,7 +7613,7 @@ class MainActivity : Activity() {
             record.isEnabled = false
             fiveSecondButton.isEnabled = false
             tenSecondButton.isEnabled = false
-            countdownRemaining = 3
+            countdownEndsAtElapsedRealtime = SystemClock.elapsedRealtime() + 3_000L
             recordingRemaining = selectedRecordingSeconds
             recordingStarted = false
             handler.post(ticker)
@@ -5502,9 +8065,15 @@ class MainActivity : Activity() {
     }
 
     private fun showFullScaleKeyboard() {
-        if (!keyboardModeOpen || splitContainer == null) return
-        moveKeyboardControlsToHeader()
+        if (!keyboardModeOpen || fullScaleTransitionAnimator?.isRunning == true) return
+        val split = splitContainer ?: return
+        val graphColumn = spectrumView.parent as? LinearLayout ?: return
+        val keyboardSection = keyboardSectionView as? LinearLayout ?: return
+        fullScaleTransitionAnimator?.cancel()
+        switchKeysToolbarLayout?.invoke(false)
+        rangePickerButton?.visibility = View.GONE
         fullScaleKeyboardOpen = true
+        fullScaleKeysButton?.isEnabled = false
         (fullScaleKeysButton as? AnalyzerIconButton)?.icon = AnalyzerIconButton.Icon.FULL_SCALE_CLOSE
         toneModeOpen = false
         soundModeOpen = false
@@ -5512,81 +8081,163 @@ class MainActivity : Activity() {
         spectrumView.setDbRangeMode("KEYS")
         tonePanel?.visibility = View.GONE
         soundIdPanel?.visibility = View.GONE
-        spectrumView.visibility = View.GONE
-        keyboardSectionView?.visibility = View.VISIBLE
-        splitContainer?.orientation = LinearLayout.VERTICAL
-        keyboardSectionView?.layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
-        )
-        val pianoView = keyboardPanel as? PianoKeyboardView
-        if (pianoView != null) {
-            val cutoutSafeLeft = if (android.os.Build.VERSION.SDK_INT >= 28) {
-                window.decorView.rootWindowInsets?.displayCutout?.safeInsetLeft ?: 0
-            } else {
-                0
-            }
-            val viewLocation = IntArray(2)
-            pianoView.getLocationInWindow(viewLocation)
-            val localCutoutInset = (cutoutSafeLeft - viewLocation[0]).coerceAtLeast(0)
-            val smallGap = (6f * resources.displayMetrics.density).roundToInt()
-            pianoView.setSafeEdgeInset((localCutoutInset + smallGap).toFloat())
-        }
-        fullScaleKeysButton?.text = ""
-        splitContainer?.requestLayout()
-    }
 
-    private fun moveKeyboardControlsToHeader() {
-        val controls = keyboardControlsRow ?: return
-        val header = spectrumHeader ?: return
-        (controls.parent as? ViewGroup)?.removeView(controls)
-        rangePickerButton?.visibility = View.GONE
-        val density = resources.displayMetrics.density
-        header.layoutParams = header.layoutParams.apply { height = (42f * density).roundToInt() }
-        val peakReadoutSpace = (220f * density).roundToInt()
-        val availableWidth = (header.width - peakReadoutSpace * 2 - (12f * density).roundToInt())
-            .coerceAtLeast((180f * density).roundToInt())
-        val targetWidth = minOf(availableWidth, (360f * density).roundToInt())
-        header.addView(
-            controls,
-            android.widget.FrameLayout.LayoutParams(targetWidth, (42f * density).roundToInt(), Gravity.CENTER)
-        )
-    }
-
-    private fun restoreKeyboardControls() {
-        val controls = keyboardControlsRow ?: return
-        val keyboardSection = keyboardSectionView as? ViewGroup ?: return
-        (controls.parent as? ViewGroup)?.removeView(controls)
-        spectrumHeader?.let { header ->
-            if (spectrumHeaderCompactHeightPx > 0) {
-                header.layoutParams = header.layoutParams.apply { height = spectrumHeaderCompactHeightPx }
-            }
-        }
-        keyboardSection.addView(
-            controls,
-            0,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (40f * resources.displayMetrics.density).roundToInt())
-        )
-        controls.post { applyKeyboardVolumeSafeInset() }
-        rangePickerButton?.visibility = View.VISIBLE
-        (keyboardPanel as? PianoKeyboardView)?.setSafeEdgeInset(0f)
-    }
-
-    private fun leaveFullScaleKeyboard() {
-        if (!fullScaleKeyboardOpen) return
-        fullScaleKeyboardOpen = false
-        (fullScaleKeysButton as? AnalyzerIconButton)?.icon = AnalyzerIconButton.Icon.FULL_SCALE_OPEN
-        restoreKeyboardControls()
-        fullScaleKeysButton?.text = ""
+        split.orientation = LinearLayout.VERTICAL
+        graphColumn.visibility = View.VISIBLE
         spectrumView.visibility = View.VISIBLE
-        if (keyboardModeOpen) {
-            splitContainer?.orientation = LinearLayout.VERTICAL
-            spectrumView.layoutParams = LinearLayout.LayoutParams( ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
-            keyboardSectionView?.visibility = View.VISIBLE
-            keyboardSectionView?.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        keyboardSection.visibility = View.VISIBLE
+        val graphParams = (graphColumn.layoutParams as LinearLayout.LayoutParams).apply {
+            width = ViewGroup.LayoutParams.MATCH_PARENT
+            height = 0
+            weight = 1f
+        }
+        val keysParams = (keyboardSection.layoutParams as LinearLayout.LayoutParams).apply {
+            width = ViewGroup.LayoutParams.MATCH_PARENT
+            height = 0
+            weight = 1f
+        }
+        graphColumn.layoutParams = graphParams
+        keyboardSection.layoutParams = keysParams
+        spectrumView.alpha = 1f
+        spectrumView.translationY = 0f
+        keyboardSection.alpha = 1f
+        keyboardSection.translationY = 0f
+        keyboardSection.scaleY = 1f
+        split.requestLayout()
+        keyboardPanel?.post { applyPianoKeyboardSafeInsets() }
+
+        val animator = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 400L
+            interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+            var wasCancelled = false
+            addUpdateListener { update ->
+                val progress = (update.animatedValue as Float).coerceIn(0f, 1f)
+                graphParams.weight = 1f - progress
+                graphColumn.layoutParams = graphParams
+                split.requestLayout()
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationCancel(animation: android.animation.Animator) {
+                    wasCancelled = true
+                }
+
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    if (wasCancelled || fullScaleTransitionAnimator !== this@apply) return
+                    graphParams.height = 0
+                    graphParams.weight = 0f
+                    graphColumn.layoutParams = graphParams
+                    graphColumn.visibility = View.GONE
+                    spectrumView.visibility = View.GONE
+                    spectrumView.alpha = 1f
+                    spectrumView.translationY = 0f
+                    keyboardSection.alpha = 1f
+                    keyboardSection.translationY = 0f
+                    keyboardSection.scaleY = 1f
+                    fullScaleKeysButton?.isEnabled = true
+                    fullScaleTransitionAnimator = null
+                    split.requestLayout()
+                    keyboardPanel?.post { applyPianoKeyboardSafeInsets() }
+                }
+            })
+        }
+        fullScaleTransitionAnimator = animator
+        animator.start()
+    }
+
+    private fun leaveFullScaleKeyboard(animate: Boolean = true) {
+        if (!fullScaleKeyboardOpen) return
+        fullScaleTransitionAnimator?.cancel()
+        fullScaleTransitionAnimator = null
+        fullScaleKeyboardOpen = false
+        val split = splitContainer
+        val graphColumn = spectrumView.parent as? LinearLayout
+        val keyboardSection = keyboardSectionView as? LinearLayout
+        (fullScaleKeysButton as? AnalyzerIconButton)?.icon = AnalyzerIconButton.Icon.FULL_SCALE_OPEN
+        fullScaleKeysButton?.isEnabled = !animate
+        fullScaleKeysButton?.text = ""
+
+        if (!keyboardModeOpen || split == null || graphColumn == null || keyboardSection == null) {
+            spectrumView.visibility = View.VISIBLE
+            if (keyboardModeOpen) switchKeysToolbarLayout?.invoke(true)
+            rangePickerButton?.visibility = if (keyboardModeOpen && !soundModeOpen) View.VISIBLE else View.GONE
+            fullScaleKeysButton?.isEnabled = true
+            split?.requestLayout()
+            return
+        }
+        split.orientation = LinearLayout.VERTICAL
+        graphColumn.visibility = View.VISIBLE
+        spectrumView.visibility = View.VISIBLE
+        keyboardSection.visibility = View.VISIBLE
+        val graphParams = (graphColumn.layoutParams as LinearLayout.LayoutParams).apply {
+            width = ViewGroup.LayoutParams.MATCH_PARENT
+            height = 0
+            weight = 0f
+        }
+        val keysParams = (keyboardSection.layoutParams as LinearLayout.LayoutParams).apply {
+            width = ViewGroup.LayoutParams.MATCH_PARENT
+            height = 0
+            weight = 1f
+        }
+        graphColumn.layoutParams = graphParams
+        keyboardSection.layoutParams = keysParams
+        spectrumView.alpha = 1f
+        spectrumView.translationY = 0f
+        keyboardSection.alpha = 1f
+        keyboardSection.translationY = 0f
+        keyboardSection.scaleY = 1f
+        split.requestLayout()
+
+        fun finishExit() {
+            graphColumn.visibility = View.VISIBLE
+            graphParams.height = 0
+            graphParams.weight = 1f
+            keysParams.height = 0
+            keysParams.weight = 1f
+            graphColumn.layoutParams = graphParams
+            keyboardSection.layoutParams = keysParams
+            spectrumView.alpha = 1f
+            spectrumView.translationY = 0f
+            keyboardSection.alpha = 1f
+            keyboardSection.translationY = 0f
+            keyboardSection.scaleY = 1f
             soundIdPanel?.visibility = View.GONE
             tonePanel?.visibility = View.GONE
+            switchKeysToolbarLayout?.invoke(true)
+            rangePickerButton?.visibility = View.VISIBLE
+            fullScaleKeysButton?.isEnabled = true
+            split.requestLayout()
+            keyboardControlsRow?.post { applyKeyboardVolumeSafeInset() }
+            keyboardPanel?.post { applyPianoKeyboardSafeInsets() }
         }
-        splitContainer?.requestLayout()
+
+        if (!animate) {
+            finishExit()
+            return
+        }
+        val animator = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 400L
+            interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+            var wasCancelled = false
+            addUpdateListener { update ->
+                val progress = (update.animatedValue as Float).coerceIn(0f, 1f)
+                graphParams.weight = progress
+                graphColumn.layoutParams = graphParams
+                split.requestLayout()
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationCancel(animation: android.animation.Animator) {
+                    wasCancelled = true
+                }
+
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    if (wasCancelled || fullScaleTransitionAnimator !== this@apply) return
+                    fullScaleTransitionAnimator = null
+                    finishExit()
+                }
+            })
+        }
+        fullScaleTransitionAnimator = animator
+        animator.start()
     }
 
     @Suppress("unused")
@@ -5637,17 +8288,11 @@ class MainActivity : Activity() {
         }
         val octave = control(when (pianoTranspose) { 12 -> "OCTAVE +1"; -12 -> "OCTAVE -1"; else -> "OCTAVE 0" }) { button ->
             pianoTranspose = when (pianoTranspose) { 0 -> 12; 12 -> -12; else -> 0 }
-            pianoOctaveButton?.text = when (pianoTranspose) { 12 -> "OCTAVE +1"; -12 -> "OCTAVE -1"; else -> "OCTAVE 0" }
+            updatePianoOctaveControls()
             button.text = when (pianoTranspose) { 12 -> "OCTAVE +1"; -12 -> "OCTAVE -1"; else -> "OCTAVE 0" }
         }
-        val reverb = control(if (pianoReverbEnabled) "REVERB ON" else "REVERB OFF") { button ->
-            pianoReverbEnabled = !pianoReverbEnabled
-            pianoReverbButton?.apply {
-                text = if (pianoReverbEnabled) "REVERB ON" else "REVERB OFF"
-                styleXButton(this, primary = pianoReverbEnabled)
-            }
-            button.text = if (pianoReverbEnabled) "REVERB ON" else "REVERB OFF"
-        }
+        val reverb = createPianoReverbButton()
+        fullScalePianoReverbButton = reverb
         controlRow.addView(volume, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(5) })
         controlRow.addView(octave, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(5) })
         controlRow.addView(reverb, LinearLayout.LayoutParams(0, dp(42), 1f))
@@ -5663,9 +8308,10 @@ class MainActivity : Activity() {
         }
         root.addView(keys, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(4) })
         dialog.setContentView(root)
-        dialog.setCanceledOnTouchOutside(false)
+        requireExplicitDialogAction(dialog)
         dialog.setOnDismissListener {
             keys.releaseAllPointers()
+            if (fullScalePianoReverbButton === reverb) fullScalePianoReverbButton = null
             if (fullScaleKeysDialog === dialog) fullScaleKeysDialog = null
         }
         dialog.show()
@@ -5739,6 +8385,50 @@ class MainActivity : Activity() {
         statusText.visibility = View.VISIBLE
     }
 
+    private fun createAudioRecordWithFallback(): AudioRecord? {
+        for (captureRate in intArrayOf(sampleRate, 44_100).distinct()) {
+            val minBuffer = try {
+                AudioRecord.getMinBufferSize(
+                    captureRate,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT
+                )
+            } catch (_: Exception) {
+                continue
+            }
+            if (minBuffer <= 0) continue
+
+            val candidate = try {
+                AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    captureRate,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    max(minBuffer, fftSize * 2)
+                )
+            } catch (error: SecurityException) {
+                throw error
+            } catch (_: IllegalArgumentException) {
+                continue
+            }
+            if (candidate.state != AudioRecord.STATE_INITIALIZED) {
+                candidate.release()
+                continue
+            }
+            try {
+                candidate.startRecording()
+                if (candidate.recordingState == AudioRecord.RECORDSTATE_RECORDING) return candidate
+            } catch (error: SecurityException) {
+                candidate.release()
+                throw error
+            } catch (_: IllegalStateException) {
+                // Try the next standard capture rate.
+            }
+            candidate.release()
+        }
+        return null
+    }
+
     private fun startAnalysis() {
         if (running) return
 
@@ -5753,55 +8443,26 @@ class MainActivity : Activity() {
             return
         }
 
-        val minBuffer = AudioRecord.getMinBufferSize(
-            sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-
-        if (minBuffer <= 0) {
-            showStatus("Audio recording is not supported.")
-            return
-        }
-
         val audioRecord = try {
-            AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                max(minBuffer, fftSize * 2)
-            )
+            createAudioRecordWithFallback()
         } catch (e: SecurityException) {
             showStatus("Microphone permission denied.")
             return
-        } catch (e: IllegalArgumentException) {
-            showStatus("Invalid audio configuration.")
-            return
         }
-
-        if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
-            audioRecord.release()
-            showStatus("Microphone initialization failed.")
-            return
-        }
-
-        try {
-            audioRecord.startRecording()
-        } catch (e: SecurityException) {
-            audioRecord.release()
-            showStatus("Microphone permission denied.")
-            return
-        } catch (e: IllegalStateException) {
-            audioRecord.release()
-            showStatus("Unable to start recording.")
+        if (audioRecord == null) {
+            showStatus("Audio recording is not supported on this device.")
             return
         }
 
         recorder = audioRecord
         splSystemCalibrationOffsetDb = readSystemSplCalibrationOffset(audioRecord)
-        splCalibrationOffsetDb = splManualCalibrationOffsetDb ?: splSystemCalibrationOffsetDb
+        splCalibrationOffsetDb = splSystemCalibrationOffsetDb ?: genericSplEstimateOffsetDb
+        latestSplFastADbfs = -120.0
+        latestSplSlowADbfs = -120.0
         splRecentReadings.clear()
+        resetSplSlowDisplayCache()
+        splLastResponseValueDb = null
+        resetSplCaptureReadings()
         splHasCurrentSample = false
         running = true
         updateSplReadout()
@@ -5824,6 +8485,8 @@ class MainActivity : Activity() {
         // Keep a rolling buffer large enough for the maximum supported FFT size.
         val ringBuffer = ShortArray(16384)
         val readBuffer = ShortArray(2048)
+        val inputResampler = audioRecord.sampleRate.takeIf { it != sampleRate }
+            ?.let { StreamingPcmResampler(it, sampleRate) }
         var writeIndex = 0
         var samplesSeen = 0L
         var samplesSinceFft = 0
@@ -5833,28 +8496,55 @@ class MainActivity : Activity() {
         var real = DoubleArray(activeFftSize)
         var imaginary = DoubleArray(activeFftSize)
         var magnitudes = DoubleArray(activeFftSize / 2)
+        val splAWeightingFilter = SplAWeightingFilter(sampleRate)
+        val fastPowerAlpha = exp(-1.0 / (0.125 * sampleRate))
+        val slowPowerAlpha = exp(-1.0 / (1.0 * sampleRate))
+        var fastAWeightedPower = 0.0
+        var slowAWeightedPower = 0.0
+        var splPowerPrimed = false
+
+        fun powerToDbfs(power: Double): Double =
+            if (power > 1e-12 && power.isFinite()) 10.0 * log10(power) else -120.0
 
         while (running) {
             // Frames started before RESET must not be allowed to restore old graph state.
             val frameResetGeneration = spectrumView.getResetGeneration()
-            val count = try {
+            val readCount = try {
                 audioRecord.read(readBuffer, 0, readBuffer.size, AudioRecord.READ_BLOCKING)
             } catch (_: Exception) {
                 -1
             }
-            if (count <= 0) {
+            if (readCount <= 0) {
                 if (!running) break
                 continue
             }
 
+            val converted = inputResampler?.process(readBuffer, readCount)
+            val audioSamples = converted?.samples ?: readBuffer
+            val count = converted?.count ?: readCount
+            if (count <= 0) continue
+
             // Sound ID consumes the same microphone samples as the spectrum graph.
             // It never opens a second AudioRecord session.
-            if (soundIdActive) soundIdEngine.offerAudio(readBuffer, count)
+            if (soundIdActive) soundIdEngine.offerAudio(audioSamples, count)
 
             for (i in 0 until count) {
-                ringBuffer[writeIndex] = readBuffer[i]
+                val normalizedSample = audioSamples[i].toDouble() / 32768.0
+                val aWeightedSample = splAWeightingFilter.process(normalizedSample)
+                val aWeightedPower = aWeightedSample * aWeightedSample
+                if (!splPowerPrimed) {
+                    fastAWeightedPower = aWeightedPower
+                    slowAWeightedPower = aWeightedPower
+                    splPowerPrimed = true
+                } else {
+                    fastAWeightedPower = fastPowerAlpha * fastAWeightedPower + (1.0 - fastPowerAlpha) * aWeightedPower
+                    slowAWeightedPower = slowPowerAlpha * slowAWeightedPower + (1.0 - slowPowerAlpha) * aWeightedPower
+                }
+                ringBuffer[writeIndex] = audioSamples[i]
                 writeIndex = (writeIndex + 1) % ringBuffer.size
             }
+            latestSplFastADbfs = powerToDbfs(fastAWeightedPower)
+            latestSplSlowADbfs = powerToDbfs(slowAWeightedPower)
             samplesSeen += count
             samplesSinceFft += count
 
@@ -6031,12 +8721,15 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun stopAnalysis() {
+    private fun stopAnalysis(preserveSoundId: Boolean = false) {
         running = false
         splHasCurrentSample = false
         splRecentReadings.clear()
+        resetSplSlowDisplayCache()
+        splLastResponseValueDb = null
+        resetSplCaptureReadings()
         updateSplReadout()
-        if (soundIdActive) {
+        if (soundIdActive && !preserveSoundId) {
             soundIdActive = false
             if (soundIdPanel != null) {
                 soundIdTimerHandler.removeCallbacks(soundIdTimerRunnable)
@@ -6090,6 +8783,12 @@ private data class SoundSessionEntry(
 
 private data class SoundCandidate(val label: String, val scorePercent: Int)
 
+private data class EfficientAtPrediction(
+    val label: String,
+    val scorePercent: Int,
+    val yamnetClassIndex: Int
+)
+
 private data class SoundSessionSummary(
     val totalSeconds: Double,
     val entries: List<SoundSessionEntry>,
@@ -6113,11 +8812,23 @@ private data class SoundIdResult(
 
 private const val PERSONAL_SOUND_FEATURE_COUNT = 585
 private const val PERSONAL_SOUND_SAMPLE_SECONDS = 10
-private const val PERSONAL_SOUND_DEFAULT_PROFILE_WINDOWS = 19
 private const val PERSONAL_SOUND_MATCH_THRESHOLD = 0.72f
 private const val PERSONAL_SOUND_NOTE_THRESHOLD = 0.55f
 
-private data class PersonalSoundProfile(val id: String, val name: String, val embedding: FloatArray)
+private data class PersonalSoundProfile(val id: String, val name: String, val embedding: FloatArray) {
+    override fun equals(other: Any?): Boolean =
+        this === other || (other is PersonalSoundProfile &&
+            id == other.id &&
+            name == other.name &&
+            embedding.contentEquals(other.embedding))
+
+    override fun hashCode(): Int {
+        var result = id.hashCode()
+        result = 31 * result + name.hashCode()
+        result = 31 * result + embedding.contentHashCode()
+        return result
+    }
+}
 
 /**
  * YAMNet bridge for the analyzer's existing 48 kHz mono microphone stream.
@@ -6134,13 +8845,24 @@ private class SoundIdEngine(
         private const val WINDOW_SAMPLES = MODEL_SAMPLES * 3
         private const val HOP_SAMPLES = 23_040 // 0.48 s at 48 kHz
         private const val CLASS_COUNT = 521
+        private const val EFFICIENTAT_CLASS_COUNT = 527
+        // EfficientAT's released model was trained on 2.925 s AudioSet clips.
+        // Keep its longer context separate from YAMNet's shorter rolling window.
+        private const val EFFICIENTAT_SOURCE_SAMPLE_COUNT = WINDOW_SAMPLES * 3
+        private const val EFFICIENTAT_SAMPLE_COUNT = EFFICIENTAT_SOURCE_SAMPLE_COUNT * 32_000 / 48_000
+        private const val EFFICIENTAT_FFT_SIZE = 1024
+        private const val EFFICIENTAT_WINDOW_SIZE = 800
+        private const val EFFICIENTAT_HOP_SIZE = 320
+        private const val EFFICIENTAT_MEL_COUNT = 128
+        private const val EFFICIENTAT_FRAME_COUNT = 293
+        private const val EFFICIENTAT_INTERVAL_SAMPLES = HOP_SAMPLES * 6
+        private const val MIN_EFFICIENTAT_SCORE = 0.14f
         private const val PERSONAL_SPECTRAL_BANDS = 64
         private const val PERSONAL_FEATURE_COUNT = PERSONAL_SOUND_FEATURE_COUNT
         private const val QUIET_DBFS = -60.0
         private const val MIN_MODEL_SCORE = 0.14f
         private const val MIN_CHILD_SCORE = 0.12f
         private const val MIN_CHILD_PARENT_RATIO = 0.30f
-        private const val CLASSIFIED_SECONDS_PER_WINDOW = HOP_SAMPLES / 48_000.0
     }
 
     @Volatile private var listening = false
@@ -6153,24 +8875,41 @@ private class SoundIdEngine(
     }
 
     // offerAudio() is called only from the single AudioRecord consumer thread.
-    private val inputRing = ShortArray(WINDOW_SAMPLES)
+    // Keep one hop beyond a full model window so a frame can end on the exact
+    // sample-clock boundary even when AudioRecord delivers a larger block.
+    private val inputRing = ShortArray(maxOf(WINDOW_SAMPLES, EFFICIENTAT_SOURCE_SAMPLE_COUNT) + HOP_SAMPLES)
     private var writeIndex = 0
     private var samplesSeen = 0L
-    private var samplesSinceWindow = 0
+    private var nextWindowEndSample = WINDOW_SAMPLES.toLong()
     private var wasListening = false
 
     private var interpreter: Interpreter? = null
+    @Volatile private var efficientAtInterpreter: Interpreter? = null
     private var labels: List<String> = emptyList()
+    private var efficientAtLabels: List<String> = emptyList()
+    private var efficientAtYamnetIndices = IntArray(EFFICIENTAT_CLASS_COUNT) { -1 }
     private var childClassIndices: Array<IntArray> = emptyArray()
     private val smoothedScores = FloatArray(CLASS_COUNT)
     private var hasSmoothedScores = false
+    private val efficientAtSmoothedScores = FloatArray(EFFICIENTAT_CLASS_COUNT)
+    private var hasEfficientAtSmoothedScores = false
+    @Volatile private var nextEfficientAtSample = 0L
+    private var efficientAtLatestPrediction: EfficientAtPrediction? = null
+    private val efficientAtInputBuffer = ByteBuffer
+        .allocateDirect(EFFICIENTAT_MEL_COUNT * EFFICIENTAT_FRAME_COUNT * Float.SIZE_BYTES)
+        .order(ByteOrder.nativeOrder())
+    private val efficientAtOutput = Array(1) { FloatArray(EFFICIENTAT_CLASS_COUNT) }
+    private val efficientAtMelBasis = FloatArray(EFFICIENTAT_MEL_COUNT * (EFFICIENTAT_FFT_SIZE / 2 + 1))
+    private val efficientAtLogMel = FloatArray(EFFICIENTAT_MEL_COUNT * EFFICIENTAT_FRAME_COUNT)
+    private val efficientAtHann = FloatArray(EFFICIENTAT_WINDOW_SIZE) { index ->
+        (0.5 - 0.5 * cos(2.0 * PI * index / (EFFICIENTAT_WINDOW_SIZE - 1))).toFloat()
+    }
+    private val efficientAtReal = DoubleArray(EFFICIENTAT_FFT_SIZE)
+    private val efficientAtImaginary = DoubleArray(EFFICIENTAT_FFT_SIZE)
+    private val efficientAtResampleWindow = createEfficientAtResampleWindow()
     private val personalSoundLock = Any()
     private val personalSounds = loadPersonalSounds()
-    @Volatile private var personalCaptureName: String? = null
-    private var personalCaptureSum = FloatArray(PERSONAL_FEATURE_COUNT)
-    private var personalCaptureWindows = 0
-    private var personalCaptureTargetWindows = PERSONAL_SOUND_DEFAULT_PROFILE_WINDOWS
-    private var personalCaptureWarmup = true
+    private var personalCaptureGeneration = 0
     @Volatile private var personalSoundCapturedListener: ((FloatArray, ShortArray) -> Unit)? = null
     private var personalCapturePcm = ShortArray(0)
     private var personalCapturePcmCount = 0
@@ -6178,25 +8917,49 @@ private class SoundIdEngine(
     private val secondsByLabel = linkedMapOf<String, Double>()
     private val timelineLabels = mutableListOf<String>()
     private var analyzedSeconds = 0.0
+    private var lastClassifiedAudioEndSample = 0L
+    @Volatile private var listeningStartedAtMs = 0L
     private val filter = createDecimatorFilter()
 
+    @Synchronized
     fun setListening(value: Boolean) {
-        listening = value
-        if (!value) {
+        if (value) {
+            if (listening) return
+            listening = true
+            listeningStartedAtMs = SystemClock.elapsedRealtime()
+            writeIndex = 0
+            samplesSeen = 0L
+            nextWindowEndSample = WINDOW_SAMPLES.toLong()
+            wasListening = false
+            inputRing.fill(0)
+            onResult(SoundIdResult("LOADING MODEL", "Waiting for the first sound…"))
             worker.execute {
-                onResult(SoundIdResult("SESSION COMPLETE", "", sessionSummary = createSessionSummary()))
+                secondsByLabel.clear()
+                timelineLabels.clear()
+                analyzedSeconds = 0.0
+                lastClassifiedAudioEndSample = 0L
+                smoothedScores.fill(0f)
+                hasSmoothedScores = false
+                efficientAtSmoothedScores.fill(0f)
+                hasEfficientAtSmoothedScores = false
+                nextEfficientAtSample = 0L
+                efficientAtLatestPrediction = null
+                if (loadStarted.compareAndSet(false, true)) loadModel()
+                else if (ready) onResult(SoundIdResult("LISTENING", "Listening for sounds…"))
             }
             return
         }
-        onResult(SoundIdResult("LOADING MODEL", "Waiting for the first sound…"))
+        if (!listening) return
+        listening = false
+        val startedAt = listeningStartedAtMs
+        val elapsedSeconds = if (startedAt > 0L) {
+            (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L) / 1000.0
+        } else {
+            0.0
+        }
+        listeningStartedAtMs = 0L
         worker.execute {
-            secondsByLabel.clear()
-            timelineLabels.clear()
-            analyzedSeconds = 0.0
-            smoothedScores.fill(0f)
-            hasSmoothedScores = false
-            if (loadStarted.compareAndSet(false, true)) loadModel()
-            else if (ready) onResult(SoundIdResult("LISTENING", "Listening for sounds…"))
+            onResult(SoundIdResult("SESSION COMPLETE", "", sessionSummary = createSessionSummary(elapsedSeconds)))
         }
     }
 
@@ -6208,27 +8971,6 @@ private class SoundIdEngine(
         var index = 1
         while (personalSounds.any { it.name.equals("My Sound $index", ignoreCase = true) }) index++
         "My Sound $index"
-    }
-
-    fun renamePersonalSound(id: String, name: String): Boolean = synchronized(personalSoundLock) {
-        val cleanName = name.trim()
-        val index = personalSounds.indexOfFirst { it.id == id }
-        if (cleanName.isEmpty() || index < 0) return@synchronized false
-        personalSounds[index] = personalSounds[index].copy(name = cleanName)
-        persistPersonalSoundsLocked()
-        true
-    }
-
-    fun removePersonalSound(id: String) {
-        synchronized(personalSoundLock) {
-            personalSounds.removeAll { profile ->
-                if (profile.id == id) {
-                    File(context.filesDir, "personal_sound_samples/${profile.id}.pcm").delete()
-                    true
-                } else false
-            }
-            persistPersonalSoundsLocked()
-        }
     }
 
     fun renamePersonalSounds(existingName: String, newName: String): Set<String> = synchronized(personalSoundLock) {
@@ -6261,12 +9003,7 @@ private class SoundIdEngine(
     fun beginPersonalSoundCapture(durationSeconds: Int = PERSONAL_SOUND_SAMPLE_SECONDS) {
         val sampleDurationSeconds = durationSeconds.coerceIn(5, 10)
         synchronized(personalSoundLock) {
-            personalCaptureName = "pending"
-            personalCaptureSum = FloatArray(PERSONAL_FEATURE_COUNT)
-            personalCaptureWindows = 0
-            val capturedSampleCount = sampleDurationSeconds * 48_000
-            personalCaptureTargetWindows = 1 + maxOf(0, (capturedSampleCount - WINDOW_SAMPLES) / HOP_SAMPLES)
-            personalCaptureWarmup = true
+            personalCaptureGeneration++
             personalCapturePcm = ShortArray(MODEL_RATE * 3 * sampleDurationSeconds)
             personalCapturePcmCount = 0
             personalCapturePcmActive = true
@@ -6275,10 +9012,7 @@ private class SoundIdEngine(
 
     fun cancelPersonalSoundCapture() {
         synchronized(personalSoundLock) {
-            personalCaptureName = null
-            personalCaptureSum = FloatArray(PERSONAL_FEATURE_COUNT)
-            personalCaptureWindows = 0
-            personalCaptureWarmup = true
+            personalCaptureGeneration++
             personalCapturePcm = ShortArray(0)
             personalCapturePcmCount = 0
             personalCapturePcmActive = false
@@ -6321,33 +9055,7 @@ private class SoundIdEngine(
             val failure = try {
                 val cleanName = name.trim().take(80)
                 require(cleanName.isNotEmpty()) { "The sample needs a name." }
-                require(source48k.size in WINDOW_SAMPLES..(48_000 * 30)) {
-                    "WAV must contain between 1 and 30 seconds of audio."
-                }
-                if (!ready && loadStarted.compareAndSet(false, true)) loadModel(announceState = false)
-                check(ready) { modelLoadError ?: "The sound model could not be loaded." }
-                val model = interpreter ?: error("The sound model is not ready.")
-                val embeddingSum = DoubleArray(PERSONAL_FEATURE_COUNT)
-                var usableWindows = 0
-                var start = 0
-                while (start + WINDOW_SAMPLES <= source48k.size) {
-                    val frame = source48k.copyOfRange(start, start + WINDOW_SAMPLES)
-                    val audio16k = resample48kTo16k(frame)
-                    val rms = sqrt(audio16k.sumOf { it.toDouble() * it.toDouble() } / audio16k.size)
-                    val rmsDb = if (rms > 0.0) 20.0 * log10(rms) else -120.0
-                    if (rmsDb >= QUIET_DBFS) {
-                        val output = Array(1) { FloatArray(CLASS_COUNT) }
-                        model.run(arrayOf(audio16k), output)
-                        val embedding = createPersonalEmbedding(output[0], audio16k)
-                        for (index in embedding.indices) embeddingSum[index] += embedding[index]
-                        usableWindows++
-                    }
-                    start += HOP_SAMPLES
-                }
-                require(usableWindows > 0) { "No clear sound was found in this WAV." }
-                val averaged = FloatArray(PERSONAL_FEATURE_COUNT) { index ->
-                    (embeddingSum[index] / usableWindows).toFloat()
-                }
+                val averaged = buildPersonalEmbeddingFromAudio(source48k)
                 savePersonalSound(cleanName, averaged, source48k)
                 null
             } catch (error: Exception) {
@@ -6357,12 +9065,45 @@ private class SoundIdEngine(
         }
     }
 
+    private fun buildPersonalEmbeddingFromAudio(source48k: ShortArray): FloatArray {
+        require(source48k.size in WINDOW_SAMPLES..(48_000 * 30)) {
+            "Audio must contain between 1 and 30 seconds of sound."
+        }
+        if (!ready) {
+            loadStarted.set(true)
+            loadModel(announceState = false)
+        }
+        check(ready) { modelLoadError ?: "The sound model could not be loaded." }
+        val model = interpreter ?: error("The sound model is not ready.")
+        val windowCount = countCompleteAudioWindows(source48k.size, WINDOW_SAMPLES, HOP_SAMPLES)
+        val embeddingSum = DoubleArray(PERSONAL_FEATURE_COUNT)
+        var usableWindows = 0
+        for (windowIndex in 0 until windowCount) {
+            val start = windowIndex * HOP_SAMPLES
+            val frame = source48k.copyOfRange(start, start + WINDOW_SAMPLES)
+            val audio16k = resample48kTo16k(frame)
+            val rms = sqrt(audio16k.sumOf { it.toDouble() * it.toDouble() } / audio16k.size)
+            val rmsDb = if (rms > 0.0) 20.0 * log10(rms) else -120.0
+            if (rmsDb < QUIET_DBFS) continue
+            val output = Array(1) { FloatArray(CLASS_COUNT) }
+            model.run(arrayOf(audio16k), output)
+            val embedding = createPersonalEmbedding(output[0], audio16k)
+            for (index in embedding.indices) embeddingSum[index] += embedding[index]
+            usableWindows++
+        }
+        require(usableWindows > 0) { "No clear sound was found in this audio." }
+        return FloatArray(PERSONAL_FEATURE_COUNT) { index ->
+            (embeddingSum[index] / usableWindows).toFloat()
+        }
+    }
+
+    @Synchronized
     fun offerAudio(samples: ShortArray, count: Int) {
         if (!listening) {
             if (wasListening) {
                 writeIndex = 0
                 samplesSeen = 0L
-                samplesSinceWindow = 0
+                nextWindowEndSample = WINDOW_SAMPLES.toLong()
                 wasListening = false
             }
             return
@@ -6370,15 +9111,36 @@ private class SoundIdEngine(
         if (!wasListening) {
             writeIndex = 0
             samplesSeen = 0L
-            samplesSinceWindow = 0
+            nextWindowEndSample = WINDOW_SAMPLES.toLong()
             wasListening = true
         }
-        synchronized(personalSoundLock) {
+        val completedCapture = synchronized(personalSoundLock) {
             if (personalCapturePcmActive && personalCapturePcmCount < personalCapturePcm.size) {
                 val copyCount = minOf(count, personalCapturePcm.size - personalCapturePcmCount)
                 samples.copyInto(personalCapturePcm, personalCapturePcmCount, 0, copyCount)
                 personalCapturePcmCount += copyCount
-                if (personalCapturePcmCount >= personalCapturePcm.size) personalCapturePcmActive = false
+                if (personalCapturePcmCount >= personalCapturePcm.size) {
+                    personalCapturePcmActive = false
+                    val completedPcm = personalCapturePcm
+                    personalCapturePcm = ShortArray(0)
+                    personalCapturePcmCount = 0
+                    personalCaptureGeneration to completedPcm
+                } else null
+            } else null
+        }
+        completedCapture?.let { (generation, capturedPcm) ->
+            worker.execute {
+                val embedding = try {
+                    buildPersonalEmbeddingFromAudio(capturedPcm)
+                } catch (_: Exception) {
+                    null
+                }
+                val stillCurrent = synchronized(personalSoundLock) {
+                    generation == personalCaptureGeneration
+                }
+                if (stillCurrent && embedding != null) {
+                    personalSoundCapturedListener?.invoke(embedding, capturedPcm)
+                }
             }
         }
         for (i in 0 until count) {
@@ -6386,20 +9148,40 @@ private class SoundIdEngine(
             writeIndex = (writeIndex + 1) % inputRing.size
         }
         samplesSeen += count
-        samplesSinceWindow += count
-        if (samplesSeen < WINDOW_SAMPLES || samplesSinceWindow < HOP_SAMPLES) return
-        samplesSinceWindow = 0
+        if (samplesSeen < nextWindowEndSample) return
+
+        // Keep the model cadence locked to the 48 kHz sample clock instead of
+        // restarting the hop timer at each AudioRecord block boundary. If a
+        // block spans multiple deadlines, use only the newest due window.
+        val elapsedHops = (samplesSeen - nextWindowEndSample) / HOP_SAMPLES
+        val frameEndSample = nextWindowEndSample + elapsedHops * HOP_SAMPLES
+        nextWindowEndSample = frameEndSample + HOP_SAMPLES
         if (!ready || !inferencePending.compareAndSet(false, true)) return
 
         val frame = ShortArray(WINDOW_SAMPLES)
-        var index = writeIndex
+        val samplesAfterFrame = (samplesSeen - frameEndSample).toInt()
+        val frameEndIndex = (writeIndex - samplesAfterFrame + inputRing.size) % inputRing.size
+        var index = (frameEndIndex - WINDOW_SAMPLES + inputRing.size) % inputRing.size
         for (i in frame.indices) {
             frame[i] = inputRing[index]
             index = (index + 1) % inputRing.size
         }
+        val efficientAtFrame = if (
+            efficientAtInterpreter != null &&
+            frameEndSample >= EFFICIENTAT_SOURCE_SAMPLE_COUNT &&
+            frameEndSample >= nextEfficientAtSample
+        ) {
+            ShortArray(EFFICIENTAT_SOURCE_SAMPLE_COUNT).also { longFrame ->
+                var longIndex = (frameEndIndex - longFrame.size + inputRing.size) % inputRing.size
+                for (i in longFrame.indices) {
+                    longFrame[i] = inputRing[longIndex]
+                    longIndex = (longIndex + 1) % inputRing.size
+                }
+            }
+        } else null
         worker.execute {
             try {
-                classify(frame)
+                classify(frame, efficientAtFrame, frameEndSample)
             } catch (error: Exception) {
                 onResult(SoundIdResult(
                     "ANALYSIS ERROR",
@@ -6454,6 +9236,7 @@ private class SoundIdEngine(
             val options = Interpreter.Options().setNumThreads(2)
             interpreter = Interpreter(model, options)
             labels = classNames
+            loadEfficientAtModel(classIndexById)
             ready = true
             modelLoadError = null
             if (announceState) onResult(SoundIdResult("LISTENING", "Listening for sounds…"))
@@ -6464,12 +9247,70 @@ private class SoundIdEngine(
         }
     }
 
-    private fun classify(source48k: ShortArray) {
+    private fun loadEfficientAtModel(yamnetIndexById: Map<String, Int>) {
+        var loaded: Interpreter? = null
+        try {
+            val efficientClassRows = context.assets.open("efficientat_class_map.csv").bufferedReader().useLines { lines ->
+                lines.mapNotNull { line ->
+                    val trimmed = line.trim()
+                    if (trimmed.isEmpty() || trimmed.startsWith("index,")) null
+                    else {
+                        val fields = trimmed.split(',', limit = 3)
+                        if (fields.size < 3) null else {
+                            fields[1].trim() to fields[2].trim().removeSurrounding("\"")
+                        }
+                    }
+                }.toList()
+            }
+            require(efficientClassRows.size == EFFICIENTAT_CLASS_COUNT) {
+                "Expected 527 EfficientAT labels, found ${efficientClassRows.size}"
+            }
+            val melBytes = context.assets.open("efficientat_mel_basis.f32").use { it.readBytes() }
+            require(melBytes.size == efficientAtMelBasis.size * Float.SIZE_BYTES) {
+                "EfficientAT mel filter bank has an invalid size."
+            }
+            ByteBuffer.wrap(melBytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(efficientAtMelBasis)
+
+            val modelBytes = context.assets.open("efficientat_mn04_as.tflite").use { it.readBytes() }
+            require(modelBytes.isNotEmpty()) { "efficientat_mn04_as.tflite is empty" }
+            val model = ByteBuffer.allocateDirect(modelBytes.size).order(ByteOrder.nativeOrder())
+            model.put(modelBytes)
+            model.rewind()
+            val options = Interpreter.Options().setNumThreads(2)
+            val modelInterpreter = Interpreter(model, options)
+            loaded = modelInterpreter
+            require(modelInterpreter.getInputTensor(0).shape().contentEquals(
+                intArrayOf(1, EFFICIENTAT_MEL_COUNT, EFFICIENTAT_FRAME_COUNT, 1)
+            )) {
+                "EfficientAT input shape is not supported by this app."
+            }
+            require(modelInterpreter.getOutputTensor(0).shape().contentEquals(intArrayOf(1, EFFICIENTAT_CLASS_COUNT))) {
+                "EfficientAT output shape is not supported by this app."
+            }
+            efficientAtLabels = efficientClassRows.map { it.second }
+            efficientAtYamnetIndices = efficientClassRows.map { row -> yamnetIndexById[row.first] ?: -1 }.toIntArray()
+            efficientAtInterpreter = modelInterpreter
+            Log.i("SoundId", "EfficientAT mn04_as loaded (${efficientAtLabels.size} classes)")
+        } catch (error: Exception) {
+            try { loaded?.close() } catch (_: Exception) { }
+            try { efficientAtInterpreter?.close() } catch (_: Exception) { }
+            efficientAtInterpreter = null
+            efficientAtLabels = emptyList()
+            efficientAtLatestPrediction = null
+            Log.w("SoundId", "EfficientAT unavailable; continuing with YAMNet only", error)
+        }
+    }
+
+    private fun classify(source48k: ShortArray, efficientAtSource48k: ShortArray?, frameEndSample: Long) {
         val audio16k = resample48kTo16k(source48k)
         val rms = sqrt(audio16k.sumOf { it.toDouble() * it.toDouble() } / audio16k.size)
         val rmsDb = if (rms > 0.0) 20.0 * log10(rms) else -120.0
         if (rmsDb < QUIET_DBFS) {
-            recordWinner("Unclear / quiet")
+            efficientAtLatestPrediction = null
+            nextEfficientAtSample = 0L
+            efficientAtSmoothedScores.fill(0f)
+            hasEfficientAtSmoothedScores = false
+            recordWinner("Unclear / quiet", frameEndSample)
             onResult(SoundIdResult("LISTENING", "No clear sound", 0))
             return
         }
@@ -6478,42 +9319,15 @@ private class SoundIdEngine(
         interpreter?.run(arrayOf(audio16k), output)
             ?: error("The YAMNet interpreter is not ready")
         val scores = output[0]
-        val needsPersonalEmbedding = synchronized(personalSoundLock) {
-            personalSounds.isNotEmpty() || personalCaptureName != null
-        }
+        val needsPersonalEmbedding = synchronized(personalSoundLock) { personalSounds.isNotEmpty() }
         val personalEmbedding = if (needsPersonalEmbedding) createPersonalEmbedding(scores, audio16k) else null
-        val capturedEmbedding = synchronized(personalSoundLock) {
-            if (personalCaptureName == null || personalEmbedding == null) null else if (personalCaptureWarmup) {
-                personalCaptureWarmup = false
-                null
-            } else {
-                for (index in personalEmbedding.indices) personalCaptureSum[index] += personalEmbedding[index]
-                personalCaptureWindows++
-                if (personalCaptureWindows >= personalCaptureTargetWindows) {
-                    val averaged = FloatArray(PERSONAL_FEATURE_COUNT) { personalCaptureSum[it] / personalCaptureWindows }
-                    personalCaptureName = null
-                    personalCaptureSum = FloatArray(PERSONAL_FEATURE_COUNT)
-                    personalCaptureWindows = 0
-                    averaged
-                } else null
-            }
-        }
-        capturedEmbedding?.let { embedding ->
-            val pcm = synchronized(personalSoundLock) {
-                val captured = personalCapturePcm.copyOf(personalCapturePcmCount)
-                personalCapturePcm = ShortArray(0)
-                personalCapturePcmCount = 0
-                personalCapturePcmActive = false
-                captured
-            }
-            personalSoundCapturedListener?.invoke(embedding, pcm)
-        }
         if (!hasSmoothedScores) {
             scores.copyInto(smoothedScores)
             hasSmoothedScores = true
         } else {
             for (i in scores.indices) smoothedScores[i] = smoothedScores[i] * 0.55f + scores[i] * 0.45f
         }
+        val efficientPrediction = runEfficientAtIfDue(efficientAtSource48k, frameEndSample)
         val ranked = smoothedScores.indices
             .asSequence()
             .filter { smoothedScores[it] >= 0.05f }
@@ -6529,7 +9343,7 @@ private class SoundIdEngine(
         val best = ranked.firstOrNull() ?: -1
         if (best < 0 || smoothedScores[best] < MIN_MODEL_SCORE) {
             if (customCandidate != null) {
-                recordWinner(customCandidate.label)
+                recordWinner(customCandidate.label, frameEndSample)
                 onResult(SoundIdResult(
                     "LISTENING · SAVED SOUND MATCH",
                     customCandidate.label,
@@ -6537,8 +9351,16 @@ private class SoundIdEngine(
                     "Similarity to your saved sample",
                     isPersonalMatch = true
                 ))
+            } else if (efficientPrediction != null) {
+                recordWinner(efficientPrediction.label, frameEndSample)
+                onResult(SoundIdResult(
+                    "LISTENING · EFFICIENTAT MATCH",
+                    efficientPrediction.label,
+                    efficientPrediction.scorePercent,
+                    "EfficientAT second-model match"
+                ))
             } else {
-                recordWinner("Unclear / mixed")
+                recordWinner("Unclear / mixed", frameEndSample)
                 onResult(SoundIdResult("LISTENING", "No clear sound", 0))
             }
             return
@@ -6553,32 +9375,194 @@ private class SoundIdEngine(
         }
         if (candidates.isEmpty()) {
             if (customCandidate != null) {
-                recordWinner(customCandidate.label)
+                recordWinner(customCandidate.label, frameEndSample)
                 onResult(SoundIdResult("LISTENING · SAVED SOUND MATCH", customCandidate.label,
                     customCandidate.scorePercent, "Similarity to your saved sample", isPersonalMatch = true))
             } else {
-                recordWinner("Unclear / mixed")
+                recordWinner("Unclear / mixed", frameEndSample)
                 onResult(SoundIdResult("LISTENING", "No clear sound", 0))
             }
             return
         }
-        val allCandidates = (listOfNotNull(customCandidate) + candidates).distinctBy { it.label }.take(3)
-        recordWindow(allCandidates)
+        val yamnetBestCandidate = candidates.first()
+        val efficientRefinement = efficientPrediction?.takeIf { prediction ->
+            prediction.scorePercent / 100f >= MIN_EFFICIENTAT_SCORE &&
+                prediction.yamnetClassIndex >= 0 &&
+                isSupportedDescendant(prediction.yamnetClassIndex, best)
+        }?.let { SoundCandidate(it.label, it.scorePercent) }
+        val classifierCandidates = if (efficientRefinement != null) {
+            listOf(efficientRefinement) + candidates.filterNot { it.label == yamnetBestCandidate.label }.take(2)
+        } else candidates
+        val allCandidates = (listOfNotNull(customCandidate) + classifierCandidates).distinctBy { it.label }.take(3)
+        recordWindow(allCandidates, frameEndSample)
         val label = allCandidates.first().label
         val alternatives = allCandidates.drop(1).takeIf { it.isNotEmpty() }?.let { others ->
             "Also possible: " + others.joinToString("   ·   ") { "${it.label} ${it.scorePercent}%" }
         }.orEmpty()
-        val displayedScore = if (customCandidate != null) customCandidate.scorePercent else (bestScore * 100f).roundToInt()
+        val displayedScore = when {
+            customCandidate != null -> customCandidate.scorePercent
+            efficientRefinement != null -> efficientRefinement.scorePercent
+            else -> (bestScore * 100f).roundToInt()
+        }
         val status = when {
             customCandidate != null -> "LISTENING · SAVED SOUND MATCH"
+            efficientRefinement != null -> "LISTENING · MORE SPECIFIC MATCH"
+            efficientPrediction?.label == yamnetBestCandidate.label -> "LISTENING · TWO MODELS AGREE"
             displayedScore >= 35 -> "LISTENING · CLEAR MATCH"
             else -> "LISTENING · LOW MATCH"
         }
         val personalNote = personalMatch?.takeIf { it.second >= PERSONAL_SOUND_NOTE_THRESHOLD }?.let { (profile, similarity) ->
             "Nearest saved sample: ${profile.name} · ${(similarity * 100f).roundToInt()}% similarity"
         }.orEmpty()
-        val fullAlternatives = listOf(personalNote, alternatives).filter { it.isNotBlank() }.joinToString("\n")
+        val modelCrossCheck = when {
+            customCandidate != null -> null
+            efficientRefinement != null -> "YAMNet: ${yamnetBestCandidate.label} ${yamnetBestCandidate.scorePercent}%"
+            efficientPrediction != null && efficientPrediction.label != label ->
+                "EfficientAT: ${efficientPrediction.label} ${efficientPrediction.scorePercent}%"
+            else -> null
+        }.orEmpty()
+        val fullAlternatives = listOf(personalNote, modelCrossCheck, alternatives)
+            .filter { it.isNotBlank() }
+            .joinToString("\n")
         onResult(SoundIdResult(status, label, displayedScore, fullAlternatives, isPersonalMatch = customCandidate != null))
+    }
+
+    private fun runEfficientAtIfDue(source48k: ShortArray?, frameEndSample: Long): EfficientAtPrediction? {
+        val model = efficientAtInterpreter ?: return null
+        if (source48k == null) return efficientAtLatestPrediction
+        if (frameEndSample < nextEfficientAtSample) return efficientAtLatestPrediction
+        nextEfficientAtSample = frameEndSample + EFFICIENTAT_INTERVAL_SAMPLES
+        return try {
+            val audio32k = resample48kTo32k(source48k)
+            fillEfficientAtLogMel(audio32k)
+            efficientAtInputBuffer.clear()
+            for (value in efficientAtLogMel) efficientAtInputBuffer.putFloat(value)
+            efficientAtInputBuffer.rewind()
+            model.run(efficientAtInputBuffer, efficientAtOutput)
+
+            val scores = efficientAtOutput[0]
+            if (!hasEfficientAtSmoothedScores) {
+                scores.copyInto(efficientAtSmoothedScores)
+                hasEfficientAtSmoothedScores = true
+            } else {
+                for (index in scores.indices) {
+                    efficientAtSmoothedScores[index] =
+                        efficientAtSmoothedScores[index] * 0.55f + scores[index] * 0.45f
+                }
+            }
+            val bestIndex = efficientAtSmoothedScores.indices.maxByOrNull { efficientAtSmoothedScores[it] } ?: -1
+            val bestScore = efficientAtSmoothedScores.getOrElse(bestIndex) { 0f }.coerceIn(0f, 1f)
+            efficientAtLatestPrediction = if (bestIndex >= 0 && bestScore >= MIN_EFFICIENTAT_SCORE) {
+                EfficientAtPrediction(
+                    efficientAtLabels.getOrElse(bestIndex) { "Unknown sound" },
+                    (bestScore * 100f).roundToInt(),
+                    efficientAtYamnetIndices.getOrElse(bestIndex) { -1 }
+                )
+            } else null
+            efficientAtLatestPrediction
+        } catch (error: Exception) {
+            Log.w("SoundId", "EfficientAT inference failed; YAMNet remains active", error)
+            try { model.close() } catch (_: Exception) { }
+            efficientAtInterpreter = null
+            efficientAtLatestPrediction = null
+            null
+        }
+    }
+
+    private fun fillEfficientAtLogMel(audio32k: FloatArray) {
+        require(audio32k.size == EFFICIENTAT_SAMPLE_COUNT) { "Unexpected EfficientAT audio window size." }
+        val preEmphasis = FloatArray(audio32k.size - 1)
+        for (index in preEmphasis.indices) {
+            preEmphasis[index] = audio32k[index + 1] - 0.97f * audio32k[index]
+        }
+        val expectedFrames = preEmphasis.size / EFFICIENTAT_HOP_SIZE + 1
+        require(expectedFrames == EFFICIENTAT_FRAME_COUNT) { "Unexpected EfficientAT spectrogram length." }
+        val fftOffset = (EFFICIENTAT_FFT_SIZE - EFFICIENTAT_WINDOW_SIZE) / 2
+        val firstWindowSample = EFFICIENTAT_FFT_SIZE / 2 - fftOffset
+        val melStride = EFFICIENTAT_FFT_SIZE / 2 + 1
+
+        for (frame in 0 until EFFICIENTAT_FRAME_COUNT) {
+            efficientAtReal.fill(0.0)
+            efficientAtImaginary.fill(0.0)
+            val center = frame * EFFICIENTAT_HOP_SIZE
+            for (windowIndex in 0 until EFFICIENTAT_WINDOW_SIZE) {
+                val sampleIndex = reflectAudioIndex(center - firstWindowSample + windowIndex, preEmphasis.size)
+                efficientAtReal[fftOffset + windowIndex] =
+                    preEmphasis[sampleIndex].toDouble() * efficientAtHann[windowIndex]
+            }
+            fft(efficientAtReal, efficientAtImaginary)
+
+            for (mel in 0 until EFFICIENTAT_MEL_COUNT) {
+                val melBase = mel * melStride
+                var melPower = 0.0
+                for (bin in 0 until melStride) {
+                    val real = efficientAtReal[bin]
+                    val imaginary = efficientAtImaginary[bin]
+                    val power = real * real + imaginary * imaginary
+                    melPower += efficientAtMelBasis[melBase + bin] * power
+                }
+                efficientAtLogMel[mel * EFFICIENTAT_FRAME_COUNT + frame] =
+                    ((ln(melPower + 1e-5) + 4.5) / 5.0).toFloat()
+            }
+        }
+    }
+
+    private fun reflectAudioIndex(index: Int, size: Int): Int {
+        if (size <= 1) return 0
+        var reflected = index
+        while (reflected < 0 || reflected >= size) {
+            reflected = if (reflected < 0) -reflected else 2 * size - 2 - reflected
+        }
+        return reflected
+    }
+
+    private fun isSupportedDescendant(candidateIndex: Int, ancestorIndex: Int): Boolean {
+        if (candidateIndex == ancestorIndex) return false
+        val visited = BooleanArray(CLASS_COUNT)
+        val pending = ArrayDeque<Int>()
+        childClassIndices.getOrNull(ancestorIndex)?.forEach(pending::addLast)
+        while (pending.isNotEmpty()) {
+            val current = pending.removeLast()
+            if (current == candidateIndex) return true
+            if (current !in visited.indices || visited[current]) continue
+            visited[current] = true
+            childClassIndices.getOrNull(current)?.forEach(pending::addLast)
+        }
+        return false
+    }
+
+    private fun resample48kTo32k(source: ShortArray): FloatArray {
+        require(source.size == EFFICIENTAT_SOURCE_SAMPLE_COUNT) { "Unexpected EfficientAT source window size." }
+        val output = FloatArray(EFFICIENTAT_SAMPLE_COUNT)
+        val middle = efficientAtResampleWindow.size / 2
+        for (outputIndex in output.indices) {
+            val sourcePosition = outputIndex * 1.5
+            val center = floor(sourcePosition).toInt()
+            val fraction = sourcePosition - center
+            var sum = 0.0
+            var weightSum = 0.0
+            for (tap in efficientAtResampleWindow.indices) {
+                val offset = tap - middle - fraction
+                val coefficient = (2.0 / 3.0) * sincResample(2.0 / 3.0 * offset) * efficientAtResampleWindow[tap]
+                val inputIndex = center + tap - middle
+                val reflectedIndex = reflectAudioIndex(inputIndex, source.size)
+                sum += source[reflectedIndex].toDouble() / 32768.0 * coefficient
+                weightSum += coefficient
+            }
+            output[outputIndex] = if (abs(weightSum) > 1e-12) (sum / weightSum).toFloat() else 0f
+        }
+        return output
+    }
+
+    private fun sincResample(value: Double): Double =
+        if (abs(value) < 1e-12) 1.0 else sin(PI * value) / (PI * value)
+
+    private fun createEfficientAtResampleWindow(): DoubleArray {
+        val taps = 63
+        return DoubleArray(taps) { tap ->
+            0.42 - 0.5 * cos(2.0 * PI * tap / (taps - 1)) +
+                0.08 * cos(4.0 * PI * tap / (taps - 1))
+        }
     }
 
     private fun createPersonalEmbedding(scores: FloatArray, audio: FloatArray): FloatArray {
@@ -6696,10 +9680,17 @@ private class SoundIdEngine(
         return currentIndex
     }
 
-    private fun recordWinner(label: String) = recordWindow(listOf(SoundCandidate(label, 100)))
+    private fun recordWinner(label: String, frameEndSample: Long) =
+        recordWindow(listOf(SoundCandidate(label, 100)), frameEndSample)
 
-    private fun recordWindow(candidates: List<SoundCandidate>) {
-        val seconds = CLASSIFIED_SECONDS_PER_WINDOW
+    private fun recordWindow(candidates: List<SoundCandidate>, frameEndSample: Long) {
+        val newlyCoveredSamples = newlyCoveredAudioSamples(
+            frameEndSample,
+            WINDOW_SAMPLES,
+            lastClassifiedAudioEndSample
+        )
+        lastClassifiedAudioEndSample = maxOf(lastClassifiedAudioEndSample, frameEndSample)
+        val seconds = newlyCoveredSamples / 48_000.0
         analyzedSeconds += seconds
         val uniqueCandidates = candidates.distinctBy { it.label }
         if (uniqueCandidates.isEmpty()) return
@@ -6711,13 +9702,26 @@ private class SoundIdEngine(
         }
     }
 
-    private fun createSessionSummary(): SoundSessionSummary {
-        if (analyzedSeconds <= 0.0) return SoundSessionSummary(0.0, emptyList(), emptyList())
-        val ranked = secondsByLabel.entries.sortedByDescending { it.value }
-        val entries = ranked.take(5).map { (label, seconds) ->
-            SoundSessionEntry(label, seconds, seconds / analyzedSeconds * 100.0)
+    private fun createSessionSummary(sessionDurationSeconds: Double): SoundSessionSummary {
+        val totalSeconds = maxOf(analyzedSeconds, sessionDurationSeconds).coerceAtLeast(0.0)
+        if (totalSeconds <= 0.0) return SoundSessionSummary(0.0, emptyList(), emptyList())
+
+        val timeByLabel = LinkedHashMap(secondsByLabel)
+        val unclassifiedSeconds = (totalSeconds - analyzedSeconds).coerceAtLeast(0.0)
+        if (unclassifiedSeconds > 0.01) {
+            timeByLabel["Unclear / unclassified"] = unclassifiedSeconds
         }
-        return SoundSessionSummary(analyzedSeconds, entries, timelineLabels.toList())
+        val ranked = timeByLabel.entries.sortedByDescending { it.value }
+        val selected = ranked.take(5).toMutableList()
+        val unclassifiedEntry = ranked.firstOrNull { it.key == "Unclear / unclassified" }
+        if (unclassifiedEntry != null && selected.none { it.key == unclassifiedEntry.key }) {
+            if (selected.size == 5) selected.removeAt(selected.lastIndex)
+            selected.add(unclassifiedEntry)
+        }
+        val entries = selected.map { (label, seconds) ->
+            SoundSessionEntry(label, seconds, seconds / totalSeconds * 100.0)
+        }
+        return SoundSessionSummary(totalSeconds, entries, timelineLabels.toList())
     }
 
     /** Windowed-sinc low-pass followed by 3:1 decimation; this is not rate reinterpretation. */
@@ -6734,71 +9738,6 @@ private class SoundIdEngine(
             output[outIndex] = sum.toFloat().coerceIn(-1f, 1f)
         }
         return output
-    }
-
-    private fun measureAcoustics(audio: FloatArray, rmsDb: Double): String {
-        val n = 4096
-        val real = DoubleArray(n)
-        val imaginary = DoubleArray(n)
-        val start = audio.size - n
-        for (i in 0 until n) {
-            val window = 0.5 * (1.0 - cos(2.0 * PI * i / (n - 1)))
-            real[i] = audio[start + i] * window
-        }
-        fft(real, imaginary)
-        val magnitudes = DoubleArray(n / 2)
-        var total = 0.0
-        var weighted = 0.0
-        var logSum = 0.0
-        var arithmeticSum = 0.0
-        var peakBin = 1
-        for (bin in 1 until magnitudes.size) {
-            val magnitude = hypot(real[bin], imaginary[bin])
-            magnitudes[bin] = magnitude
-            if (magnitude > magnitudes[peakBin]) peakBin = bin
-            val power = magnitude * magnitude
-            total += power
-            weighted += (bin * MODEL_RATE.toDouble() / n) * power
-            val safe = max(magnitude, 1e-12)
-            logSum += ln(safe)
-            arithmeticSum += safe
-        }
-        val centroid = if (total > 0.0) weighted / total else 0.0
-        val flatness = if (arithmeticSum > 0.0) exp(logSum / magnitudes.size) / (arithmeticSum / magnitudes.size) else 0.0
-        val dominantHz = peakBin * MODEL_RATE.toDouble() / n
-        var harmonicEnergy = 0.0
-        for (harmonic in 1..5) {
-            val bin = peakBin * harmonic
-            if (bin >= magnitudes.lastIndex) break
-            for (near in max(1, bin - 1)..min(magnitudes.lastIndex, bin + 1)) {
-                harmonicEnergy += magnitudes[near] * magnitudes[near]
-            }
-        }
-        val harmonicRatio = if (total > 0.0) (harmonicEnergy / total).coerceIn(0.0, 1.0) else 0.0
-        val texture = when {
-            flatness < 0.08 && harmonicRatio > 0.25 -> "tonal / harmonic"
-            flatness > 0.28 -> "noise-like / broadband"
-            else -> "mixed spectrum"
-        }
-        fun bandDb(firstHz: Double, lastHz: Double): String {
-            val first = max(1, (firstHz * n / MODEL_RATE).toInt())
-            val last = min(magnitudes.lastIndex, (lastHz * n / MODEL_RATE).toInt())
-            var power = 0.0
-            for (i in first..last) power += magnitudes[i] * magnitudes[i]
-            // Correct the Hann-windowed, unnormalised FFT magnitude to mean-square level.
-            val meanSquare = 16.0 * power / (3.0 * n * n)
-            val level = sqrt(meanSquare)
-            val db = if (level > 0.0) 20.0 * log10(level) else -120.0
-            return String.format(java.util.Locale.US, "%.0f dBFS", db)
-        }
-        val peakText = if (dominantHz >= 1000.0) String.format(java.util.Locale.US, "%.2f kHz", dominantHz / 1000.0)
-        else String.format(java.util.Locale.US, "%.0f Hz", dominantHz)
-        return String.format(
-            java.util.Locale.US,
-            "RMS %.1f dBFS · dominant %s · centroid %.0f Hz · flatness %.2f · harmonic energy %.0f%% (%s)\nBands (low/mid/high/top): %s / %s / %s / %s",
-            rmsDb, peakText, centroid, flatness, harmonicRatio * 100.0, texture,
-            bandDb(20.0, 250.0), bandDb(250.0, 1000.0), bandDb(1000.0, 4000.0), bandDb(4000.0, 8000.0)
-        )
     }
 
     private fun fft(real: DoubleArray, imaginary: DoubleArray) {
@@ -6844,6 +9783,8 @@ private class SoundIdEngine(
         worker.execute {
             try { interpreter?.close() } catch (_: Exception) { }
             interpreter = null
+            try { efficientAtInterpreter?.close() } catch (_: Exception) { }
+            efficientAtInterpreter = null
         }
         worker.shutdown()
     }
@@ -6977,7 +9918,8 @@ private class PianoKeyboardView(
     context: Context,
     private val onKeyChange: (midiNote: Int, pressed: Boolean) -> Unit
 ) : View(context) {
-    private var safeEdgeInsetPx = 0f
+    private var safeLeftInsetPx = 0f
+    private var safeRightInsetPx = 0f
     private var transpose = 0
     private val whitePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(245, 245, 240); style = Paint.Style.FILL }
     private val blackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(25, 29, 36); style = Paint.Style.FILL }
@@ -6988,8 +9930,9 @@ private class PianoKeyboardView(
     private val pointerNotes = mutableMapOf<Int, Int>()
     private val activeNotes = mutableSetOf<Int>()
 
-    fun setSafeEdgeInset(insetPx: Float) {
-        safeEdgeInsetPx = insetPx.coerceAtLeast(0f)
+    fun setSafeEdgeInsets(leftPx: Float, rightPx: Float) {
+        safeLeftInsetPx = leftPx.coerceAtLeast(0f)
+        safeRightInsetPx = rightPx.coerceAtLeast(0f)
         invalidate()
     }
 
@@ -7002,14 +9945,15 @@ private class PianoKeyboardView(
         super.onDraw(canvas)
         canvas.drawColor(Color.rgb(15, 23, 36))
         if (width <= 0 || height <= 0) return
-        val edgeInset = safeEdgeInsetPx.coerceAtMost(width.toFloat() * 0.35f)
-        val usableWidth = (width.toFloat() - edgeInset * 2f).coerceAtLeast(1f)
+        val leftInset = safeLeftInsetPx.coerceAtMost(width.toFloat() * 0.35f)
+        val rightInset = safeRightInsetPx.coerceAtMost(width.toFloat() * 0.35f)
+        val usableWidth = (width.toFloat() - leftInset - rightInset).coerceAtLeast(1f)
         val whiteWidth = usableWidth / whiteNotes.size
         val top = height * 0.04f
         val bottom = height * 0.96f
         whiteNotes.forEachIndexed { index, note ->
-            val left = edgeInset + index * whiteWidth
-            val right = edgeInset + (index + 1) * whiteWidth
+            val left = leftInset + index * whiteWidth
+            val right = leftInset + (index + 1) * whiteWidth
             canvas.drawRect(left, top, right, bottom, if (note in activeNotes) pressedPaint else whitePaint)
             canvas.drawRect(left, top, right, bottom, linePaint)
             val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.DKGRAY; textSize = (height * 0.075f).coerceIn(10f, 24f); textAlign = Paint.Align.CENTER }
@@ -7020,7 +9964,7 @@ private class PianoKeyboardView(
         for (note in blackNotes) {
             if (note < 0) continue
             val whiteIndex = whiteNotes.count { it < note }
-            val left = edgeInset + whiteIndex * whiteWidth - blackWidth / 2f
+            val left = leftInset + whiteIndex * whiteWidth - blackWidth / 2f
             canvas.drawRect(left, top, left + blackWidth, top + blackHeight, if (note in activeNotes) pressedPaint else blackPaint)
             canvas.drawRect(left, top, left + blackWidth, top + blackHeight, linePaint)
         }
@@ -7094,9 +10038,10 @@ private class PianoKeyboardView(
     }
 
     private fun noteAt(x: Float, y: Float): Int? {
-        val edgeInset = safeEdgeInsetPx.coerceAtMost(width.toFloat() * 0.35f)
-        if (y < 0 || y > height || x < edgeInset || x > width - edgeInset) return null
-        val usableWidth = (width.toFloat() - edgeInset * 2f).coerceAtLeast(1f)
+        val leftInset = safeLeftInsetPx.coerceAtMost(width.toFloat() * 0.35f)
+        val rightInset = safeRightInsetPx.coerceAtMost(width.toFloat() * 0.35f)
+        if (y < 0 || y > height || x < leftInset || x > width - rightInset) return null
+        val usableWidth = (width.toFloat() - leftInset - rightInset).coerceAtLeast(1f)
         val whiteWidth = usableWidth / whiteNotes.size
         val blackWidth = whiteWidth * 0.58f
         val blackHeight = height * 0.60f
@@ -7104,14 +10049,13 @@ private class PianoKeyboardView(
             for (note in blackNotes) {
                 if (note < 0) continue
                 val whiteIndex = whiteNotes.count { it < note }
-                val left = edgeInset + whiteIndex * whiteWidth - blackWidth / 2f
+                val left = leftInset + whiteIndex * whiteWidth - blackWidth / 2f
                 if (x in left..(left + blackWidth)) return note
             }
         }
-        return whiteNotes[((x - edgeInset) / whiteWidth).toInt().coerceIn(0, whiteNotes.lastIndex)]
+        return whiteNotes[((x - leftInset) / whiteWidth).toInt().coerceIn(0, whiteNotes.lastIndex)]
     }
 
-    private fun noteToFrequency(note: Int): Int = (440.0 * 2.0.pow((note - 69) / 12.0)).roundToInt().coerceIn(20, 20000)
     private fun noteName(note: Int): String = listOf("C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B")[note % 12] + (note / 12 - 1)
 }
 
@@ -7126,6 +10070,13 @@ class SpectrumView @JvmOverloads constructor(
     private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.rgb(49, 63, 81)
         strokeWidth = 1f
+    }
+    private val minorGridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(31, 42, 56)
+        strokeWidth = 1f
+    }
+    private val spectrogramPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
     }
 
     // Live spectrum is white for strong contrast against the dark blue background.
@@ -7143,11 +10094,6 @@ class SpectrumView @JvmOverloads constructor(
         style = Paint.Style.STROKE
         strokeJoin = Paint.Join.ROUND
         strokeCap = Paint.Cap.ROUND
-    }
-
-    private val peakHoldLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(255, 130, 145)
-        textSize = 23f
     }
 
     private val peakLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -7193,12 +10139,12 @@ class SpectrumView @JvmOverloads constructor(
 
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.rgb(225, 233, 243)
-        textSize = 27f
+        textSize = 10f * resources.displayMetrics.density
     }
 
     private val dbLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.rgb(225, 233, 243)
-        textSize = 27f
+        textSize = 10f * resources.displayMetrics.density
         style = Paint.Style.FILL
         typeface = android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
     }
@@ -7210,27 +10156,17 @@ class SpectrumView @JvmOverloads constructor(
     }
     private val dbAxisTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.rgb(225, 233, 243)
-        textSize = 27f
+        textSize = 10f * resources.displayMetrics.density
         textAlign = Paint.Align.RIGHT
     }
     private val dbAxisUnitPaint = Paint(dbLabelPaint).apply { textAlign = Paint.Align.RIGHT }
 
     private val peakTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.rgb(255, 213, 135)
-        textSize = 23f
+        textSize = 8.5f * resources.displayMetrics.density
         style = Paint.Style.FILL
         setShadowLayer(3f, 0f, 1f, Color.rgb(15, 23, 36))
     }
-
-    // Custom frequency-grid divisions requested for the spectrum display.
-    private val gridFrequencies = intArrayOf(
-        0, 40, 60, 100, 200, 340, 400, 500, 600, 700, 770, 880,
-        1000, 2000, 2800, 3200, 4000, 5100, 6200, 7300, 8400,
-        9500, 10000, 11000, 12000, 13000, 14000, 15000, 16000,
-        17000, 18000, 19000, 20000, 24000, 28000, 32000, 36000, 40000
-    )
-
-    private val frequencyLabelTicks = setOf(40, 60, 100, 200, 500, 1000, 2000, 4000, 10000, 20000)
 
     private val spectrumPath = Path()
     private val peakHoldPath = Path()
@@ -7249,14 +10185,20 @@ class SpectrumView @JvmOverloads constructor(
     @Volatile
     private var spectrogramEnabled = false
     private val spectrogramHistory = java.util.ArrayDeque<DoubleArray>()
-    private val spectrogramHistoryLimit = 140
+    private val spectrogramHistorySeconds = 6.0
+    private var spectrogramColumnFirstBins = IntArray(0)
+    private var spectrogramColumnLastBins = IntArray(0)
     private var peakHoldEnabled = false
     private var peakHoldMagnitudes = DoubleArray(0)
-    private var dbCeiling = 10
-    private var dbFloor = -130
+    private var dbCeiling = -30
+    private var dbFloor = -150
+    private var dbAxisTransitionRange: Pair<Double, Double>? = null
+    private var frequencyAxisTransition: Triple<Pair<Double, Double>, Pair<Double, Double>, Float>? = null
+    private var dbAxisTransition: Triple<Pair<Int, Int>, Pair<Int, Int>, Float>? = null
     private var dbRangeMode = "DEFAULT"
     private var savedDbRange: Pair<Int, Int>? = null
     private var savedFrequencyRangeForKeys: Pair<Double, Double>? = null
+    private var keysFrequencyRangeExitStart: Pair<Double, Double>? = null
     private var panStartX = 0f
     private var panStartY = 0f
     private var lastTouchX = 0f
@@ -7274,33 +10216,83 @@ class SpectrumView @JvmOverloads constructor(
     private var resetGeneration = 0
     private val touchSlop = android.view.ViewConfiguration.get(context).scaledTouchSlop
     private var soundIdPortraitLayoutActive = false
+    private var plotInsetsDirty = true
+    private var cachedPlotCutoutInsets = 0f to 0f
 
     fun setSoundIdPortraitLayoutActive(active: Boolean) {
         if (soundIdPortraitLayoutActive == active) return
         soundIdPortraitLayoutActive = active
+        plotInsetsDirty = true
         invalidate()
     }
 
-    private fun plotLeftInset(): Float {
+    private fun plotCutoutInsets(): Pair<Float, Float> {
+        if (!plotInsetsDirty) return cachedPlotCutoutInsets
+        plotInsetsDirty = false
         // In portrait Sound ID mode, use the full screen width for the plot.
-        // The landscape inset exists to keep the graph clear of the front camera.
-        if (soundIdPortraitLayoutActive) return 0f
-        val density = resources.displayMetrics.density
-        val cameraSafeInsetScreen = if (android.os.Build.VERSION.SDK_INT >= 28) {
-            rootWindowInsets?.displayCutout?.safeInsetLeft ?: 0
-        } else {
-            0
+        // In landscape, keep the same 4 dp gap beyond the OS-reported camera cutout.
+        if (soundIdPortraitLayoutActive || android.os.Build.VERSION.SDK_INT < 28) {
+            cachedPlotCutoutInsets = 0f to 0f
+            return cachedPlotCutoutInsets
         }
+        val cutout = rootWindowInsets?.displayCutout ?: run {
+            cachedPlotCutoutInsets = 0f to 0f
+            return cachedPlotCutoutInsets
+        }
+        val root = rootView
+        if (root.width <= 0 || width <= 0) {
+            plotInsetsDirty = true
+            return 0f to 0f
+        }
+        val rootLocation = IntArray(2)
         val viewLocation = IntArray(2)
+        root.getLocationOnScreen(rootLocation)
         getLocationOnScreen(viewLocation)
-        val cameraSafeInset = (cameraSafeInsetScreen - viewLocation[0]).coerceAtLeast(0)
-        // Keep the graph close to the cutout while leaving a small visual safety gap.
-        return if (cameraSafeInset > 0) {
-            cameraSafeInset + 4f * density
-        } else {
-            18f * density
-        }
+        val rootLeft = rootLocation[0].toFloat()
+        val rootRight = rootLeft + root.width
+        val viewLeft = viewLocation[0].toFloat()
+        val viewRight = viewLeft + width
+        val leftOverlap = (rootLeft + cutout.safeInsetLeft - viewLeft).coerceAtLeast(0f)
+        val rightOverlap = (viewRight - (rootRight - cutout.safeInsetRight)).coerceAtLeast(0f)
+        val gap = 4f * resources.displayMetrics.density
+        cachedPlotCutoutInsets = (if (leftOverlap > 0f) leftOverlap + gap else 0f) to
+                (if (rightOverlap > 0f) rightOverlap + gap else 0f)
+        return cachedPlotCutoutInsets
     }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        plotInsetsDirty = true
+    }
+
+    override fun onApplyWindowInsets(insets: android.view.WindowInsets): android.view.WindowInsets {
+        val result = super.onApplyWindowInsets(insets)
+        plotInsetsDirty = true
+        postInvalidateOnAnimation()
+        return result
+    }
+
+    private fun plotTopInset(): Float = 20f * resources.displayMetrics.density
+
+    private fun plotBottomInset(): Float = 15f * resources.displayMetrics.density
+
+    private fun plotLeftInset(): Float {
+        if (soundIdPortraitLayoutActive) return 0f
+        val (leftInset, _) = plotCutoutInsets()
+        // Preserve the existing landscape fallback on Android versions without cutout APIs.
+        return if (leftInset > 0f) leftInset else 18f * resources.displayMetrics.density
+    }
+
+    private fun plotRightInset(): Float {
+        if (soundIdPortraitLayoutActive) return 0f
+        return plotCutoutInsets().second
+    }
+
+    private fun plotRightEdge(): Float =
+        width.toFloat() - plotRightInset() - dbAxisMarginWidth - 2f
+
+    private fun axisLabelRight(): Float =
+        width.toFloat() - plotRightInset() - 7f * resources.displayMetrics.density
 
     fun getResetGeneration(): Int = resetGeneration
     private var controlStateListener: ((String, Boolean, Int, Int) -> Unit)? = null
@@ -7389,12 +10381,14 @@ class SpectrumView @JvmOverloads constructor(
         magnitudes = smoothedMagnitudes.copyOf()
         synchronized(spectrogramHistory) {
             spectrogramHistory.addLast(magnitudes.copyOf())
-            while (spectrogramHistory.size > spectrogramHistoryLimit) spectrogramHistory.removeFirst()
+            val frameHop = (fftSize / 4).coerceAtLeast(1)
+            val historyLimit = ceil(spectrogramHistorySeconds * sampleRate / frameHop).toInt().coerceAtLeast(1)
+            while (spectrogramHistory.size > historyLimit) spectrogramHistory.removeFirst()
         }
-        // Keep the vertical axis range at -160 dB to -30 dB after startup and reset.
+        // Keep the default spectrum range at -150 dB to -30 dB after startup and reset.
         // Do not auto-center the graph on the strongest peak, which can make it jump vertically.
         if (initialAutoRangePending) {
-            dbFloor = -160
+            dbFloor = -150
             dbCeiling = -30
             initialAutoRangePending = false
             notifyControlState()
@@ -7419,16 +10413,6 @@ class SpectrumView @JvmOverloads constructor(
         postInvalidateOnAnimation()
     }
 
-    fun clearSpectrum() {
-        magnitudes = DoubleArray(0)
-        smoothedMagnitudes = DoubleArray(0)
-        synchronized(spectrogramHistory) { spectrogramHistory.clear() }
-        peakHoldMagnitudes = DoubleArray(0)
-        peakFrequency = 0.0
-        // Preserve the user's current scale when analysis is stopped/restarted.
-        invalidate()
-    }
-
     override fun onTouchEvent(event: MotionEvent): Boolean {
         // Keep parent containers (for example, a ScrollView) from interpreting
         // the vertical movement of a pinch gesture as a request to scroll the UI.
@@ -7443,7 +10427,7 @@ class SpectrumView @JvmOverloads constructor(
                 multiTouchInProgress = false
                 dragging = false
                 // Dragging the dB-axis margin on the right changes the vertical range.
-                draggingYScale = !spectrogramEnabled && event.x >= width - dbAxisMarginWidth
+                draggingYScale = !spectrogramEnabled && event.x >= plotRightEdge()
                 if (draggingYScale) parent?.requestDisallowInterceptTouchEvent(true)
                 yScaleStartY = event.y
                 yScaleStartRange = (dbCeiling - dbFloor).toFloat()
@@ -7537,10 +10521,6 @@ class SpectrumView @JvmOverloads constructor(
         return true
     }
 
-    private fun performClickIfShortPress() {
-        if (!longPressTriggered) performClick()
-    }
-
     override fun performClick(): Boolean {
         super.performClick()
         return true
@@ -7571,21 +10551,24 @@ class SpectrumView @JvmOverloads constructor(
 
     fun setDbRangeMode(mode: String) {
         val nextMode = when (mode) {
-            "TONE", "KEYS" -> mode
+              "TONE", "KEYS", "SOUND" -> mode
             else -> "DEFAULT"
         }
         if (nextMode == dbRangeMode) return
+        dbAxisTransitionRange = null
+        dbAxisTransition = null
 
         if (dbRangeMode == "DEFAULT" && nextMode != "DEFAULT") {
-            savedDbRange = if (initialAutoRangePending) (-160 to -30) else (dbFloor to dbCeiling)
+            savedDbRange = if (initialAutoRangePending) (-150 to -30) else (dbFloor to dbCeiling)
         }
 
         dbRangeMode = nextMode
         when (nextMode) {
             "TONE" -> { dbFloor = -135; dbCeiling = -30 }
             "KEYS" -> { dbFloor = -140; dbCeiling = -30 }
+              "SOUND" -> { dbFloor = -140; dbCeiling = -30 }
             else -> {
-                val restoredRange = savedDbRange ?: (-160 to -30)
+                val restoredRange = savedDbRange ?: (-150 to -30)
                 dbFloor = restoredRange.first
                 dbCeiling = restoredRange.second
                 savedDbRange = null
@@ -7596,11 +10579,13 @@ class SpectrumView @JvmOverloads constructor(
         notifyControlState()
     }
 
-    fun setKeysFrequencyRangeActive(active: Boolean) {
+    fun setKeysFrequencyRangeActive(active: Boolean, notify: Boolean = true) {
+        frequencyAxisTransition = null
         if (active) {
             if (savedFrequencyRangeForKeys == null) {
                 savedFrequencyRangeForKeys = visibleMinFrequency to visibleMaxFrequency
             }
+            keysFrequencyRangeExitStart = null
             visibleMinFrequency = 65.0
             visibleMaxFrequency = 12500.0
         } else {
@@ -7608,9 +10593,77 @@ class SpectrumView @JvmOverloads constructor(
             visibleMinFrequency = previousRange.first
             visibleMaxFrequency = previousRange.second
             savedFrequencyRangeForKeys = null
+            keysFrequencyRangeExitStart = null
         }
         invalidate()
-        notifyFrequencyRange()
+        if (notify) notifyFrequencyRange()
+    }
+
+    fun getVisibleFrequencyRangeForTransition(): Pair<Double, Double> =
+        visibleMinFrequency to visibleMaxFrequency
+
+    fun setFrequencyRangeForTransition(
+        start: Pair<Double, Double>,
+        target: Pair<Double, Double>,
+        progress: Float
+    ) {
+        val fraction = progress.coerceIn(0f, 1f).toDouble()
+        frequencyAxisTransition = if (fraction < 1.0) Triple(start, target, fraction.toFloat()) else null
+        if (linearFrequencyAxis) {
+            visibleMinFrequency = start.first + (target.first - start.first) * fraction
+            visibleMaxFrequency = start.second + (target.second - start.second) * fraction
+        } else {
+            val startMin = logAxisPosition(start.first)
+            val startMax = logAxisPosition(start.second)
+            val targetMin = logAxisPosition(target.first)
+            val targetMax = logAxisPosition(target.second)
+            visibleMinFrequency = frequencyAtLogAxisPosition(startMin + (targetMin - startMin) * fraction)
+            visibleMaxFrequency = frequencyAtLogAxisPosition(startMax + (targetMax - startMax) * fraction)
+        }
+        invalidate()
+    }
+
+    fun notifyVisibleFrequencyRangeChanged() = notifyFrequencyRange()
+
+    fun getVisibleDbRangeForTransition(): Pair<Int, Int> = dbFloor to dbCeiling
+
+    fun getDbRangeTargetForMode(mode: String): Pair<Int, Int> = when (mode) {
+        "TONE" -> -135 to -30
+        "KEYS", "SOUND" -> -140 to -30
+        else -> savedDbRange ?: (-150 to -30)
+    }
+
+    fun setDbRangeForTransition(
+        start: Pair<Int, Int>,
+        target: Pair<Int, Int>,
+        progress: Float
+    ) {
+        val fraction = progress.coerceIn(0f, 1f).toDouble()
+        dbAxisTransition = if (fraction < 1.0) Triple(start, target, fraction.toFloat()) else null
+        val floorDb = start.first + (target.first - start.first) * fraction
+        val ceilingDb = start.second + (target.second - start.second) * fraction
+        dbAxisTransitionRange = floorDb to max(ceilingDb, floorDb + 1.0)
+        invalidate()
+    }
+
+    fun beginKeysFrequencyRangeExitTransition() {
+        if (savedFrequencyRangeForKeys == null) return
+        keysFrequencyRangeExitStart = visibleMinFrequency to visibleMaxFrequency
+    }
+
+    fun setKeysFrequencyRangeExitProgress(progress: Float) {
+        val start = keysFrequencyRangeExitStart ?: return
+        val target = savedFrequencyRangeForKeys ?: return
+        setFrequencyRangeForTransition(start, target, progress)
+    }
+
+    fun cancelKeysFrequencyRangeExitTransition() {
+        val start = keysFrequencyRangeExitStart ?: return
+        visibleMinFrequency = start.first
+        visibleMaxFrequency = start.second
+        keysFrequencyRangeExitStart = null
+        frequencyAxisTransition = null
+        invalidate()
     }
 
     fun toggleFrequencyAxis() {
@@ -7621,8 +10674,8 @@ class SpectrumView @JvmOverloads constructor(
 
     fun toggleSpectrogram(): Boolean {
         spectrogramEnabled = !spectrogramEnabled
-        // Show the selected view on the next animation frame. New FFT frames continue
-        // filling the existing 140-frame history while the view is visible.
+        // Show the selected view on the next frame. History duration stays stable
+        // when the graph changes FFT size.
         postInvalidateOnAnimation()
         return spectrogramEnabled
     }
@@ -7664,32 +10717,54 @@ class SpectrumView @JvmOverloads constructor(
     ) {
         if (history.isEmpty() || right <= left || bottom <= top) return
         // Limit horizontal raster columns to avoid thousands of tiny draw calls per frame.
-        // The waterfall still updates on every incoming FFT frame.
+        // Aggregate the bins that cross each pixel column so narrow tones do not disappear.
         val columns = max(1, (right - left).toInt().coerceAtMost(240))
         val rows = history.size
         val cellWidth = (right - left) / columns
         val cellHeight = (bottom - top) / rows
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         val highestAnalyzedFrequency = min(sampleRate / 2.0, 20000.0)
+        if (spectrogramColumnFirstBins.size != columns) {
+            spectrogramColumnFirstBins = IntArray(columns)
+            spectrogramColumnLastBins = IntArray(columns)
+        }
+        for (column in 0 until columns) {
+            val firstRatio = column.toDouble() / columns
+            val lastRatio = (column + 1).toDouble() / columns
+            val firstFrequency = frequencyAtRatio(firstRatio, minFreq, maxFreq)
+            val lastFrequency = frequencyAtRatio(lastRatio, minFreq, maxFreq)
+            val bins = spectrogramBinRange(
+                firstFrequency,
+                lastFrequency,
+                sampleRate,
+                fftSize,
+                highestAnalyzedFrequency
+            )
+            spectrogramColumnFirstBins[column] = bins?.first ?: -1
+            spectrogramColumnLastBins[column] = bins?.last ?: -1
+        }
 
         for (row in history.indices) {
             val frame = history[row]
             if (frame.isEmpty()) continue
             for (column in 0 until columns) {
-                val ratio = (column + 0.5) / columns.toDouble()
-                val frequency = frequencyAtRatio(ratio, minFreq, maxFreq)
-                if (frequency < 0.0 || frequency > highestAnalyzedFrequency) {
-                    paint.color = backgroundColor
+                val firstBin = spectrogramColumnFirstBins[column]
+                val lastBin = spectrogramColumnLastBins[column].coerceAtMost(frame.lastIndex)
+                if (firstBin < 0 || lastBin < firstBin) {
+                    spectrogramPaint.color = backgroundColor
                 } else {
-                    val bin = (frequency * fftSize / sampleRate).roundToInt().coerceIn(0, frame.lastIndex)
-                    val normalizedMagnitude = frame[bin] * 4.0 / fftSize
+                    var maximumMagnitude = 0.0
+                    for (bin in firstBin..lastBin) {
+                        val magnitude = frame[bin]
+                        if (magnitude.isFinite() && magnitude > maximumMagnitude) maximumMagnitude = magnitude
+                    }
+                    val normalizedMagnitude = maximumMagnitude * 4.0 / fftSize
                     val magnitudeDb = if (normalizedMagnitude > 1e-8) 20.0 * log10(normalizedMagnitude) else -160.0
-                    paint.color = spectrogramColor(magnitudeDb)
+                    spectrogramPaint.color = spectrogramColor(magnitudeDb)
                 }
                 val x0 = left + column * cellWidth
                 // Oldest frames are at the top; newest frames are at the bottom.
                 val y0 = top + row * cellHeight
-                canvas.drawRect(x0, y0, x0 + cellWidth + 1f, y0 + cellHeight + 1f, paint)
+                canvas.drawRect(x0, y0, x0 + cellWidth + 1f, y0 + cellHeight + 1f, spectrogramPaint)
             }
         }
     }
@@ -7727,7 +10802,7 @@ class SpectrumView @JvmOverloads constructor(
 
     private fun selectFrequencyAt(touchX: Float) {
         val left = plotLeftInset()
-        val right = width.toFloat() - dbAxisMarginWidth - 2f
+        val right = plotRightEdge()
         if (right <= left || touchX < left || touchX > right) return
         val ratio = ((touchX - left) / (right - left)).coerceIn(0f, 1f).toDouble()
         val selected = frequencyAtRatio(ratio, visibleMinFrequency, visibleMaxFrequency)
@@ -7737,9 +10812,9 @@ class SpectrumView @JvmOverloads constructor(
 
     private fun selectSpectrogramAt(touchX: Float, touchY: Float) {
         val left = plotLeftInset()
-        val right = width.toFloat() - dbAxisMarginWidth - 2f
-        val top = 56f
-        val bottom = height.toFloat() - 42f
+        val right = plotRightEdge()
+        val top = plotTopInset()
+        val bottom = height.toFloat() - plotBottomInset()
         if (right <= left || bottom <= top || touchX < left || touchX > right || touchY < top || touchY > bottom) return
         val frequencyRatio = ((touchX - left) / (right - left)).coerceIn(0f, 1f).toDouble()
         val selectedHz = frequencyAtRatio(frequencyRatio, visibleMinFrequency, visibleMaxFrequency)
@@ -7755,22 +10830,6 @@ class SpectrumView @JvmOverloads constructor(
         selectedSpectrogramYRatio = historyRatio.toDouble()
         selectedFrequency = null
         invalidate()
-    }
-
-    fun adjustDbCeiling(delta: Int) {
-        initialAutoRangePending = false
-        dbCeiling = (dbCeiling + delta).coerceIn(-125, 10)
-        if (dbCeiling - dbFloor < 20) dbFloor = dbCeiling - 20
-        invalidate()
-        notifyControlState()
-    }
-
-    fun adjustDbFloor(delta: Int) {
-        initialAutoRangePending = false
-        dbFloor = (dbFloor + delta).coerceIn(-150, -10)
-        if (dbCeiling - dbFloor < 20) dbCeiling = dbFloor + 20
-        invalidate()
-        notifyControlState()
     }
 
     fun resetView(preserveFrequencyRange: Boolean = false, useKeysFrequencyRange: Boolean = false) {
@@ -7796,8 +10855,8 @@ class SpectrumView @JvmOverloads constructor(
         dbCeiling = -30
         dbFloor = when (dbRangeMode) {
             "TONE" -> -135
-            "KEYS" -> -140
-            else -> -160
+              "KEYS", "SOUND" -> -140
+            else -> -150
         }
         highResolutionFftEnabled = false
         sourceFftSize = 8192
@@ -7845,7 +10904,7 @@ class SpectrumView @JvmOverloads constructor(
         if (spectrogramEnabled) return
         if (!scaleFactor.isFinite() || scaleFactor <= 0f || width <= 0) return
         val left = plotLeftInset()
-        val right = width.toFloat() - dbAxisMarginWidth - 2f
+        val right = plotRightEdge()
         if (right <= left) return
         val focusRatio = ((focusX - left) / (right - left)).coerceIn(0f, 1f).toDouble()
         val oldMin = visibleMinFrequency
@@ -7875,7 +10934,7 @@ class SpectrumView @JvmOverloads constructor(
         }
         // Horizontal dragging pans the frequency range; vertical dragging pans the
         // visible dB window without changing its height (dB span).
-        val plotWidth = (width.toFloat() - plotLeftInset() - dbAxisMarginWidth - 2f).coerceAtLeast(1f)
+        val plotWidth = (plotRightEdge() - plotLeftInset()).coerceAtLeast(1f)
         val fraction = (-dx / plotWidth).toDouble()
         val frequencySpan = if (linearFrequencyAxis) visibleMaxFrequency - visibleMinFrequency
         else logAxisPosition(visibleMaxFrequency) - logAxisPosition(visibleMinFrequency)
@@ -7891,7 +10950,7 @@ class SpectrumView @JvmOverloads constructor(
         // Keep the current dB range size fixed while moving it vertically.
         // The default/reset floor remains -130 dB, but panning can move the
         // visible window below that value so a zoomed trace can be repositioned.
-        val plotHeight = (height.toFloat() - 80f).coerceAtLeast(1f)
+        val plotHeight = (height.toFloat() - plotTopInset() - plotBottomInset()).coerceAtLeast(1f)
         val dbSpan = (dbCeiling - dbFloor).coerceAtLeast(20)
         val dbShift = (dy / plotHeight * dbSpan.toFloat()).roundToInt()
         if (dbShift != 0) {
@@ -7936,6 +10995,8 @@ class SpectrumView @JvmOverloads constructor(
         right: Float,
         top: Float,
         bottom: Float,
+        displayDbFloor: Double,
+        displayDbCeiling: Double,
         paint: Paint,
         path: Path
     ) {
@@ -7957,8 +11018,9 @@ class SpectrumView @JvmOverloads constructor(
             val fraction = (binPosition - lowerBin).coerceIn(0.0, 1.0)
             // Interpolate magnitudes between bins to avoid a blocky, stair-stepped trace when zoomed.
             val interpolatedMagnitude = data[lowerBin] * (1.0 - fraction) + data[lowerBin + 1] * fraction
-            val db = magnitudeToDb(interpolatedMagnitude, fftSize).coerceIn(dbFloor.toDouble(), dbCeiling.toDouble())
-            val y = top + ((dbCeiling - db) / (dbCeiling - dbFloor)).toFloat() * (bottom - top)
+            val db = magnitudeToDb(interpolatedMagnitude, fftSize).coerceIn(displayDbFloor, displayDbCeiling)
+            val dbSpan = (displayDbCeiling - displayDbFloor).coerceAtLeast(1.0)
+            val y = top + ((displayDbCeiling - db) / dbSpan).toFloat() * (bottom - top)
             if (!started) {
                 path.moveTo(x, y)
                 started = true
@@ -7983,22 +11045,61 @@ class SpectrumView @JvmOverloads constructor(
         val lastBin = min(data.lastIndex - 1, kotlin.math.floor(min(maxFreq, 20000.0) / binWidth).toInt())
         if (lastBin <= firstBin) return emptyList()
 
+        fun shoulderLevelDb(startBin: Int, endBin: Int): Double? {
+            if (endBin < startBin) return null
+            var powerSum = 0.0
+            var count = 0
+            for (bin in startBin..endBin) {
+                val magnitude = data[bin]
+                if (magnitude.isFinite()) {
+                    powerSum += magnitude * magnitude
+                    count++
+                }
+            }
+            if (count == 0) return null
+            return magnitudeToDb(sqrt(powerSum / count), fftSize)
+        }
+
         val candidates = ArrayList<Peak>()
         for (bin in firstBin..lastBin) {
             val magnitude = data[bin]
-            if (magnitude >= data[bin - 1] && magnitude > data[bin + 1]) {
-                val db = magnitudeToDb(magnitude, fftSize)
-                if (db > -95.0) {
-                    candidates.add(Peak(bin, bin * binWidth, db))
-                }
+            if (!magnitude.isFinite() || magnitude <= 0.0) continue
+            if (magnitude < data[bin - 1] || magnitude <= data[bin + 1]) continue
+
+            val db = magnitudeToDb(magnitude, fftSize)
+            if (db <= -95.0) continue
+
+            // A local maximum alone is often just FFT noise or leakage. Require
+            // at least 6 dB of prominence over the RMS level on both shoulders,
+            // outside the Hann-window main lobe (about 3–8 FFT bins away).
+            val leftFloor = shoulderLevelDb(max(firstBin, bin - 8), bin - 3) ?: continue
+            val rightFloor = shoulderLevelDb(bin + 3, min(lastBin, bin + 8)) ?: continue
+            if (db - max(leftFloor, rightFloor) < 6.0) continue
+
+            // Refine the displayed frequency with a three-bin parabolic fit in
+            // log magnitude, which is more accurate than labeling the bin center.
+            val leftLog = ln(max(data[bin - 1], 1e-15))
+            val centerLog = ln(max(magnitude, 1e-15))
+            val rightLog = ln(max(data[bin + 1], 1e-15))
+            val curvature = leftLog - 2.0 * centerLog + rightLog
+            val binOffset = if (curvature < -1e-12) {
+                (0.5 * (leftLog - rightLog) / curvature).coerceIn(-0.5, 0.5)
+            } else {
+                0.0
+            }
+            val peakFrequency = (bin + binOffset) * binWidth
+            if (peakFrequency in minFreq..min(maxFreq, 20000.0)) {
+                candidates.add(Peak(bin, peakFrequency, db))
             }
         }
 
         candidates.sortByDescending { it.db }
         val selected = ArrayList<Peak>(4)
         for (candidate in candidates) {
-            // Prevent adjacent FFT bins belonging to one broad peak being reported separately.
-            if (selected.none { kotlin.math.abs(it.bin - candidate.bin) < 5 }) {
+            // Keep one marker per resolvable peak; scale spacing with FFT
+            // resolution and frequency so neighboring bins do not become labels.
+            val minimumSeparationHz = max(binWidth * 5.0, candidate.frequency * 0.002)
+            if (selected.none { kotlin.math.abs(it.frequency - candidate.frequency) < minimumSeparationHz }) {
                 selected.add(candidate)
                 if (selected.size == 4) break
             }
@@ -8009,15 +11110,15 @@ class SpectrumView @JvmOverloads constructor(
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
-        val w = width.toFloat()
         val h = height.toFloat()
+        val density = resources.displayMetrics.density
         canvas.drawColor(backgroundColor)
 
-        // Leave room at the left edge for the front camera in landscape.
+        // Respect the camera cutout on either landscape edge.
         val left = plotLeftInset()
-        val right = w - dbAxisMarginWidth - 2f
-        val top = 56f
-        val bottom = h - 42f
+        val right = plotRightEdge()
+        val top = plotTopInset()
+        val bottom = h - plotBottomInset()
         if (right <= left || bottom <= top) return
 
         // Keep the X-axis line out of the graph: it should not remain fixed when
@@ -8033,26 +11134,54 @@ class SpectrumView @JvmOverloads constructor(
         }
 
         if (linearFrequencyAxis) {
+            // Use a readable 1/2/5 sequence whose density adapts to the
+            // visible range and screen width instead of drawing every custom tick.
             val axisStart = minFreq
             val axisEnd = maxFreq
-            val axisPeriod = maxFrequencyBound
-            val firstGridCycle = kotlin.math.floor(axisStart / axisPeriod).toInt() - 1
-            val lastGridCycle = kotlin.math.ceil(axisEnd / axisPeriod).toInt() + 1
-            for (cycle in firstGridCycle..lastGridCycle) {
-                for (frequency in gridFrequencies) {
-                    val position = frequency + cycle * axisPeriod
-                    if (position < axisStart || position > axisEnd) continue
-                    val x = left + (right - left) * ((position - axisStart) / (axisEnd - axisStart)).toFloat()
-                    canvas.drawLine(x, top, x, bottom, gridPaint)
-                    if (cycle != 0 || frequency <= 0 || frequency !in frequencyLabelTicks) continue
-                    val label = when {
-                        frequency == 20000 -> "20k"
-                        frequency >= 1000 -> "${frequency / 1000}k"
-                        else -> frequency.toString()
+            val span = axisEnd - axisStart
+            val density = resources.displayMetrics.density
+            val targetMajorCount = ((right - left) / (90f * density)).roundToInt().coerceIn(4, 10)
+            val rawMajorStep = span / targetMajorCount
+            val stepMagnitude = 10.0.pow(floor(log10(rawMajorStep.coerceAtLeast(1e-9))))
+            val normalizedStep = rawMajorStep / stepMagnitude
+            val majorStep = (when {
+                normalizedStep <= 1.0 -> 1.0
+                normalizedStep <= 2.0 -> 2.0
+                normalizedStep <= 5.0 -> 5.0
+                else -> 10.0
+            }) * stepMagnitude
+            val majorSpacingDp = (right - left) * (majorStep / span) / density
+            val subdivisions = if (majorSpacingDp >= 110f) 2L else 1L
+            val gridStep = majorStep / subdivisions
+            val firstTick = floor(axisStart / gridStep).toLong()
+            val lastTick = ceil(axisEnd / gridStep).toLong()
+            var tick = firstTick
+            var drawnLines = 0
+            while (tick <= lastTick && drawnLines < 180) {
+                val position = tick * gridStep
+                val isMajor = tick % subdivisions == 0L
+                val x = left + (right - left) * ((position - axisStart) / span).toFloat()
+                canvas.drawLine(x, top, x, bottom, if (isMajor) gridPaint else minorGridPaint)
+                if (isMajor && position > 0.0 && position <= 20000.0) {
+                    val label = if (position >= 1000.0) {
+                        val kilo = position / 1000.0
+                        val roundedKilo = kilo.roundToInt().toDouble()
+                        if (kotlin.math.abs(kilo - roundedKilo) < 0.01) {
+                            "${roundedKilo.roundToInt()}k"
+                        } else {
+                            String.format(java.util.Locale.US, "%.1fk", kilo)
+                        }
+                    } else if (kotlin.math.abs(position - position.roundToInt()) < 0.01) {
+                        position.roundToInt().toString()
+                    } else {
+                        String.format(java.util.Locale.US, "%.1f", position)
                     }
-                    val labelX = max(left, x - textPaint.measureText(label) / 2f)
-                    canvas.drawText(label, labelX, bottom + 30f, textPaint)
+                    val labelWidth = textPaint.measureText(label)
+                    val labelX = (x - labelWidth / 2f).coerceIn(left, max(left, right - labelWidth))
+                    canvas.drawText(label, labelX, bottom + 11f * density, textPaint)
                 }
+                tick++
+                drawnLines++
             }
         } else {
             val axisStart = logAxisPosition(minFreq)
@@ -8065,7 +11194,7 @@ class SpectrumView @JvmOverloads constructor(
                 if (label != null) {
                     val labelX = (x - textPaint.measureText(label) / 2f)
                         .coerceIn(left, max(left, right - textPaint.measureText(label)))
-                    canvas.drawText(label, labelX, bottom + 30f, textPaint)
+                    canvas.drawText(label, labelX, bottom + 11f * density, textPaint)
                 }
             }
 
@@ -8110,9 +11239,37 @@ class SpectrumView @JvmOverloads constructor(
             }
         }
 
+        // Ease the 20 Hz endpoint label into view while the axis is animating out
+        // of KEYS. The normal tick takes over at the end of the transition.
+        if (!linearFrequencyAxis) {
+            val transition = frequencyAxisTransition
+            if (transition != null) {
+                val (startRange, targetRange, progress) = transition
+                val startsAt20 = startRange.first <= 20.001 && startRange.second >= 20.0
+                val endsAt20 = targetRange.first <= 20.001 && targetRange.second >= 20.0
+                val fade = when {
+                    endsAt20 && startRange.first > 20.001 && minFreq > 20.001 && progress > 0.76f ->
+                        ((progress - 0.76f) / 0.22f).coerceIn(0f, 1f)
+                    startsAt20 && targetRange.first > 20.001 && minFreq > 20.001 && progress < 0.22f ->
+                        (1f - progress / 0.22f).coerceIn(0f, 1f)
+                    else -> 0f
+                }
+                if (fade > 0f) {
+                    val oldAlpha = textPaint.alpha
+                    textPaint.alpha = (oldAlpha * fade).roundToInt().coerceIn(0, 255)
+                    canvas.drawText("20", left, bottom + 11f * density, textPaint)
+                    textPaint.alpha = oldAlpha
+                }
+            }
+        }
+
+        val displayDbRange = dbAxisTransitionRange
+        val displayDbFloor = displayDbRange?.first ?: dbFloor.toDouble()
+        val displayDbCeiling = displayDbRange?.second ?: dbCeiling.toDouble()
         fun yForDb(db: Double): Float {
-            val clampedDb = db.coerceIn(dbFloor.toDouble(), dbCeiling.toDouble())
-            return top + ((dbCeiling - clampedDb) / (dbCeiling - dbFloor)).toFloat() * (bottom - top)
+            val clampedDb = db.coerceIn(displayDbFloor, displayDbCeiling)
+            val ratio = ((displayDbCeiling - clampedDb) / (displayDbCeiling - displayDbFloor)).toFloat()
+            return top + ratio * (bottom - top)
         }
 
         val historySnapshot = if (spectrogramEnabled) {
@@ -8145,29 +11302,48 @@ class SpectrumView @JvmOverloads constructor(
                     if (cycle == 0) {
                         val secondsAgo = historySeconds * (1.0 - ratio)
                         val label = if (i == 4) "0 s" else String.format(java.util.Locale.US, "%.1f s", secondsAgo)
-                        canvas.drawText(label, w - 7f * resources.displayMetrics.density, y + 8f, dbAxisTextPaint)
+                        canvas.drawText(label, axisLabelRight(), y + 3f * density, dbAxisTextPaint)
                     }
                 }
             }
-            canvas.drawText("TIME", w - 7f * resources.displayMetrics.density, max(10f, top - 26f), dbAxisUnitPaint)
+            canvas.drawText("TIME", axisLabelRight(), max(10f * density, top - 10f * density), dbAxisUnitPaint)
         } else {
             val axisX = right
-            val dbTickStep = if (dbCeiling - dbFloor > 160) 20 else 10
-            var dbTick = kotlin.math.floor(dbCeiling / dbTickStep.toDouble()).toInt() * dbTickStep
+            val dbTickStep = if (displayDbCeiling - displayDbFloor > 160.0) 20 else 10
+            var dbTick = kotlin.math.floor(displayDbCeiling / dbTickStep).toInt() * dbTickStep
             canvas.drawLine(axisX, top, axisX, bottom, dbAxisPaint)
-            while (dbTick >= dbFloor) {
+            while (dbTick >= displayDbFloor) {
                 val y = yForDb(dbTick.toDouble())
                 canvas.drawLine(left, y, right, y, gridPaint)
                 canvas.drawLine(axisX - 4f, y, axisX + 3f, y, dbAxisPaint)
-                canvas.drawText(dbTick.toString(), w - 7f * resources.displayMetrics.density, y + 8f, dbAxisTextPaint)
+                canvas.drawText(dbTick.toString(), axisLabelRight(), y + 3f * density, dbAxisTextPaint)
                 dbTick -= dbTickStep
             }
-            canvas.drawText("dBFS", w - 7f * resources.displayMetrics.density, top - 26f, dbAxisUnitPaint)
+            // Fade the restored -150 dBFS label in near the end of KEYS -> Spectrum,
+            // rather than letting a new endpoint tick pop into view on the last frame.
+            dbAxisTransition?.let { (startRange, targetRange, progress) ->
+                val fadesIn = startRange.first > -150 && targetRange.first <= -150
+                val fadesOut = startRange.first <= -150 && targetRange.first > -150
+                val fade = when {
+                    fadesIn && displayDbFloor > -150.0 && progress > 0.76f ->
+                        ((progress - 0.76f) / 0.22f).coerceIn(0f, 1f)
+                    fadesOut && displayDbFloor > -150.0 && progress < 0.22f ->
+                        (1f - progress / 0.22f).coerceIn(0f, 1f)
+                    else -> 0f
+                }
+                if (fade > 0f) {
+                    val oldAlpha = dbAxisTextPaint.alpha
+                    dbAxisTextPaint.alpha = (oldAlpha * fade).roundToInt().coerceIn(0, 255)
+                    canvas.drawText("-150", axisLabelRight(), bottom + 3f * density, dbAxisTextPaint)
+                    dbAxisTextPaint.alpha = oldAlpha
+                }
+            }
+            canvas.drawText("dBFS", axisLabelRight(), top - 10f * density, dbAxisUnitPaint)
         }
 
         val data = magnitudes
         if (data.isEmpty()) {
-            canvas.drawText("Waiting for audio...", left + 20f, top + 50f, textPaint)
+            canvas.drawText("Waiting for audio...", left + 20f, top + 50f * density, textPaint)
             return
         }
 
@@ -8215,13 +11391,13 @@ class SpectrumView @JvmOverloads constructor(
         // The live spectrum is white; the permanent Peak Hold trace is red.
         drawSpectrumTrace(
             canvas, data, sourceSampleRate, sourceFftSize, minFreq, maxFreq,
-            left, right, top, bottom, spectrumPaint, spectrumPath
+            left, right, top, bottom, displayDbFloor, displayDbCeiling, spectrumPaint, spectrumPath
         )
 
         if (peakHoldEnabled && peakHoldMagnitudes.isNotEmpty()) {
             drawSpectrumTrace(
                 canvas, peakHoldMagnitudes, sourceSampleRate, sourceFftSize, minFreq, maxFreq,
-                left, right, top, bottom, peakHoldPaint, peakHoldPath
+                left, right, top, bottom, displayDbFloor, displayDbCeiling, peakHoldPaint, peakHoldPath
             )
         }
 
