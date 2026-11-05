@@ -56,7 +56,7 @@ Built with Kotlin, the app combines professional-style audio visualization and s
 - Import and export ZIP archives containing recordings, names, and sound profiles.
 
 <p align="center">
-  <img src="Screenshots/mysoundid.png" width="220" alt="Spectrum Analyzer 2 - My Sound ID">
+  <img src="Screenshots/mysoundid2.png" width="220" alt="Spectrum Analyzer 2 - My Sound ID">
 </p>
 
 ### Tone Generator
