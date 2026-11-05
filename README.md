@@ -29,13 +29,18 @@ Built with Kotlin, the app combines professional-style audio visualization and s
 - Estimated SPL readout with reference calibration and a live level scale.
 
 <p align="center">
-  <img src="Screenshots/linear.png" width="360" alt="Spectrum Analyzer 2 - Linear Spectrum">
-  <img src="Screenshots/log.png" width="360" alt="Spectrum Analyzer 2 - Logarithmic Spectrum">
+  <img src="Screenshots/lin.png" width="360" alt="Spectrum Analyzer2 - Linear Spectrum">
+  <img src="Screenshots/log2.png" width="360" alt="Spectrum Analyzer2 - Logarithmic Spectrum">
 </p>
 
 <p align="center">
-  <img src="Screenshots/spectogram.png" width="360" alt="Spectrum Analyzer 2 - Spectrogram">
-  <img src="Screenshots/SPL.png" width="360" alt="Spectrum Analyzer 2 - SPL">
+  <img src="Screenshots/lin3.png" width="360" alt="Spectrum Analyzer2 - Linear Spectrum Analysis">
+  <img src="Screenshots/spectrogram2.png" width="360" alt="Spectrum Analyzer2 - Real-Time Spectrogram">
+</p>
+
+<p align="center">
+  <img src="Screenshots/spl2.png" width="360" alt="Spectrum Analyzer2 - Sound Pressure Level">
+  <img src="Screenshots/spl3.png" width="360" alt="Spectrum Analyzer2 - SPL Analysis">
 </p>
 
 ### Sound ID
@@ -45,8 +50,7 @@ Built with Kotlin, the app combines professional-style audio visualization and s
 - Export session summaries as PDF.
 
 <p align="center">
-  <img src="Screenshots/soundid.png" width="220" alt="Spectrum Analyzer 2 - Sound ID">
-  <img src="Screenshots/soundid2.png" width="220" alt="Spectrum Analyzer 2 - Sound ID 2">
+  <img src="Screenshots/soundid2.png" width="360" alt="Spectrum Analyzer2 - AI Sound Identification">
 </p>
 
 ### My Sound ID
@@ -56,7 +60,7 @@ Built with Kotlin, the app combines professional-style audio visualization and s
 - Import and export ZIP archives containing recordings, names, and sound profiles.
 
 <p align="center">
-  <img src="Screenshots/mysoundid2.png" width="220" alt="Spectrum Analyzer 2 - My Sound ID">
+  <img src="Screenshots/mysoundid2.png" width="360" alt="Spectrum Analyzer2 - Custom Sound Identification">
 </p>
 
 ### Tone Generator
@@ -70,7 +74,8 @@ Built with Kotlin, the app combines professional-style audio visualization and s
 - Select LEFT, RIGHT, or STEREO audio output.
 
 <p align="center">
-  <img src="Screenshots/tonegen.png" width="360" alt="Spectrum Analyzer 2 - Tone Generator">
+  <img src="Screenshots/tonegenerator2.png" width="360" alt="Spectrum Analyzer2 - Tone Generator">
+  <img src="Screenshots/tonegeneratorfull.png" width="360" alt="Spectrum Analyzer2 - Full-Screen Tone Generator">
 </p>
 
 ### Piano Keyboard
@@ -79,8 +84,8 @@ Built with Kotlin, the app combines professional-style audio visualization and s
 - Piano samples load in the background, prioritizing the middle octave.
 
 <p align="center">
-  <img src="Screenshots/fullscalekeys.png" width="360" alt="Spectrum Analyzer 2 - Full-Scale Keys">
-  <img src="Screenshots/keys.png" width="360" alt="Spectrum Analyzer 2 - Keys">
+  <img src="Screenshots/piano2.png" width="360" alt="Spectrum Analyzer2 - Piano Keyboard">
+  <img src="Screenshots/fullscalepiano.png" width="360" alt="Spectrum Analyzer2 - Full-Screen Piano Keyboard">
 </p>
 
 ### App Experience
