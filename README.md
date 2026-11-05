@@ -76,15 +76,25 @@ An Android application developed in Kotlin that visualizes audio frequencies in 
 
 ---
 
+## Download & Installation
+
+Spectrum Analyzer2 is a free, open-source native Android application.
+
+**Download the latest APK** from the GitHub Releases page:
+
+[Download Spectrum Analyzer2](https://github.com/ukiddingbitch/SpectrumAnalyzer2/releases)
+
+Alternatively, clone this repository and build the application using Android Studio.
+
 ## Source Code
 
-The complete source code is available in this repository.
+The complete source code is available in this repository under the MIT License.
 
 ## Android Compatibility
 
-Minimum Android version: Android 8.0 Oreo (API 26).
-Target SDK: API 37 (Android 17).
-Supported devices: Android devices running API 26 or later, subject to compatibility testing.
+- **Minimum Android version:** Android 8.0 Oreo (API 26).
+- **Target SDK:** API 37 (Android 17).
+- **Supported devices:** Android devices running API 26 or later, subject to compatibility testing.
 
 ## License
 
