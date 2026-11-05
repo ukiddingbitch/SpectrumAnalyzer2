@@ -1,8 +1,21 @@
 # Spectrum Analyzer2
 
-An Android application developed in Kotlin that visualizes audio frequencies in a spectrum analyzer interface.
+**Free, open-source, real-time audio spectrum analyzer for Android.**
 
-## Features
+Spectrum Analyzer2 is an advanced Android audio analysis app featuring a real-time FFT spectrum analyzer, spectrogram (waterfall), adjustable frequency and dB scales, offline sound recognition, sound level estimation, tone generator, and interactive piano keyboard.
+
+Built with Kotlin, the app combines professional-style audio visualization and sound analysis tools in one application.
+
+## Key Highlights
+
+- Real-time FFT spectrum analysis with linear and logarithmic scales.
+- Interactive zoom, pan, frequency cursor, and peak hold.
+- Live spectrogram and estimated sound pressure level (SPL).
+- Offline sound recognition using YAMNet with 521 sound classes.
+- Custom sound recording and identification.
+- Multi-waveform tone generator, frequency sweeps, and noise generation.
+- Interactive multi-touch piano keyboard.
+- Free and open-source under the MIT License.
 
 ### Audio Analysis
 - Real-time spectrum and spectrogram visualization.
