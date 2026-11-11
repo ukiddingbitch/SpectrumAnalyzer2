@@ -16,6 +16,8 @@ Built with Kotlin, the app combines professional-style audio visualization and s
 - Multi-waveform tone generator, frequency sweeps, and noise generation.
 - Interactive multi-touch piano keyboard.
 - Free and open-source under the MIT License.
+- Sweep-based speaker and room response measurement with CSV and PDF export.
+- In-app selection of the default launch screen, microphone, and audio output.
 
 ### Audio Analysis
 - Real-time spectrum and spectrogram visualization.
@@ -72,6 +74,8 @@ Built with Kotlin, the app combines professional-style audio visualization and s
 - Add custom frequency presets and delete them with a long press; built-in presets and PEAK are protected.
 - Choose sweep direction and durations of 4, 8, 16, or 32 seconds.
 - Select LEFT, RIGHT, or STEREO audio output.
+- Measure the relative speaker, room, and phone microphone frequency response using an audio sweep.
+- View the response curve with estimated dB SPL and export the results as CSV or PDF.
 
 <p align="center">
   <img src="Screenshots/tonegenerator2.png" width="360" alt="Spectrum Analyzer2 - Tone Generator">
@@ -91,6 +95,9 @@ Built with Kotlin, the app combines professional-style audio visualization and s
 ### App Experience
 - Audio analysis starts automatically after microphone permission is granted.
 - Immersive full-screen interface with icon-based controls.
+- Choose the default screen shown at launch.
+- Select from available microphones and audio output devices in the app menu.
+- Improved layout and stability when switching between app modes and audio devices.
 
 ---
 
