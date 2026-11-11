@@ -15,7 +15,7 @@ internal class AnalyzerIconButton(
     context: Context,
     icon: Icon
 ) : AppCompatButton(context) {
-    enum class Icon { PLAY, STOP, MIC, RESET, TONE, PRESETS, SWEEP, KEYS, SOUND, AXIS, LIN, LOG, IMPORT, EXPORT, FULL_SCALE_OPEN, FULL_SCALE_CLOSE, SPECTRUM, SPECTROGRAM, SPL_RESPONSE, SPL_HOLD, SPL_MIN_MAX, DTMF, VOLUME, VOLUME_MUTED, OUTPUT_LEFT, OUTPUT_RIGHT, OUTPUT_STEREO }
+    enum class Icon { PLAY, STOP, MIC, RESET, TONE, PRESETS, SWEEP, MEASURE, KEYS, SOUND, AXIS, LIN, LOG, IMPORT, EXPORT, FULL_SCALE_OPEN, FULL_SCALE_CLOSE, SPECTRUM, SPECTROGRAM, SPL_RESPONSE, SPL_HOLD, SPL_MIN_MAX, DTMF, VOLUME, VOLUME_MUTED, OUTPUT_LEFT, OUTPUT_RIGHT, OUTPUT_STEREO }
 
     constructor(context: Context) : this(context, Icon.PLAY)
 
@@ -31,6 +31,7 @@ internal class AnalyzerIconButton(
                 Icon.TONE -> "Tone generator"
                 Icon.PRESETS -> "Frequency presets"
                 Icon.SWEEP -> "Start frequency sweep"
+                Icon.MEASURE -> "Measure speaker and room response with a sweep"
                 Icon.KEYS -> "Piano keyboard"
                 Icon.SOUND -> "Sound identification"
                 Icon.AXIS -> "Change frequency scale"
@@ -103,6 +104,7 @@ internal class AnalyzerIconButton(
             Icon.TONE -> "Tone generator"
             Icon.PRESETS -> "Frequency presets"
             Icon.SWEEP -> "Start frequency sweep"
+            Icon.MEASURE -> "Measure speaker and room response with a sweep"
             Icon.KEYS -> "Piano keyboard"
             Icon.SOUND -> "Sound identification"
             Icon.AXIS -> "Change frequency scale"
@@ -231,12 +233,12 @@ internal class AnalyzerIconButton(
                 fillPaint.color = Color.BLACK
                 canvas.restore()
             }
-            Icon.TONE, Icon.PRESETS, Icon.SWEEP, Icon.MIC, Icon.SOUND, Icon.SPECTRUM, Icon.SPECTROGRAM, Icon.AXIS, Icon.KEYS, Icon.LIN, Icon.LOG, Icon.IMPORT, Icon.EXPORT, Icon.FULL_SCALE_OPEN, Icon.FULL_SCALE_CLOSE, Icon.SPL_RESPONSE, Icon.SPL_HOLD, Icon.SPL_MIN_MAX, Icon.DTMF, Icon.VOLUME, Icon.VOLUME_MUTED, Icon.OUTPUT_LEFT, Icon.OUTPUT_RIGHT, Icon.OUTPUT_STEREO -> {
+            Icon.TONE, Icon.PRESETS, Icon.SWEEP, Icon.MEASURE, Icon.MIC, Icon.SOUND, Icon.SPECTRUM, Icon.SPECTROGRAM, Icon.AXIS, Icon.KEYS, Icon.LIN, Icon.LOG, Icon.IMPORT, Icon.EXPORT, Icon.FULL_SCALE_OPEN, Icon.FULL_SCALE_CLOSE, Icon.SPL_RESPONSE, Icon.SPL_HOLD, Icon.SPL_MIN_MAX, Icon.DTMF, Icon.VOLUME, Icon.VOLUME_MUTED, Icon.OUTPUT_LEFT, Icon.OUTPUT_RIGHT, Icon.OUTPUT_STEREO -> {
                 val s = minOf(width, height) * when (icon) {
                     Icon.KEYS -> 0.48f
                     Icon.MIC -> 0.62f
                     Icon.TONE, Icon.SOUND, Icon.SPECTRUM, Icon.SPECTROGRAM -> 0.40f
-                    Icon.PRESETS, Icon.SWEEP, Icon.IMPORT, Icon.EXPORT -> 0.48f
+                    Icon.PRESETS, Icon.SWEEP, Icon.MEASURE, Icon.IMPORT, Icon.EXPORT -> 0.48f
                     Icon.SPL_RESPONSE, Icon.SPL_HOLD, Icon.SPL_MIN_MAX -> 0.52f
                     Icon.DTMF -> 0.68f
                     Icon.VOLUME, Icon.VOLUME_MUTED -> 0.72f
@@ -304,6 +306,16 @@ internal class AnalyzerIconButton(
                         canvas.drawPath(sweep, symbolPaint)
                         canvas.drawLine(r - s * 0.38f, t + s * 0.12f, r - s * 0.16f, t + s * 0.12f, symbolPaint)
                         canvas.drawLine(r - s * 0.16f, t + s * 0.12f, r - s * 0.16f, t + s * 0.34f, symbolPaint)
+                    }
+                    Icon.MEASURE -> {
+                        canvas.drawLine(l + s * 0.08f, b - s * 0.12f, r - s * 0.05f, b - s * 0.12f, symbolPaint)
+                        canvas.drawLine(l + s * 0.08f, b - s * 0.12f, l + s * 0.08f, t + s * 0.08f, symbolPaint)
+                        val response = Path().apply {
+                            moveTo(l + s * 0.14f, cy + s * 0.23f)
+                            cubicTo(l + s * 0.30f, cy + s * 0.10f, l + s * 0.31f, cy - s * 0.22f, l + s * 0.48f, cy - s * 0.12f)
+                            cubicTo(l + s * 0.64f, cy - s * 0.03f, l + s * 0.66f, cy + s * 0.19f, r - s * 0.07f, t + s * 0.14f)
+                        }
+                        canvas.drawPath(response, symbolPaint)
                     }
                     Icon.SOUND -> {
                         val wave = Path().apply {

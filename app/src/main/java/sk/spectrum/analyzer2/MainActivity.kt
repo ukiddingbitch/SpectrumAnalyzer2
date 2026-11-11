@@ -182,6 +182,8 @@ class MainActivity : Activity() {
     internal var soundIdLastSummary: SoundSessionSummary? = null
     internal var personalSoundListRefresh: (() -> Unit)? = null
     internal var pendingSoundIdPdf: ByteArray? = null
+    internal var pendingSweepMeasurementExport: SweepMeasurementExport? = null
+    internal val sweepMeasurementExportInProgress = AtomicBoolean(false)
     internal val personalSoundExportInProgress = AtomicBoolean(false)
     internal val personalSoundImportInProgress = AtomicBoolean(false)
     @Volatile internal var personalPreviewTrack: AudioTrack? = null
@@ -213,6 +215,7 @@ class MainActivity : Activity() {
     }
     internal val soundIdExportRequestCode = 72
     internal val personalSoundExportFolderRequestCode = 73
+    internal val sweepMeasurementFolderRequestCode = 75
     internal val personalSoundImportRequestCode = 74
     // Tone playback and peak following
     @Volatile internal var tonePlaying = false
@@ -291,6 +294,12 @@ class MainActivity : Activity() {
     internal var toneSweepDurationButton: Button? = null
     internal var toneSweepDirectionButton: Button? = null
     internal var toneSweepScaleButton: Button? = null
+    @Volatile internal var toneMeasurementActive = false
+    internal var toneMeasurementButton: AnalyzerIconButton? = null
+    @Volatile internal var sweepMeasurementCapture: SweepMeasurementCapture? = null
+    @Volatile internal var sweepMeasurementTrack: AudioTrack? = null
+    @Volatile internal var sweepMeasurementThread: Thread? = null
+    @Volatile internal var sweepMeasurementSessionId = 0L
 
     internal val toneSweepRunnable = object : Runnable {
         override fun run() {
@@ -625,6 +634,7 @@ class MainActivity : Activity() {
         // Start the live graph automatically when the app opens.
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             startAnalysis()
+            scheduleDefaultLaunchScreen()
         } else {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), permissionRequest)
         }
@@ -672,6 +682,33 @@ class MainActivity : Activity() {
 
     internal var splOpenPending = false
 
+    private fun scheduleDefaultLaunchScreen() {
+        val selected = defaultLaunchScreenKey()
+        if (selected == "spectrum") return
+        window.decorView.postDelayed({
+            if (isFinishing || isDestroyed) return@postDelayed
+            when (selected) {
+                "tone" -> toneToggleButton?.performClick()
+                "tone_full" -> {
+                    toneToggleButton?.performClick()
+                    window.decorView.postDelayed({
+                        if (!isFinishing && !isDestroyed && toneModeOpen) toggleToneExpanded?.invoke()
+                    }, 650L)
+                }
+                "keys" -> keyboardToggleButton?.performClick()
+                "keys_full" -> {
+                    keyboardToggleButton?.performClick()
+                    window.decorView.postDelayed({
+                        if (!isFinishing && !isDestroyed && keyboardModeOpen) fullScaleKeysButton?.performClick()
+                    }, 620L)
+                }
+                "spectrogram" -> if (!spectrumView.isSpectrogramEnabled()) spectrogramModeButton?.performClick()
+                "spl" -> headerSplText?.performClick()
+                "sound" -> showSoundIdDialog()
+            }
+        }, 700L)
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
@@ -689,12 +726,14 @@ class MainActivity : Activity() {
             grantResults[0] == PackageManager.PERMISSION_GRANTED
         ) {
             startAnalysis()
+            scheduleDefaultLaunchScreen()
         } else if (requestCode == permissionRequest) {
             Toast.makeText(
                 this,
                 "Microphone permission is required.",
                 Toast.LENGTH_LONG
             ).show()
+            scheduleDefaultLaunchScreen()
         }
     }
 
@@ -713,6 +752,28 @@ class MainActivity : Activity() {
                     Toast.makeText(this, "Sound summary saved.", Toast.LENGTH_SHORT).show()
                 } catch (_: Exception) {
                     Toast.makeText(this, "Could not save the summary.", Toast.LENGTH_LONG).show()
+                }
+            }
+            sweepMeasurementFolderRequestCode -> {
+                val selectedFolder = uri
+                if (resultCode != RESULT_OK || selectedFolder == null) {
+                    pendingSweepMeasurementExport = null
+                    return
+                }
+                try {
+                    val returnedFlags = data?.flags ?: 0
+                    val grantedFlags = returnedFlags and
+                        (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                    if (grantedFlags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION == 0) {
+                        throw java.io.IOException("The selected folder did not grant write access.")
+                    }
+                    contentResolver.takePersistableUriPermission(selectedFolder, grantedFlags)
+                    getSharedPreferences("sweep_measurement_export", Context.MODE_PRIVATE)
+                        .edit().putString("folder_uri", selectedFolder.toString()).apply()
+                    exportPendingSweepMeasurement()
+                } catch (error: Exception) {
+                    pendingSweepMeasurementExport = null
+                    Toast.makeText(this, "Could not use that folder: ${error.message ?: "access denied"}", Toast.LENGTH_LONG).show()
                 }
             }
             personalSoundExportFolderRequestCode -> {
@@ -770,6 +831,7 @@ class MainActivity : Activity() {
         dismissForLayout(splDetailDialog)
         soundIdTimerHandler.removeCallbacks(soundIdTimerRunnable)
         stopPersonalSoundPreview()
+        cancelSweepMeasurement(showMessage = false)
         stopTone()
         stopAnalysis()
         unregisterAudioDeviceCallback()

@@ -389,6 +389,12 @@ internal fun MainActivity.createToneGeneratorPanel(): View {
             }
         }
     }
+    val measureSweepButton = utilityIcon(
+        AnalyzerIconButton.Icon.MEASURE,
+        "Measure speaker and room response with a sweep"
+    )
+    toneMeasurementButton = measureSweepButton
+    measureSweepButton.setOnClickListener { toggleSweepMeasurement() }
     fun formatSweepFrequency(frequency: Int): String = when {
         frequency >= 1000 && frequency % 1000 == 0 -> "${frequency / 1000} kHz"
         frequency >= 1000 -> {
@@ -652,6 +658,7 @@ internal fun MainActivity.createToneGeneratorPanel(): View {
     sweepRangeGroup.addView(sweepRangeButton, LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginEnd = dp(4) })
     sweepRangeGroup.addView(sweepDirectionButton, LinearLayout.LayoutParams(dp(32), dp(36)))
     sweepSettingsRow.addView(sweepButton, LinearLayout.LayoutParams(dp(38), dp(36)).apply { marginEnd = dp(4) })
+    sweepSettingsRow.addView(measureSweepButton, LinearLayout.LayoutParams(dp(38), dp(36)).apply { marginEnd = dp(4) })
     sweepSettingsRow.addView(sweepRangeGroup, LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginEnd = dp(4) })
     sweepSettingsRow.addView(sweepScaleButton, LinearLayout.LayoutParams(dp(42), dp(36)).apply { marginEnd = dp(4) })
     sweepSettingsRow.addView(sweepDurationButton, LinearLayout.LayoutParams(dp(46), dp(36)))
@@ -1141,8 +1148,8 @@ internal fun MainActivity.createToneGeneratorPanel(): View {
         signalPreview.waveform = toneWaveform
         signalPreview.frequency = toneFrequency
         signalPreview.volume = toneVolume.toFloat()
-        signalPreview.playing = tonePlaying
-        signalPreview.sweepActive = toneSweepActive
+        signalPreview.playing = tonePlaying || toneMeasurementActive
+        signalPreview.sweepActive = toneSweepActive || toneMeasurementActive
         signalPreview.dtmfMode = dtmfModeEnabled
         signalPreview.dtmfLowFrequency = toneDtmfLowFrequency
         signalPreview.dtmfHighFrequency = toneDtmfHighFrequency
@@ -1152,7 +1159,7 @@ internal fun MainActivity.createToneGeneratorPanel(): View {
         signalPreview.minimumFrequency = low
         signalPreview.maximumFrequency = high
         val noiseSelected = isNoiseTone()
-        val selectedToneControlsEnabled = !noiseSelected && !toneSweepActive && !dtmfModeEnabled
+        val selectedToneControlsEnabled = !noiseSelected && !toneSweepActive && !dtmfModeEnabled && !toneMeasurementActive
         signalPreview.frequencyControlEnabled = selectedToneControlsEnabled
         // The scope remains touchable in every mode so vertical drags can adjust volume.
         signalPreview.isEnabled = true
@@ -1166,17 +1173,21 @@ internal fun MainActivity.createToneGeneratorPanel(): View {
             toneSweepDirectionButton?.isEnabled = false
             toneSweepScaleButton?.isEnabled = false
             toneDtmfModeButton?.isEnabled = !toneSweepActive
+            tonePlayButton?.isEnabled = !toneMeasurementActive
+            toneMeasurementButton?.isEnabled = false
             return
         }
         valueLabel.isEnabled = !noiseSelected
         presetsButton.isEnabled = !noiseSelected
-        sweepButton.isEnabled = !noiseSelected
-        toneWaveformButton?.isEnabled = !toneSweepActive
+        sweepButton.isEnabled = !noiseSelected && !toneMeasurementActive
+        tonePlayButton?.isEnabled = !toneMeasurementActive
+        toneWaveformButton?.isEnabled = !toneSweepActive && !toneMeasurementActive
         toneSweepRangeButton?.isEnabled = selectedToneControlsEnabled
         toneSweepDurationButton?.isEnabled = selectedToneControlsEnabled
         toneSweepDirectionButton?.isEnabled = selectedToneControlsEnabled
         toneSweepScaleButton?.isEnabled = selectedToneControlsEnabled
-        toneDtmfModeButton?.isEnabled = !toneSweepActive
+        toneDtmfModeButton?.isEnabled = !toneSweepActive && !toneMeasurementActive
+        toneMeasurementButton?.isEnabled = toneMeasurementActive || !toneSweepActive
         if (noiseSelected) {
             valueLabel.text = if (toneWaveform == "White noise") "WHITE" else "PINK"
             valueLabel.textSize = 14f

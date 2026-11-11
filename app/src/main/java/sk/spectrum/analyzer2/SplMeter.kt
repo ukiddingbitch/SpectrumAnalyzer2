@@ -16,6 +16,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 
 import kotlin.math.abs
 import kotlin.math.max
@@ -424,7 +425,38 @@ internal fun MainActivity.showSplDetailDialog() {
     }
     val header = spectrumHeader ?: return
     val bottom = bottomActionBar ?: return
-    if (header.width <= 0 || bottom.height <= 0) return
+    val root = window.decorView
+    if (isCompactAppWindow() && (
+            isAppWindowPortrait() || root.width <= root.height || bottom.width <= 0 ||
+                header.width < bottom.width * 0.70f
+        )) {
+        // Leaving Sound ID requests landscape asynchronously. Do not size this
+        // graph overlay from the old portrait measurements while the window is
+        // still rotating or its weighted graph column has not been laid out.
+        splOpenPending = true
+        val waitStartedAt = SystemClock.elapsedRealtime()
+        root.postDelayed(object : Runnable {
+            override fun run() {
+                if (isFinishing || isDestroyed) {
+                    splOpenPending = false
+                    return
+                }
+                val layoutReady = !isAppWindowPortrait() && root.width > root.height &&
+                    bottom.width > 0 && header.width >= bottom.width * 0.70f
+                if (layoutReady) {
+                    splOpenPending = false
+                    showSplDetailDialog()
+                } else if (SystemClock.elapsedRealtime() - waitStartedAt < 3_000L) {
+                    root.postDelayed(this, 32L)
+                } else {
+                    splOpenPending = false
+                    Toast.makeText(this@showSplDetailDialog, "Wait for the landscape layout, then open SPL again.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }, 32L)
+        return
+    }
+    if (header.width <= 0 || bottom.width <= 0 || bottom.height <= 0) return
     // Overlay exactly the graph area. Spectrum bars keep their original parents and pixels.
     val headerAt = IntArray(2); header.getLocationOnScreen(headerAt)
     val bottomAt = IntArray(2); bottom.getLocationOnScreen(bottomAt)
@@ -513,6 +545,9 @@ internal fun MainActivity.showSplDetailDialog() {
             saved.view.alpha = if (saved.visibility == View.VISIBLE) 0f else saved.alpha
             if (saved.visibility == View.VISIBLE) saved.view.animate().alpha(saved.alpha).setDuration(180L).start()
         }
+        // SPL may have been opened during the Sound ID -> landscape handoff.
+        // Its old GONE state is not authoritative once Sound ID has closed.
+        rangePickerButton?.visibility = if (soundModeOpen) View.GONE else View.VISIBLE
         hideSystemBars()
         val navigation = pendingSplToolbarClick; pendingSplToolbarClick = null
         if (!isFinishing && !isDestroyed) navigation?.post { navigation.performClick() }

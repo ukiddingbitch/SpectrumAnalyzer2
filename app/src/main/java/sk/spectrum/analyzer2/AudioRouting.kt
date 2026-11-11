@@ -13,14 +13,38 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.app.Dialog
 
 import kotlin.math.roundToInt
 
 /** Input/output device selection, route changes and route dialogs. */
+private data class LaunchScreenChoice(val key: String, val label: String)
+
+private val launchScreenChoices = listOf(
+    LaunchScreenChoice("tone", "Tone generator"),
+    LaunchScreenChoice("tone_full", "Tone generator · Full scale"),
+    LaunchScreenChoice("keys", "Keys"),
+    LaunchScreenChoice("keys_full", "Keys · Full scale"),
+    LaunchScreenChoice("spectrum", "Spectrum"),
+    LaunchScreenChoice("spectrogram", "Spectrogram"),
+    LaunchScreenChoice("spl", "SPL"),
+    LaunchScreenChoice("sound", "Sound ID")
+)
+
+internal fun MainActivity.defaultLaunchScreenKey(): String =
+    getSharedPreferences("app_preferences", Context.MODE_PRIVATE)
+        .getString("default_launch_screen", "spectrum")
+        ?.takeIf { key -> launchScreenChoices.any { it.key == key } } ?: "spectrum"
+
+private fun MainActivity.launchScreenLabel(key: String): String =
+    launchScreenChoices.firstOrNull { it.key == key }?.label ?: "Spectrum"
+
 internal fun MainActivity.ensureAudioDeviceCallbackRegistered() {
     if (audioDeviceCallback != null) return
     val manager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
@@ -30,7 +54,7 @@ internal fun MainActivity.ensureAudioDeviceCallbackRegistered() {
             val outputWasAdded = addedDevices.any { it.isSink }
             audioRouteDialogRefresh?.invoke()
             if (outputWasAdded) {
-                listOfNotNull(toneTrack, pianoAudioTrack, personalPreviewTrack)
+                listOfNotNull(toneTrack, sweepMeasurementTrack, pianoAudioTrack, personalPreviewTrack)
                     .forEach { applyPreferredOutputRoute(it) }
             }
             if (inputWasAdded) scheduleAudioRouteRestart(clearBuiltInPreference = true)
@@ -43,7 +67,7 @@ internal fun MainActivity.ensureAudioDeviceCallbackRegistered() {
             if (preferredOutputDeviceId in removedDevices.map { it.id }) preferredOutputDeviceId = null
             audioRouteDialogRefresh?.invoke()
             if (outputWasRemoved) {
-                listOfNotNull(toneTrack, pianoAudioTrack, personalPreviewTrack)
+                listOfNotNull(toneTrack, sweepMeasurementTrack, pianoAudioTrack, personalPreviewTrack)
                     .forEach { applyPreferredOutputRoute(it) }
             }
             if (inputWasRemoved) scheduleAudioRouteRestart(clearBuiltInPreference = true)
@@ -122,16 +146,16 @@ internal fun MainActivity.updateAudioRouteButtonPlacement(inPortraitSoundId: Boo
     if (routeButton.parent === targetParent) return
 
     (routeButton.parent as? ViewGroup)?.removeView(routeButton)
-    val routeParams = LinearLayout.LayoutParams(dp(58), dp(26))
+    val routeParams = LinearLayout.LayoutParams(dp(30), dp(26))
     if (inPortraitSoundId) {
         routeParams.setMargins(dp(8), 0, 0, 0)
         val soundButtonIndex = actionRow.indexOfChild(soundIdModeButton)
         val insertionIndex = if (soundButtonIndex >= 0) soundButtonIndex + 1 else actionRow.childCount
         actionRow.addView(routeButton, insertionIndex.coerceAtMost(actionRow.childCount), routeParams)
     } else {
-        routeParams.setMargins(0, 0, dp(2), 0)
-        // Keep the route control after the app info icon and before the SPL readout.
-        headerGroup.addView(routeButton, minOf(1, headerGroup.childCount), routeParams)
+        routeParams.setMargins(0, 0, dp(3), 0)
+        // The menu now owns both app information and audio routing options.
+        headerGroup.addView(routeButton, 0.coerceAtMost(headerGroup.childCount), routeParams)
     }
     updateSpectrumHeaderWidths()
 }
@@ -181,7 +205,7 @@ internal fun MainActivity.currentInputRouteName(): String {
 }
 
 internal fun MainActivity.currentOutputRouteName(): String {
-    val tracks = listOfNotNull(toneTrack, pianoAudioTrack, personalPreviewTrack)
+    val tracks = listOfNotNull(toneTrack, sweepMeasurementTrack, pianoAudioTrack, personalPreviewTrack)
     val active = tracks.firstNotNullOfOrNull { track ->
         try {
             track.takeIf { it.playState == AudioTrack.PLAYSTATE_PLAYING }?.routedDevice
@@ -209,179 +233,237 @@ internal fun MainActivity.showAudioRouteDialog() {
     val density = resources.displayMetrics.density
     fun dp(value: Int) = (value * density).roundToInt()
     val safeBounds = availableWindowBounds()
-    val narrowWindow = safeBounds.width() < dp(500)
-    val safeHeightDp = (safeBounds.height() / density).roundToInt().coerceAtLeast(1)
-    val reservedDialogHeightDp = if (narrowWindow) 220 else 130
-    val visibleColumns = if (narrowWindow) 2 else 1
-    val maxListHeightDp = ((safeHeightDp - reservedDialogHeightDp) / visibleColumns)
-        .coerceAtLeast(36).coerceAtMost(148)
-    val card = LinearLayout(this).apply {
+    val dialog = createAnimatedDialog()
+    audioRouteDialog = dialog
+    val sizingPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+    var widestLinePx = 0f
+    fun measureLine(text: String, sp: Float, bold: Boolean = false) {
+        sizingPaint.textSize = sp * resources.displayMetrics.scaledDensity
+        sizingPaint.typeface = android.graphics.Typeface.create(
+            android.graphics.Typeface.DEFAULT,
+            if (bold) android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL
+        )
+        widestLinePx = maxOf(widestLinePx, sizingPaint.measureText(text))
+    }
+    measureLine("Spectrum Analyzer 2 · ${installedAppVersionName()}", 16f, bold = true)
+    measureLine("RESET TO DEFAULT", 14f)
+    measureLine("Default screen on launch", 14f)
+    (availableAudioDevices(true).map { audioDeviceDisplayName(it, true) } +
+        availableAudioDevices(false).map { audioDeviceDisplayName(it, false) } +
+        "System default" + launchScreenChoices.map { it.label }).forEach { measureLine(it, 13f) }
+    val desiredWidth = widestLinePx + dp(44)
+    val width = minOf(dp(400), maxOf(dp(260), desiredWidth.roundToInt()),
+        (safeBounds.width() - dp(28)).coerceAtLeast(dp(1)))
+    val cardHeight = dp(390)
+    lateinit var mainCard: LinearLayout
+
+    fun makeCard(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         gravity = Gravity.CENTER
         styleNumericDialogCard(this)
-        setPadding(dp(16), dp(12), dp(16), dp(12))
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        layoutParams = ViewGroup.LayoutParams(width, cardHeight)
     }
-    card.addView(TextView(this).apply {
-        text = "Audio devices"
-        textSize = 17f
+
+    fun title(text: String) = TextView(this).apply {
+        this.text = text
+        textSize = 16f
         setTypeface(null, android.graphics.Typeface.BOLD)
         setTextColor(Color.rgb(255, 213, 90))
         gravity = Gravity.CENTER
         includeFontPadding = false
-    }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(28)))
-
-    val columns = LinearLayout(this).apply {
-        orientation = if (narrowWindow) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
-        gravity = Gravity.TOP
     }
-    card.addView(columns, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-        topMargin = dp(8)
-    })
 
-    val dialog = createAnimatedDialog()
-    audioRouteDialog = dialog
-    fun deviceColumn(
-        title: String,
-        input: Boolean,
-        maxListHeight: Int
-    ): LinearLayout {
-        val column = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(4), dp(3), dp(4), dp(3))
+    fun action(label: String, onClick: () -> Unit) = TextView(this).apply {
+        text = label
+        textSize = if (label == "RESET TO DEFAULT") 11f else 14f
+        setTextColor(Color.rgb(255, 213, 90))
+        gravity = Gravity.CENTER
+        includeFontPadding = false
+        maxLines = 1
+        ellipsize = android.text.TextUtils.TruncateAt.END
+        background = GradientDrawable().apply {
+            setColor(Color.rgb(39, 54, 72)); cornerRadius = dp(11).toFloat()
         }
-        column.addView(TextView(this).apply {
-            text = title
-            textSize = 13f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setTextColor(Color.rgb(210, 220, 232))
-            includeFontPadding = false
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(22)))
-        val activeRoute = if (input) currentInputRouteName() else currentOutputRouteName()
-        column.addView(TextView(this).apply {
-            text = "Active: $activeRoute"
-            textSize = 10f
-            setTextColor(Color.rgb(153, 169, 188))
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            includeFontPadding = false
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(18)))
-        val list = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        val scroll = android.widget.ScrollView(this).apply {
-            isFillViewport = true
-            isVerticalScrollBarEnabled = true
-            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
-            addView(list, ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ))
-        }
-        column.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, maxListHeight))
+        setOnClickListener { onClick() }
+    }
 
-        fun addChoice(label: String, selected: Boolean, contentDescription: String, choose: () -> Unit) {
-            val choice = TextView(this).apply {
-                text = (if (selected) "✓  " else "      ") + label
-                textSize = 12f
-                setTextColor(if (selected) Color.rgb(255, 213, 90) else Color.rgb(220, 228, 237))
-                gravity = Gravity.CENTER_VERTICAL or Gravity.START
-                maxLines = 2
-                ellipsize = android.text.TextUtils.TruncateAt.END
-                includeFontPadding = false
-                setPadding(dp(9), dp(5), dp(7), dp(5))
-                minHeight = dp(42)
-                isClickable = true
-                isFocusable = true
-                this.contentDescription = contentDescription
-                background = GradientDrawable().apply {
-                    setColor(if (selected) Color.rgb(39, 54, 72) else Color.rgb(15, 23, 36))
-                    cornerRadius = dp(11).toFloat()
-                    setStroke(dp(if (selected) 1 else 0), if (selected) Color.rgb(86, 118, 149) else Color.TRANSPARENT)
+    fun showSubcard(content: (LinearLayout, Dialog) -> Unit) {
+        val subCard = makeCard()
+        content(subCard, dialog)
+        dialog.setContentView(subCard)
+        centerDialogOnScreen(dialog, width, height = cardHeight)
+    }
+
+    fun returnToMenu(subDialog: Dialog) {
+        val defaultRow = (mainCard.getChildAt(1) as? LinearLayout)?.getChildAt(0) as? LinearLayout
+        (defaultRow?.getChildAt(1) as? TextView)?.text = launchScreenLabel(defaultLaunchScreenKey())
+        subDialog.setContentView(mainCard)
+        centerDialogOnScreen(subDialog, width, height = cardHeight)
+    }
+
+    mainCard = makeCard()
+    mainCard.addView(title("Spectrum Analyzer 2 · ${installedAppVersionName()}"),
+        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(36)))
+    val options = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+    fun addMenuOption(label: String, detail: String, action: () -> Unit) {
+        val item = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(5), dp(12), dp(5))
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(15, 23, 36)); cornerRadius = dp(12).toFloat()
+                setStroke(dp(1), Color.rgb(56, 73, 91))
+            }
+            setOnClickListener { action() }
+        }
+        item.addView(TextView(this).apply {
+            text = label; textSize = 14f; setTextColor(Color.rgb(255, 213, 90)); includeFontPadding = false
+        })
+        item.addView(TextView(this).apply {
+            text = detail; textSize = 11f; setTextColor(Color.rgb(153, 169, 188)); includeFontPadding = false
+            maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+        })
+        options.addView(item, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)).apply {
+            topMargin = dp(7)
+        })
+    }
+
+    addMenuOption("Default screen on launch", launchScreenLabel(defaultLaunchScreenKey())) {
+        showSubcard { subCard, subDialog ->
+            subCard.addView(title("Default screen on launch"), LinearLayout.LayoutParams(-1, dp(30)))
+            val choicesList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            launchScreenChoices.forEach { choice ->
+                val option = TextView(this).apply {
+                    text = choice.label
+                    textSize = 13f
+                    setTextColor(if (defaultLaunchScreenKey() == choice.key) Color.rgb(255, 213, 90) else Color.rgb(220, 228, 237))
+                    gravity = Gravity.CENTER
+                    includeFontPadding = false
+                    maxLines = 1
+                    minHeight = dp(30)
+                    setPadding(dp(4), dp(2), dp(4), dp(2))
+                    contentDescription = choice.label
+                    background = GradientDrawable().apply {
+                        setColor(if (defaultLaunchScreenKey() == choice.key) Color.rgb(39, 54, 72) else Color.rgb(15, 23, 36))
+                        cornerRadius = dp(10).toFloat()
+                        setStroke(dp(1), Color.rgb(56, 73, 91))
+                    }
+                    setOnClickListener { selectLaunchChoice(choice.key, choice.label, choicesList) }
                 }
-                setOnClickListener { choose() }
+                choicesList.addView(option, LinearLayout.LayoutParams(-1, dp(30)).apply {
+                    setMargins(dp(2), dp(1), dp(2), dp(1))
+                })
             }
-            list.addView(choice, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)).apply {
-                bottomMargin = dp(4)
-            })
+            subCard.addView(choicesList, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(2) })
+            subCard.addView(action("DONE") { returnToMenu(subDialog) }, LinearLayout.LayoutParams(-1, dp(36)).apply { topMargin = dp(3) })
         }
+    }
+    addMenuOption("Input (Microphone)", currentInputRouteName()) {
+        showSubcard { subCard, subDialog -> buildAudioDeviceSubcard(subCard, subDialog, input = true, returnToMenu = ::returnToMenu) }
+    }
+    addMenuOption("Output (Speakers)", currentOutputRouteName()) {
+        showSubcard { subCard, subDialog -> buildAudioDeviceSubcard(subCard, subDialog, input = false, returnToMenu = ::returnToMenu) }
+    }
+    mainCard.addView(options, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(10) })
+    val footer = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+    footer.addView(action("RESET TO DEFAULT") {
+        getSharedPreferences("app_preferences", Context.MODE_PRIVATE).edit()
+            .putString("default_launch_screen", "spectrum").apply()
+        preferredInputDeviceId = null
+        preferredOutputDeviceId = null
+        preferBuiltInMicrophone = false
+        try { recorder?.setPreferredDevice(null) } catch (_: RuntimeException) {}
+        listOfNotNull(toneTrack, sweepMeasurementTrack, pianoAudioTrack, personalPreviewTrack)
+            .forEach(this@showAudioRouteDialog::applyPreferredOutputRoute)
+        dialog.dismiss()
+        window.decorView.post { if (!isFinishing && !isDestroyed) showAudioRouteDialog() }
+    }, LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginEnd = dp(6) })
+    footer.addView(action("DONE") { dialog.dismiss() }, LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginStart = dp(6) })
+    mainCard.addView(footer, LinearLayout.LayoutParams(-1, dp(40)).apply {
+        topMargin = dp(8)
+        bottomMargin = dp(6)
+    })
+    dialog.setContentView(mainCard)
+    requireExplicitDialogAction(dialog)
+    dialog.setOnDismissListener { if (audioRouteDialog === dialog) audioRouteDialog = null }
+    dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+    dialog.window?.setDimAmount(0.38f)
+    centerDialogOnScreen(dialog, width, height = cardHeight)
+    dialog.show()
+}
 
-        val selectedId = if (input) preferredInputDeviceId else preferredOutputDeviceId
-        addChoice("System default", selectedId == null, "Use Android's default ${if (input) "microphone" else "speaker"} route") {
-            if (input) {
-                preferredInputDeviceId = null
-                preferBuiltInMicrophone = false
-                try { recorder?.setPreferredDevice(null) } catch (_: RuntimeException) {}
-                if (running) scheduleAudioRouteRestart()
-            } else {
-                preferredOutputDeviceId = null
-                listOfNotNull(toneTrack, pianoAudioTrack, personalPreviewTrack).forEach(this@showAudioRouteDialog::applyPreferredOutputRoute)
-            }
-            audioRouteDialogRefresh?.invoke()
+private fun MainActivity.selectLaunchChoice(key: String, label: String, grid: ViewGroup) {
+    getSharedPreferences("app_preferences", Context.MODE_PRIVATE).edit()
+        .putString("default_launch_screen", key).apply()
+    val density = resources.displayMetrics.density
+    fun dp(value: Int) = (value * density).roundToInt()
+    for (rowIndex in 0 until grid.childCount) {
+        val tile = grid.getChildAt(rowIndex)
+        val selected = tile.contentDescription == label
+        tile.setBackground(GradientDrawable().apply {
+            setColor(if (selected) Color.rgb(39, 54, 72) else Color.rgb(15, 23, 36))
+            cornerRadius = dp(10).toFloat()
+            setStroke(dp(1), Color.rgb(56, 73, 91))
+        })
+        if (tile is TextView) {
+            tile.setTextColor(if (selected) Color.rgb(255, 213, 90) else Color.rgb(220, 228, 237))
         }
-        availableAudioDevices(input).forEach { device ->
-            addChoice(
-                audioDeviceDisplayName(device, input),
-                selectedId == device.id,
-                "Route ${if (input) "microphone" else "playback"} to ${audioDeviceDisplayName(device, input)}"
-            ) {
+    }
+}
+
+private fun MainActivity.buildAudioDeviceSubcard(
+    card: LinearLayout,
+    dialog: Dialog,
+    input: Boolean,
+    returnToMenu: (Dialog) -> Unit
+) {
+    val density = resources.displayMetrics.density
+    fun dp(value: Int) = (value * density).roundToInt()
+    card.addView(TextView(this).apply {
+        text = if (input) "Input (Microphone)" else "Output (Speakers)"
+        textSize = 16f; setTypeface(null, android.graphics.Typeface.BOLD)
+        setTextColor(Color.rgb(255, 213, 90)); gravity = Gravity.CENTER
+    }, LinearLayout.LayoutParams(-1, dp(34)))
+    val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+    val scroll = ScrollView(this).apply { addView(list) }
+    val devices = availableAudioDevices(input)
+    val selectedId = if (input) preferredInputDeviceId else preferredOutputDeviceId
+    val choices = listOf<android.media.AudioDeviceInfo?>(null) + devices
+    choices.forEach { device ->
+        val selected = device?.id == selectedId || (device == null && selectedId == null)
+        val label = device?.let { audioDeviceDisplayName(it, input) } ?: "System default"
+        val item = TextView(this).apply {
+            text = (if (selected) "✓  " else "") + label
+            textSize = 13f; setTextColor(if (selected) Color.rgb(255, 213, 90) else Color.rgb(220, 228, 237))
+            gravity = Gravity.CENTER_VERTICAL or Gravity.START; maxLines = 1
+            setPadding(dp(12), 0, dp(8), 0)
+            background = GradientDrawable().apply {
+                setColor(if (selected) Color.rgb(39, 54, 72) else Color.rgb(15, 23, 36))
+                cornerRadius = dp(11).toFloat(); setStroke(dp(1), Color.rgb(56, 73, 91))
+            }
+            setOnClickListener {
                 if (input) {
-                    preferredInputDeviceId = device.id
-                    preferBuiltInMicrophone = device.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_MIC
+                    preferredInputDeviceId = device?.id
+                    preferBuiltInMicrophone = device?.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_MIC
                     try { recorder?.setPreferredDevice(device) } catch (_: RuntimeException) {}
                     if (running) scheduleAudioRouteRestart(forceBuiltInMicrophone = preferBuiltInMicrophone)
                 } else {
-                    preferredOutputDeviceId = device.id
-                    val applied = listOfNotNull(toneTrack, pianoAudioTrack, personalPreviewTrack)
-                        .all(this@showAudioRouteDialog::applyPreferredOutputRoute)
-                    if (!applied) Toast.makeText(this@showAudioRouteDialog, "Android could not select that audio output.", Toast.LENGTH_SHORT).show()
+                    preferredOutputDeviceId = device?.id
+                    val applied = listOfNotNull(toneTrack, sweepMeasurementTrack, pianoAudioTrack, personalPreviewTrack)
+                        .all(this@buildAudioDeviceSubcard::applyPreferredOutputRoute)
+                    if (!applied) Toast.makeText(this@buildAudioDeviceSubcard, "Android could not select that audio output.", Toast.LENGTH_SHORT).show()
                 }
-                audioRouteDialogRefresh?.invoke()
+                returnToMenu(dialog)
             }
         }
-        return column
+        list.addView(item, LinearLayout.LayoutParams(-1, dp(42)).apply { bottomMargin = dp(5) })
     }
-
-    fun refreshDeviceColumns() {
-        columns.removeAllViews()
-        val inputColumn = deviceColumn("Microphones", input = true, maxListHeight = dp(maxListHeightDp))
-        val outputColumn = deviceColumn("Speakers", input = false, maxListHeight = dp(maxListHeightDp))
-        val columnParams = if (narrowWindow) {
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        } else {
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        columns.addView(inputColumn, columnParams)
-        columns.addView(outputColumn, if (narrowWindow) {
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
-        } else {
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        })
+    card.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(8) })
+    val done = TextView(this).apply {
+        text = "DONE"; gravity = Gravity.CENTER; setTextColor(Color.rgb(255, 213, 90))
+        background = GradientDrawable().apply { setColor(Color.rgb(39, 54, 72)); cornerRadius = dp(11).toFloat() }
+        setOnClickListener { returnToMenu(dialog) }
     }
-    refreshDeviceColumns()
-    audioRouteDialogRefresh = ::refreshDeviceColumns
-
-    val done = Button(this).apply {
-        text = "DONE"
-        textSize = 12f
-        isAllCaps = false
-        setTextColor(Color.rgb(255, 213, 90))
-        setOnClickListener { dialog.dismiss() }
-    }
-    styleNumericDialogButton(done)
-    card.addView(done, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)).apply {
-        topMargin = dp(8)
-    })
-    dialog.setContentView(card)
-    requireExplicitDialogAction(dialog)
-    dialog.setOnDismissListener {
-        if (audioRouteDialog === dialog) {
-            audioRouteDialog = null
-            audioRouteDialogRefresh = null
-        }
-    }
-    dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
-    dialog.window?.setDimAmount(0.38f)
-    val maxWidth = (safeBounds.width() - dp(24)).coerceAtLeast(dp(1))
-    val preferredWidth = if (narrowWindow) dp(380) else dp(620)
-    centerDialogOnScreen(dialog, minOf(preferredWidth, maxWidth), horizontalOffsetDp = 0)
-    dialog.show()
+    card.addView(done, LinearLayout.LayoutParams(-1, dp(40)).apply { topMargin = dp(7) })
 }

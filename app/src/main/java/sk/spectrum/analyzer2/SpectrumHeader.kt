@@ -34,7 +34,7 @@ internal fun MainActivity.updateSpectrumHeaderWidths() {
     fun dp(value: Int) = (value * density).roundToInt()
     val safeWidth = spectrumHeader?.width?.takeIf { it > 0 } ?: availableWindowBounds().width().coerceAtLeast(1)
     val routeButtonInHeader = audioRoutePickerButton?.parent === audioRouteHeaderGroup
-    val fixedLeftControls = dp(26 + (if (routeButtonInHeader) 58 else 0) + 4)
+    val fixedLeftControls = dp((if (routeButtonInHeader) 30 else 0) + 4)
     val peakReserve = maxOf(headerPeakReadout?.width ?: 0, dp(148))
     val splWidth = (safeWidth - fixedLeftControls - peakReserve - dp(10)).coerceAtLeast(dp(48))
     // Audio updates call this frequently. Do not invalidate text layout each sample.
@@ -404,86 +404,19 @@ internal fun MainActivity.configureSpectrumHeader() {
             if (splDetailDialog?.isShowing == true) splDetailDialog?.dismiss() else showSplDetailDialog()
         }
     }
-    val appVersionInfoButton = android.widget.ImageButton(this).apply {
-        val infoBitmap = android.graphics.BitmapFactory.decodeResource(
-            resources,
-            R.drawable.ic_information_white,
-            android.graphics.BitmapFactory.Options().apply { inSampleSize = 8 }
-        )
-        setImageBitmap(infoBitmap)
+    val appMenuButton = android.widget.ImageButton(this).apply {
+        setImageResource(R.drawable.ic_menu)
         scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
-        setPadding(dp(2), dp(2), dp(2), dp(2))
+        setPadding(dp(3), dp(3), dp(3), dp(3))
         background = android.graphics.drawable.ColorDrawable(Color.rgb(15, 23, 36))
         backgroundTintList = null
         stateListAnimator = null
         minimumWidth = 0
         minimumHeight = 0
-        contentDescription = "Application version information"
-        setOnClickListener {
-            val versionDialog = createAnimatedDialog()
-            val versionCard = LinearLayout(this@configureSpectrumHeader).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER_HORIZONTAL
-                styleNumericDialogCard(this)
-                setPadding(dp(20), dp(18), dp(20), dp(16))
-            }
-            versionCard.addView(TextView(this@configureSpectrumHeader).apply {
-                text = "Spectrum Analyzer 2"
-                textSize = 18f
-                setTypeface(null, android.graphics.Typeface.BOLD)
-                setTextColor(Color.rgb(255, 213, 90))
-                gravity = Gravity.CENTER
-            }, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ))
-            versionCard.addView(TextView(this@configureSpectrumHeader).apply {
-                text = "Version ${installedAppVersionName()}"
-                textSize = 15f
-                setTextColor(Color.rgb(210, 220, 232))
-                gravity = Gravity.CENTER
-                includeFontPadding = false
-            }, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(10) })
-            val versionOkButton = Button(this@configureSpectrumHeader).apply {
-                text = "OK"
-                textSize = 13f
-                setTextColor(Color.rgb(255, 213, 90))
-                setOnClickListener { versionDialog.dismiss() }
-            }
-            styleNumericDialogButton(versionOkButton)
-            versionCard.addView(versionOkButton, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(42)
-            ).apply { topMargin = dp(16) })
-            setDialogCardContent(versionDialog, versionCard)
-            requireExplicitDialogAction(versionDialog)
-            versionDialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
-            val versionDialogWidth = minOf(
-                dp(360),
-                (resources.displayMetrics.widthPixels - dp(32)).coerceAtLeast(dp(220))
-            )
-            centerDialogOnScreen(versionDialog, versionDialogWidth, horizontalOffsetDp = 0)
-            versionDialog.show()
-        }
-    }
-    val audioRouteIconButton = android.widget.ImageButton(this).apply {
-        val routeIcon = android.graphics.BitmapFactory.decodeResource(
-            resources,
-            R.drawable.ic_audio_route,
-            android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }
-        )
-        setImageBitmap(routeIcon)
-        scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
-        setPadding(dp(1), 0, dp(1), 0)
-        background = android.graphics.drawable.ColorDrawable(Color.rgb(15, 23, 36))
-        backgroundTintList = null
-        stateListAnimator = null
-        minimumWidth = 0
-        minimumHeight = 0
-        contentDescription = "Choose microphone and speaker"
+        contentDescription = "Open menu"
         setOnClickListener { showAudioRouteDialog() }
     }
-    audioRoutePickerButton = audioRouteIconButton
+    audioRoutePickerButton = appMenuButton
     updateSplReadout()
     peakReadout.addView(headerPeakFrequencyText)
     peakReadout.addView(headerPeakDbText, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -494,11 +427,8 @@ internal fun MainActivity.configureSpectrumHeader() {
         gravity = Gravity.CENTER_VERTICAL or Gravity.START
     }
     audioRouteHeaderGroup = splHeaderGroup
-    splHeaderGroup.addView(appVersionInfoButton, LinearLayout.LayoutParams(dp(26), dp(26)).apply {
-        marginEnd = dp(2)
-    })
-    splHeaderGroup.addView(audioRouteIconButton, LinearLayout.LayoutParams(dp(58), dp(26)).apply {
-        marginEnd = dp(2)
+    splHeaderGroup.addView(appMenuButton, LinearLayout.LayoutParams(dp(30), dp(26)).apply {
+        marginEnd = dp(3)
     })
     splHeaderGroup.addView(headerSplText, LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.WRAP_CONTENT, headerHeight

@@ -202,6 +202,10 @@ internal fun MainActivity.processAudio(audioRecord: AudioRecord, captureGenerati
         val count = converted?.count ?: readCount
         if (count <= 0) continue
 
+        // Measurement sweep reuses this single AudioRecord stream; never open a
+        // competing microphone session while the analyzer is already listening.
+        sweepMeasurementCapture?.append(audioSamples, count)
+
         // Sound ID consumes the same microphone samples as the spectrum graph.
         // It never opens a second AudioRecord session.
         if (soundIdActive) soundIdEngine.offerAudio(audioSamples, count)

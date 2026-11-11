@@ -236,9 +236,21 @@ internal fun MainActivity.installToneGeneratorSplit(toggleButton: Button, keysBu
     var toolbarLayoutGeneration = 0
     fun setKeysModeGraphLayout(enabled: Boolean, animateRows: Boolean = false) {
         val mergeControls = keyboardModeOpen
+        val rangeAlreadyInExpectedParent = when {
+            toneModeOpen -> true
+            mergeControls -> rangePickerButton?.parent === graphHeader
+            else -> rangePickerButton?.parent === bottomActionBar
+        }
+        val controlsAlreadyInExpectedParent = when {
+            toneModeOpen -> true
+            mergeControls -> controls.parent === bottomActionBar
+            else -> controls.parent === keyboardSection
+        }
         val fadeKeysControlsIn = animateRows && mergeControls
         val fadeRangeIn = animateRows && !soundModeOpen && !(mergeControls && fullScaleKeyboardOpen)
-        if (keysControlsMerged == mergeControls) return
+        // KEYS -> TONE -> Spectrum can leave the cached flag stale. Check RANGE's
+        // actual parent before returning, or KEYS may not reclaim the top-row button.
+        if (keysControlsMerged == mergeControls && rangeAlreadyInExpectedParent && controlsAlreadyInExpectedParent) return
         val layoutGeneration = ++toolbarLayoutGeneration
         // Width animators retain the old LayoutParams object. Stop them before
         // reparenting toolbar controls so they cannot reapply stale row geometry.
@@ -822,6 +834,48 @@ internal fun MainActivity.installToneGeneratorSplit(toggleButton: Button, keysBu
             }
         }
     }
+    fun ensureKeysRangeButtonInHeader() {
+        if (!keyboardModeOpen || fullScaleKeyboardOpen) return
+        val rangeButton = rangePickerButton ?: return
+        val header = spectrumHeader ?: graphHeader ?: return
+        val width = rangeButton.layoutParams?.width?.takeIf { it > 0 }
+            ?: ViewGroup.LayoutParams.WRAP_CONTENT
+        if (rangeButton.parent !== header) {
+            (rangeButton.parent as? ViewGroup)?.removeView(rangeButton)
+            header.addView(rangeButton, FrameLayout.LayoutParams(width, dp(42), Gravity.CENTER))
+        } else {
+            val params = rangeButton.layoutParams as? FrameLayout.LayoutParams
+                ?: FrameLayout.LayoutParams(width, dp(42), Gravity.CENTER)
+            params.width = width
+            params.height = dp(42)
+            params.gravity = Gravity.CENTER
+            rangeButton.layoutParams = params
+        }
+        rangeButton.visibility = View.VISIBLE
+        rangeButton.alpha = 1f
+    }
+    fun ensureToneRangeButtonPlacement() {
+        if (!toneModeOpen) return
+        val rangeButton = rangePickerButton ?: return
+        val row = toneGraphToolbarRow
+        if (rangeButton.parent !== row) {
+            (rangeButton.parent as? ViewGroup)?.removeView(rangeButton)
+            row.addView(rangeButton, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(38), Gravity.CENTER
+            ))
+        } else {
+            val params = rangeButton.layoutParams as? FrameLayout.LayoutParams
+                ?: FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(38), Gravity.CENTER)
+            params.width = ViewGroup.LayoutParams.WRAP_CONTENT
+            params.height = dp(38)
+            params.gravity = Gravity.CENTER
+            rangeButton.layoutParams = params
+        }
+        rangeButton.visibility = View.VISIBLE
+        rangeButton.alpha = 1f
+        row.visibility = View.VISIBLE
+        bottomActionBar?.visibility = View.GONE
+    }
     fun applyCurrentWindowGeometry(enteringToneMode: Boolean = false) {
         val compactWindow = isCompactAppWindow()
         val portraitWindow = isAppWindowPortrait()
@@ -1245,6 +1299,11 @@ internal fun MainActivity.installToneGeneratorSplit(toggleButton: Button, keysBu
         }
         portraitGraphControlsRow?.visibility = if (soundModeOpen) View.VISIBLE else View.GONE
         rangePickerButton?.visibility = if (soundModeOpen) View.GONE else View.VISIBLE
+        // Enforce the KEYS top-row placement after mode changes, including a
+        // return from the SPL overlay where toolbar visibility may be restored
+        // from the previous Sound ID layout.
+        ensureKeysRangeButtonInHeader()
+        ensureToneRangeButtonPlacement()
         if (keyboardModeOpen && enteringKeysMode) {
             keyboardSection.alpha = 0f
             keyboardSection.scaleY = 0.98f
